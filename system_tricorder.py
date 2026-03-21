@@ -13,20 +13,20 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 from datetime import datetime
 
-from PyQt5.QtWidgets import (
+from PyQt5.QtWidgets import (                                           # type: ignore
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QFrame, QGridLayout, QSizePolicy
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread
-from PyQt5.QtGui import QColor, QPainter, QPainterPath, QPen, QBrush
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread                # type: ignore
+from PyQt5.QtGui import QColor, QPainter, QPainterPath, QPen, QBrush    # type: ignore
 
 # --- KONFIGURATION ---
 DEFAULT_VRAM_GB = 16.0
 
 # --- WMI Initialisierung für GPU Sensoren ---
 try:
-    import pythoncom
-    import win32com.client
+    import pythoncom                                                    # type: ignore
+    import win32com.client                                              # type: ignore
     WMI_AVAILABLE = True
 except ImportError:
     WMI_AVAILABLE = False

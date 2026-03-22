@@ -1,35 +1,99 @@
 #!/usr/bin/env python3
 """
-System Tricorder v0.1 - Hardware Monitoring Dashboard
-Dark Mode | 20 FPS
+System Tricorder v1.1 - Hardware Monitoring Dashboard
+Dark Mode | 20 FPS 
 """
 
 import sys
 import time
+import math
 import platform
 import psutil
 from collections import deque
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 from datetime import datetime
 
-from PyQt5.QtWidgets import (                                           # type: ignore
+from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QFrame, QGridLayout, QSizePolicy
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread                # type: ignore
-from PyQt5.QtGui import QColor, QPainter, QPainterPath, QPen, QBrush    # type: ignore
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread
+from PyQt5.QtGui import QColor, QPainter, QPainterPath, QPen, QBrush
 
-# --- KONFIGURATION ---
-DEFAULT_VRAM_GB = 16.0
-
-# --- WMI Initialisierung für GPU Sensoren ---
+# --- WMI & WinReg Initialisierung ---
 try:
-    import pythoncom                                                    # type: ignore
-    import win32com.client                                              # type: ignore
+    import pythoncom
+    import win32com.client
     WMI_AVAILABLE = True
 except ImportError:
     WMI_AVAILABLE = False
+
+try:
+    import winreg
+    WINREG_AVAILABLE = True
+except ImportError:
+    WINREG_AVAILABLE = False
+
+
+def get_real_vram_gb() -> float:
+    """
+    Liest den VRAM über die Registry aus und iteriert über ALLE GPUs,
+    um die stärkste Karte zu finden (verhindert dass eine iGPU gewinnt).
+    Konvertiert Binary-Daten korrekt.
+    """
+    max_vram = 0.0
+    if WINREG_AVAILABLE:
+        try:
+            base_key = r"SYSTEM\CurrentControlSet\Control\Class\{4D36E968-E325-11CE-BFC1-08002BE10318}"
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base_key) as key:
+                for i in range(20):
+                    try:
+                        subkey_name = f"{i:04d}"
+                        with winreg.OpenKey(key, subkey_name) as subkey:
+                            vram = 0.0
+                            for val_name in ["HardwareInformation.qwMemorySize", "HardwareInformation.MemorySize"]:
+                                try:
+                                    vdata, _ = winreg.QueryValueEx(subkey, val_name)
+                                    if isinstance(vdata, bytes):
+                                        vbytes = int.from_bytes(vdata, byteorder='little')
+                                    else:
+                                        vbytes = int(vdata)
+                                        
+                                    temp_vram = float(vbytes) / (1024**3)
+                                    if temp_vram > vram:
+                                        vram = temp_vram
+                                except FileNotFoundError:
+                                    pass
+                            if vram > max_vram:
+                                max_vram = vram
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+
+    if max_vram >= 1.0:
+        return float(math.ceil(max_vram)) # Rundet z.B. 15.8 GB auf glatte 16.0 GB auf
+
+    # Fallback auf WMI
+    if WMI_AVAILABLE:
+        try:
+            pythoncom.CoInitialize() # type: ignore
+            wmi = win32com.client.GetObject("winmgmts:root\\cimv2") # type: ignore
+            controllers = wmi.ExecQuery("SELECT AdapterRAM FROM Win32_VideoController")
+            for c in controllers:
+                if c.AdapterRAM:
+                    vgb = float(c.AdapterRAM) / (1024**3)
+                    if vgb > max_vram:
+                        max_vram = vgb
+        except Exception:
+            pass
+            
+    if max_vram >= 1.0:
+        return float(math.ceil(max_vram))
+        
+    return 8.0 # Absoluter Notfall-Fallback
+
 
 @dataclass
 class SystemMetrics:
@@ -58,7 +122,7 @@ class HardwareMonitorThread(QThread):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._running = False
-        self.vram_total_gb = DEFAULT_VRAM_GB
+        self.vram_total_gb = get_real_vram_gb()
         
     def run(self):
         self._running = True
@@ -72,16 +136,6 @@ class HardwareMonitorThread(QThread):
 
         self.last_disk_io = psutil.disk_io_counters()
         self.last_time = time.time()
-
-        if wmi:
-            try:
-                controllers = wmi.ExecQuery("SELECT AdapterRAM FROM Win32_VideoController")
-                for c in controllers:
-                    if c.AdapterRAM:
-                        vgb = float(c.AdapterRAM) / (1024**3)
-                        if vgb > 2.0 and (vgb % 2 == 0 or vgb % 2 == 1):
-                            self.vram_total_gb = max(self.vram_total_gb, round(vgb))
-            except: pass
 
         while self._running:
             try:
@@ -129,8 +183,9 @@ class HardwareMonitorThread(QThread):
                                 elif "ai boost" in name or "npu" in name: npu_p = max(npu_p, util)
                     except: pass
 
+                # Fallback Auto-Scaler falls wider Erwarten die GPU doch mehr nutzt als erkannt
                 if vram_used_g > self.vram_total_gb:
-                    self.vram_total_gb = vram_used_g * 1.1
+                    self.vram_total_gb = math.ceil(vram_used_g)
 
                 self.metrics_updated.emit(SystemMetrics(
                     cpu_total_percent=cpu_total, cpu_cores=cpu_cores,
@@ -224,68 +279,6 @@ class MasterMetricBox(QFrame):
         self.val_lbl.setText(text if text else f"{int(val)}%")
 
 # ============================================================================
-# HARDWARE INFO WIDGETS
-# ============================================================================
-class HardwareInfoWidget(QFrame):
-    """Widget zur Anzeige von Hardware-Details (CPU, GPU, RAM, etc.)"""
-    def __init__(self, title: str, color_hex: str, info_text: str, parent=None):
-        super().__init__(parent)
-        self.info_text = info_text
-        self.setStyleSheet(f"""
-            QFrame {{ 
-                background-color: #121218; 
-                border: 1px solid #222; 
-                border-radius: 6px; 
-                border-top: 3px solid {color_hex};
-            }}
-            QLabel {{ background: transparent; border: none; }}
-        """)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(4)
-        
-        # Header
-        header = QHBoxLayout()
-        title_lbl = QLabel(title)
-        title_lbl.setStyleSheet(f"color: {color_hex}; font-size: 12px; font-weight: bold;")
-        header.addWidget(title_lbl)
-        header.addStretch()
-        layout.addLayout(header)
-        
-        # Info Text
-        info_lbl = QLabel(info_text)
-        info_lbl.setStyleSheet("color: #888; font-size: 10px;")
-        layout.addWidget(info_lbl)
-
-class HardwareInfoContainer(QFrame):
-    """Container für Hardware-Info Widgets"""
-    def __init__(self, title: str, color_hex: str, widgets: list, parent=None):
-        super().__init__(parent)
-        self.setStyleSheet(f"""
-            QFrame {{ 
-                background-color: #0f0f14; 
-                border: 1px solid #252525; 
-                border-radius: 8px; 
-                border-top: 4px solid {color_hex};
-            }}
-        """)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
-        
-        # Title
-        title_lbl = QLabel(title)
-        title_lbl.setStyleSheet(f"color: {color_hex}; font-size: 14px; font-weight: bold;")
-        layout.addWidget(title_lbl)
-        
-        # Grid für Widgets
-        grid = QGridLayout()
-        grid.setSpacing(8)
-        for widget in widgets:
-            grid.addWidget(widget, 0, grid.columnCount())
-        layout.addLayout(grid)
-
-# ============================================================================
 # MAIN WINDOW
 # ============================================================================
 class TricorderDashboard(QMainWindow):
@@ -296,7 +289,7 @@ class TricorderDashboard(QMainWindow):
         try: ctypes.windll.dwmapi.DwmSetWindowAttribute(int(self.winId()), 20, ctypes.byref(ctypes.c_int(1)), 4)
         except Exception: pass
         
-        self.setWindowTitle("System Tricorder v2.0")
+        self.setWindowTitle("System Tricorder v0.1")
         self.setMinimumSize(1280, 900)
         
         self.setStyleSheet("""
@@ -304,14 +297,10 @@ class TricorderDashboard(QMainWindow):
             QWidget { background-color: #0a0a0f; color: white; }
         """)
         
-        # --- HARDWARE IDENTIFICATION ---
-        self.cpu_brand, self.cpu_model, self.cpu_cores_count, self.cpu_threads_count = self._get_cpu_info()
-        self.gpu_brand, self.gpu_model, self.gpu_memory, self.gpu_arch = self._get_gpu_info()
-        self.ram_brand, self.ram_model, self.ram_speed, self.ram_total_gb = self._get_ram_info()
+        self._analyze_hardware()
         
-        # --- INITIALISIERUNG ---
-        self.p_items = []
-        self.e_items = []
+        self.block1_items = []
+        self.block2_items = []
         
         self._setup_ui()
         
@@ -323,124 +312,40 @@ class TricorderDashboard(QMainWindow):
         self.hw_thread.metrics_updated.connect(self._update_ui)
         self.hw_thread.start()
 
-    def _get_cpu_info(self) -> Tuple[str, str, int, int]:
-        """Erhalte CPU-Informationen (Marke, Modell, Cores, Threads)"""
-        cpu_info = platform.processor()
-        uname = platform.uname()
+    def _analyze_hardware(self):
+        """Erkennt selbständig P/E Cores und RAM-Typ"""
+        self.c_physical = psutil.cpu_count(logical=False) or 4
+        self.c_logical = psutil.cpu_count(logical=True) or 4
+        self.is_amd = "AMD" in platform.processor()
         
-        # CPU Marke und Modell
-        cpu_brand = "Unknown"
-        cpu_model = "Unknown"
-        
-        if uname.system == "Windows":
-            try:
-                import wmi  # type: ignore
-                c = wmi.WMI()
-                for cpu in c.Win32_Processor():
-                    cpu_brand = cpu.Manufacturer.strip()
-                    cpu_model = cpu.Name.strip()
-                    break
-            except:
-                pass
-        
-        # Fallback auf platform
-        if cpu_brand == "Unknown":
-            cpu_brand = "Intel" if "Intel" in cpu_info else "AMD" if "AMD" in cpu_info else "Unknown"
-            cpu_model = cpu_info
-        
-        # Core/Thread Count
-        cpu_cores_count = psutil.cpu_count(logical=False) or 4
-        cpu_threads_count = psutil.cpu_count(logical=True) or 8
-        
-        return cpu_brand, cpu_model, cpu_cores_count, cpu_threads_count
+        self.is_hybrid = False
+        self.p_threads = self.c_logical
+        self.e_threads = 0
 
-    def _get_gpu_info(self) -> Tuple[str, str, str, str]:
-        """Erhalte GPU-Informationen (Marke, Modell, Speicher, Architektur)"""
-        gpu_brand = "Unknown"
-        gpu_model = "Unknown"
-        gpu_memory = "Unknown"
-        gpu_arch = "Unknown"
-        
+        # --- CPU Topologie erkennen ---
+        if not self.is_amd:
+            # Bei Intel Hybrid: Threads sind größer als Cores, aber kleiner als 2 * Cores. 
+            if self.c_logical > self.c_physical and self.c_logical < 2 * self.c_physical:
+                self.is_hybrid = True
+                p_cores = self.c_logical - self.c_physical
+                self.e_threads = 2 * self.c_physical - self.c_logical
+                self.p_threads = p_cores * 2
+
+        # --- RAM Typ erkennen ---
+        self.ram_type = "RAM"
         if WMI_AVAILABLE:
             try:
-                pythoncom.CoInitialize()  # type: ignore
-                wmi = win32com.client.GetObject("winmgmts:root\\cimv2")  # type: ignore
-                
-                # GPU Details
-                for adapter in wmi.ExecQuery("SELECT Name, AdapterRAM, VideoProcessor FROM Win32_VideoController"):
-                    gpu_model = adapter.Name.strip()
-                    if adapter.AdapterRAM:
-                        vgb = float(adapter.AdapterRAM) / (1024**3)
-                        gpu_memory = f"{round(vgb)} GB"
+                wmi = win32com.client.GetObject("winmgmts:root\\cimv2") # type: ignore
+                for mem in wmi.ExecQuery("SELECT SMBIOSMemoryType, Speed FROM Win32_PhysicalMemory"):
+                    if mem.SMBIOSMemoryType == 34 or mem.SMBIOSMemoryType == 35:
+                        self.ram_type = "DDR5"
+                    elif mem.SMBIOSMemoryType == 26:
+                        self.ram_type = "DDR4"
+                    elif mem.Speed:
+                        if int(mem.Speed) >= 4800: self.ram_type = "DDR5"
+                        elif int(mem.Speed) > 0: self.ram_type = "DDR4"
                     break
-                
-                # GPU Architektur (über WMI oder psutil)
-                try:
-                    import wmi  # type: ignore
-                    c = wmi.WMI()
-                    for gpu in c.Win32_VideoController():
-                        gpu_arch = gpu.DriverVersion.split('.')[0] if gpu.DriverVersion else "Unknown"
-                        break
-                except:
-                    pass
-                    
-            except Exception as e:
-                pass
-        
-        # Fallback auf psutil
-        if gpu_model == "Unknown":
-            try:
-                import pynvml  # type: ignore
-                pynvml.nvmlInit()
-                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-                gpu_model = pynvml.nvmlDeviceGetName(handle).decode('utf-8')
-                gpu_memory = pynvml.nvmlDeviceGetMemoryInfo(handle).total / (1024**3)
-                gpu_memory = f"{round(gpu_memory)} GB"
-                pynvml.nvmlShutdown()
-            except:
-                pass
-        
-        # Brand erkennen
-        if "nvidia" in gpu_model.lower():
-            gpu_brand = "NVIDIA"
-        elif "intel" in gpu_model.lower() or "iris" in gpu_model.lower() or "arc" in gpu_model.lower():
-            gpu_brand = "Intel"
-        elif "amd" in gpu_model.lower() or "radeon" in gpu_model.lower() or "rx" in gpu_model.lower():
-            gpu_brand = "AMD"
-        
-        return gpu_brand, gpu_model, gpu_memory, gpu_arch
-
-    def _get_ram_info(self) -> Tuple[str, str, str, float]:
-        """Erhalte RAM-Informationen (Marke, Modell, Geschwindigkeit, Total GB)"""
-        ram_brand = "Unknown"
-        ram_model = "Unknown"
-        ram_speed = "Unknown"
-        ram_total_gb = 0.0
-        
-        ram = psutil.virtual_memory()
-        ram_total_gb = ram.total / (1024**3)
-        
-        # RAM Geschwindigkeit (über WMI auf Windows)
-        if WMI_AVAILABLE:
-            try:
-                pythoncom.CoInitialize()  # type: ignore
-                wmi = win32com.client.GetObject("winmgmts:root\\cimv2")  # type: ignore
-                for mem in wmi.ExecQuery("SELECT Speed FROM Win32_PhysicalMemory"):
-                    if mem.Speed:
-                        ram_speed = f"{mem.Speed} MHz"
-                        break
-            except:
-                pass
-        
-        # Fallback: DDR4/DDR5 basierend auf Geschwindigkeit
-        if ram_speed == "Unknown":
-            # Schätzung basierend auf typischen Geschwindigkeiten
-            if ram_total_gb > 64:
-                ram_speed = "DDR5"
-            else:
-                ram_speed = "DDR4"
-        
-        return ram_brand, ram_model, ram_speed, ram_total_gb
+            except: pass
 
     def _update_clock(self):
         self.clock_label.setText(datetime.now().strftime("%H:%M:%S     %d.%m.%Y"))
@@ -453,7 +358,7 @@ class TricorderDashboard(QMainWindow):
         
         # --- HEADER ---
         h_layout = QHBoxLayout()
-        header = QLabel("📊 System Tricorder v2.0")
+        header = QLabel("📊 System Tricorder v0.1")
         header.setStyleSheet("font-size: 28px; font-weight: bold; color: #00ff88; margin: 5px; background: transparent;")
         h_layout.addWidget(header)
         h_layout.addStretch()
@@ -464,26 +369,6 @@ class TricorderDashboard(QMainWindow):
         layout.addLayout(h_layout)
         layout.addSpacing(10)
         
-        # --- HARDWARE INFO SECTIONS ---
-        
-        # 1. CPU Info
-        cpu_color = "#ff5500" if self.cpu_brand == "AMD" else "#ff007f"
-        cpu_info_text = f"Brand: {self.cpu_brand} | Model: {self.cpu_model} | Cores: {self.cpu_cores_count} | Threads: {self.cpu_threads_count}"
-        cpu_widget = HardwareInfoWidget("🖥️ CPU Hardware", cpu_color, cpu_info_text)
-        layout.addWidget(cpu_widget)
-        
-        # 2. GPU Info
-        gpu_color = "#ffaa00"
-        gpu_info_text = f"Brand: {self.gpu_brand} | Model: {self.gpu_model} | Memory: {self.gpu_memory} | Arch: {self.gpu_arch}"
-        gpu_widget = HardwareInfoWidget("🎮 GPU Hardware", gpu_color, gpu_info_text)
-        layout.addWidget(gpu_widget)
-        
-        # 3. RAM Info
-        ram_color = "#ff007f"
-        ram_info_text = f"Total: {self.ram_total_gb:.1f} GB | Type: {self.ram_speed}"
-        ram_widget = HardwareInfoWidget("💾 RAM Hardware", ram_color, ram_info_text)
-        layout.addWidget(ram_widget)
-        
         # --- GLOBAL SYSTEMS GRID ---
         lbl_global = QLabel("<b style='color:#00ff88; font-size: 15px;'>Global System Core & Graphics</b>")
         lbl_global.setStyleSheet("background: transparent;")
@@ -492,22 +377,22 @@ class TricorderDashboard(QMainWindow):
         g_grid = QGridLayout()
         g_grid.setSpacing(6)
         
-        # Row 1
+        # Row 0
         self.w_cpu_total = MasterMetricBox("CPU Gesamt", "#00d4ff")
-        self.w_ram = MasterMetricBox("DDR5 RAM", "#ff007f")
-        self.w_npu = MasterMetricBox("Intel NPU", "#aa00ff")
-        self.w_igpu = MasterMetricBox("Intel iGPU", "#0055ff")
+        self.w_gpu_3d = MasterMetricBox("3D/Compute", "#ff5500")
+        self.w_igpu = MasterMetricBox("iGPU", "#0055ff")
+        self.w_gpu_c0 = MasterMetricBox("GPU Copy 0", "#ff7700")
         self.w_ssd_r = MasterMetricBox("SSD Read", "#00ffcc")
         
-        # Row 2
-        self.w_gpu_3d = MasterMetricBox("AMD 3D/Compute", "#ff5500")
-        self.w_vram = MasterMetricBox("VRAM Total", "#ffaa00")
-        self.w_gpu_c0 = MasterMetricBox("GPU Copy 0", "#ff7700")
+        # Row 1 (CPU & RAM übereinander, 3D/Compute & VRAM übereinander, etc.)
+        self.w_ram = MasterMetricBox(f"{self.ram_type} RAM", "#ff007f")
+        self.w_vram = MasterMetricBox("VRAM", "#ffaa00")
+        self.w_npu = MasterMetricBox("NPU", "#aa00ff")
         self.w_gpu_c1 = MasterMetricBox("GPU Copy 1", "#ff9900")
         self.w_ssd_w = MasterMetricBox("SSD Write", "#ffcc00")
         
-        glob_widgets = [self.w_cpu_total, self.w_ram, self.w_npu, self.w_igpu, self.w_ssd_r, 
-                        self.w_gpu_3d, self.w_vram, self.w_gpu_c0, self.w_gpu_c1, self.w_ssd_w]
+        glob_widgets = [self.w_cpu_total, self.w_gpu_3d, self.w_igpu, self.w_gpu_c0, self.w_ssd_r, 
+                        self.w_ram, self.w_vram, self.w_npu, self.w_gpu_c1, self.w_ssd_w]
         
         for i, w in enumerate(glob_widgets): 
             g_grid.addWidget(w, i // 5, i % 5)
@@ -517,61 +402,67 @@ class TricorderDashboard(QMainWindow):
         layout.addLayout(g_grid)
         layout.addSpacing(15)
         
-        # --- P-CORES ---
-        if self.cpu_brand == "AMD":
-            lbl_p = QLabel(f"<b style='color:#ff5500; font-size: 15px;'>AMD Ryzen Threads (0-{self.cpu_cores_count-1})</b>")
+        # --- CORE TOPOLOGY GRIDS ---
+        if self.is_hybrid:
+            # P-Cores und E-Cores vorhanden (Blau / Pink)
+            b1_count, b2_count = self.p_threads, self.e_threads
+            b1_title, b2_title = "Performance Cores", "Efficiency Cores"
+            b1_lbl_pfx, b2_lbl_pfx = "P-Thread", "E-Core"
+            b1_color, b2_color = "#00d4ff", "#ff007f" # Blau für P-Cores, Pink für E-Cores
         else:
-            lbl_p = QLabel(f"<b style='color:#ff007f; font-size: 15px;'>Performance Cores (0-{self.cpu_cores_count-1})</b>")
+            # Nur P-Cores vorhanden (Alles Blau)
+            b1_count, b2_count = self.c_logical, 0
+            b1_title = "AMD Ryzen Threads" if self.is_amd else "Intel Core Threads"
+            b1_lbl_pfx = "Thread"
+            b1_color = "#00d4ff" # Einheitlich Blau
+
+        # Block 1 Rendern
+        lbl_b1 = QLabel(f"<b style='color:{b1_color}; font-size: 15px;'>{b1_title} (0-{b1_count-1})</b>")
+        lbl_b1.setStyleSheet("background: transparent;")
+        layout.addWidget(lbl_b1)
         
-        lbl_p.setStyleSheet("background: transparent;")
-        layout.addWidget(lbl_p)
+        b1_grid = QGridLayout()
+        b1_grid.setSpacing(6)
+        cols_b1 = max(1, (b1_count + 1) // 2)
         
-        p_grid = QGridLayout()
-        p_grid.setSpacing(6)
-        
-        cols_p = max(1, (self.cpu_cores_count + 1) // 2)
-        p_color = "#ff5500" if self.cpu_brand == "AMD" else "#ff007f"
-        
-        for i in range(self.cpu_cores_count):
-            title = f"Thread {i}" if self.cpu_brand == "AMD" else f"P-Core {i}"
-            w = MasterMetricBox(title, p_color)
-            p_grid.addWidget(w, i // cols_p, i % cols_p)
-            self.p_items.append(w)
+        for i in range(b1_count):
+            w = MasterMetricBox(f"{b1_lbl_pfx} {i}", b1_color)
+            b1_grid.addWidget(w, i // cols_b1, i % cols_b1)
+            self.block1_items.append(w)
             
-        for i in range(2): p_grid.setRowStretch(i, 1)
-        for i in range(cols_p): p_grid.setColumnStretch(i, 1)
-        layout.addLayout(p_grid)
+        for i in range(2): b1_grid.setRowStretch(i, 1)
+        for i in range(cols_b1): b1_grid.setColumnStretch(i, 1)
+        layout.addLayout(b1_grid)
         
-        # --- E-CORES (nur wenn nicht AMD und E-Cores vorhanden) ---
-        if not self.cpu_brand == "AMD" and self.cpu_threads_count > self.cpu_cores_count:
+        # Block 2 Rendern (falls E-Cores vorhanden)
+        if b2_count > 0:
             layout.addSpacing(15)
-            lbl_e = QLabel(f"<b style='color:#00d4ff; font-size: 15px;'>Efficiency Cores ({self.cpu_cores_count}-{self.cpu_threads_count-1})</b>")
-            lbl_e.setStyleSheet("background: transparent;")
-            layout.addWidget(lbl_e)
+            lbl_b2 = QLabel(f"<b style='color:{b2_color}; font-size: 15px;'>{b2_title} ({b1_count}-{self.c_logical-1})</b>")
+            lbl_b2.setStyleSheet("background: transparent;")
+            layout.addWidget(lbl_b2)
             
-            e_grid = QGridLayout()
-            e_grid.setSpacing(6)
+            b2_grid = QGridLayout()
+            b2_grid.setSpacing(6)
+            cols_b2 = max(1, (b2_count + 1) // 2)
             
-            cols_e = max(1, (self.cpu_threads_count - self.cpu_cores_count + 1) // 2)
-            
-            for i in range(self.cpu_threads_count - self.cpu_cores_count):
-                w = MasterMetricBox(f"E-Core {i + self.cpu_cores_count}", "#00d4ff")
-                e_grid.addWidget(w, i // cols_e, i % cols_e)
-                self.e_items.append(w)
+            for i in range(b2_count):
+                w = MasterMetricBox(f"{b2_lbl_pfx} {i + b1_count}", b2_color)
+                b2_grid.addWidget(w, i // cols_b2, i % cols_b2)
+                self.block2_items.append(w)
                 
-            for i in range(2): e_grid.setRowStretch(i, 1)
-            for i in range(cols_e): e_grid.setColumnStretch(i, 1)
-            layout.addLayout(e_grid)
+            for i in range(2): b2_grid.setRowStretch(i, 1)
+            for i in range(cols_b2): b2_grid.setColumnStretch(i, 1)
+            layout.addLayout(b2_grid)
 
     def _update_ui(self, m: SystemMetrics):
         self.w_cpu_total.update_val(m.cpu_total_percent)
-        self.w_ram.update_val(m.ram_percent, f"{m.ram_total_gb:.1f} GB / {m.ram_used_gb:.1f} GB")
+        self.w_ram.update_val(m.ram_percent, f"{m.ram_used_gb:.1f} / {m.ram_total_gb:.1f} GB")
         
         self.w_npu.update_val(m.npu_percent)
         self.w_igpu.update_val(m.igpu_percent)
         
         vram_percent = (m.gpu_vram_used_gb / m.gpu_vram_total_gb) * 100 if m.gpu_vram_total_gb else 0
-        self.w_vram.update_val(vram_percent, f"{m.gpu_vram_total_gb:.0f} GB / {m.gpu_vram_used_gb:.1f} GB")
+        self.w_vram.update_val(vram_percent, f"{m.gpu_vram_used_gb:.1f} / {m.gpu_vram_total_gb:.0f} GB")
         
         self.w_gpu_3d.update_val(m.gpu_3d_percent)
         self.w_gpu_c0.update_val(m.gpu_copy0_percent)
@@ -581,10 +472,12 @@ class TricorderDashboard(QMainWindow):
         self.w_ssd_w.update_val(min((m.disk_write_mbps/1000)*100, 100), f"{m.disk_write_mbps:.1f} MB/s")
         
         for i, val in m.cpu_cores.items():
-            if i < len(self.p_items):
-                self.p_items[i].update_val(val)
-            elif i < len(self.e_items):
-                self.e_items[i].update_val(val)
+            if i < len(self.block1_items):
+                self.block1_items[i].update_val(val)
+            else:
+                idx_b2 = i - len(self.block1_items)
+                if idx_b2 < len(self.block2_items):
+                    self.block2_items[idx_b2].update_val(val)
 
     def closeEvent(self, a0):  # type: ignore
         self.hw_thread.stop()

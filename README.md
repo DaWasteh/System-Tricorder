@@ -2,6 +2,9 @@
 
 A sleek, high-performance hardware monitoring dashboard for Windows. Built with Python and PyQt5, it provides real-time system metrics with a dark-mode cyberpunk aesthetic at a smooth 20 FPS.
 
+
+![alt text](image.png)
+
 ## ✨ Features
 
 * **Smart CPU Topology:** Automatically analyzes your processor. Dynamically detects and visually separates Intel Performance (P-Cores) & Efficiency (E-Cores), as well as AMD Ryzen multi-die threads. Colors adapt automatically to your CPU brand.
@@ -33,11 +36,13 @@ python system_tricorder.py
 If you want to run this without installing Python (or share it with others), you can compile it into a standalone executable using `pyinstaller`:
 
 1. Install PyInstaller:
+
 ```bash
 pip install pyinstaller
 ```
 
 2. Build the executable:
+
 ```bash
 pyinstaller --noconsole --onefile system_tricorder.py
 ```

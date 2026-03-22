@@ -1,4 +1,0 @@
-psutil
-pyqt5
-pywin32
-pyinstaller

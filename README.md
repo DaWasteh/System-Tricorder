@@ -1,35 +1,73 @@
 # 📊 System Tricorder
 
-A sleek, high-performance hardware monitoring dashboard for Windows. Built with Python and PyQt5, it provides real-time system metrics with a dark-mode cyberpunk aesthetic at a smooth 20 FPS.
+> A real-time hardware monitoring dashboard for Windows — dark mode, 20 FPS, no fluff.
 
+![Version](https://img.shields.io/badge/version-0.2-00ff88?style=flat-square)
+![Python](https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square)
+![Platform](https://img.shields.io/badge/platform-Windows-lightgrey?style=flat-square)
+![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
+
+---
+
+## ✨ What it does
+
+System Tricorder gives you a live, graph-based view of your entire system at a glance — CPU, RAM, GPU(s), NPU, iGPU, and disk I/O — all updating at 20 FPS in a clean dark-mode window.
+
+It's smart about your hardware:
+
+- **Intel Hybrid CPUs (P/E Cores)** get separate sections with distinct visual designs — Performance Cores show as top-bordered boxes, Efficiency Cores as left-bordered boxes, so you can tell them apart without reading the labels
+- **Hyperthreading & AMD SMT** is visualized as paired columns — physical core on top, logical sibling below with a dimmed `HT` / `SMT` badge
+- **Multiple GPUs** each get their own color-coded row with independent 3D, Copy, and VRAM graphs
+- **RAM type** (DDR4 / DDR5) is auto-detected and shown in the label
+- **VRAM** is read directly from the Windows Registry for accurate values (the WMI 32-bit cap workaround is handled internally)
+
+---
+
+## 🖥️ Screenshots
 
 ![alt text](image.png)
+---
 
-## ✨ Features
+## 🚀 Installation
 
-* **Smart CPU Topology:** Automatically analyzes your processor. Dynamically detects and visually separates Intel Performance (P-Cores) & Efficiency (E-Cores), as well as AMD Ryzen multi-die threads. Colors adapt automatically to your CPU brand.
-* **Robust VRAM & RAM Detection:** Uses deep Windows Registry hooks and WMI to accurately read GPU VRAM (bypassing the notorious Windows 32-bit limit for modern >4GB GPUs) and dynamically detects DDR4/DDR5 RAM speeds.
-* **Comprehensive Metrics:** Tracks CPU load, RAM usage, GPU (3D/Compute, Copy engines, VRAM), iGPU, NPU, and SSD Read/Write speeds in real-time.
-* **Aesthetic UI:** A clean 2x5 global grid layout with dynamic color-coding, borderless window elements, and a dark-mode aesthetic.
-* **Standalone Capability:** Can be easily compiled into a single `.exe` file so you can share it with friends who don't have Python installed.
+**1. Clone the repo**
+```bash
+git clone https://github.com/YOUR_USERNAME/system-tricorder.git
+cd system-tricorder
+```
 
-## 🚀 Requirements
+**2. Install dependencies**
+```bash
+pip install PyQt5
+pip install psutil
+pip install pywin32        # Required for GPU/WMI metrics
+```
 
-Make sure you have Python 3 installed. You will need the following Python packages to run the source code:
-
+Or all at once:
 ```bash
 pip install PyQt5 psutil pywin32
 ```
 
-## 🛠️ Usage
-
-Simply run the python script from your terminal or double-click it (if `.py` files are associated with Python):
-
+**3. Run**
 ```bash
 python system_tricorder.py
 ```
 
-*Note: This tool uses Windows-specific APIs (WMI & Registry) to fetch accurate hardware data and is designed specifically for Windows 10 and 11.*
+> ⚠️ Windows only. The GPU and RAM-type detection relies on WMI and the Windows Registry.
+
+---
+
+## 🔧 Requirements
+
+| Package   | Purpose                                    |
+|-----------|--------------------------------------------|
+| `PyQt5`   | GUI framework                              |
+| `psutil`  | CPU / RAM / Disk metrics                   |
+| `pywin32` | GPU utilization & VRAM via WMI + Registry  |
+
+Python 3.8 or newer is recommended.
+
+---
 
 ## 📦 Building an Executable (.exe)
 
@@ -49,6 +87,63 @@ pyinstaller --noconsole --onefile system_tricorder.py
 
 You will find the compiled `system_tricorder.exe` inside the newly created `dist` folder.
 
+---
+
+## 📐 What's monitored
+
+### Global Grid
+| Metric        | Source                        |
+|---------------|-------------------------------|
+| CPU Total     | psutil                        |
+| DDR4/DDR5 RAM | psutil + WMI type detection   |
+| SSD Read/Write| psutil disk I/O (MB/s)        |
+| NPU           | WMI GPU engine counters       |
+| iGPU          | WMI GPU engine counters       |
+
+### Per GPU (up to 4)
+| Metric    | Source                             |
+|-----------|------------------------------------|
+| 3D/Compute| WMI GPU engine utilization         |
+| Copy 0/1  | WMI GPU engine utilization         |
+| VRAM Used | WMI adapter memory counters        |
+| VRAM Total| Windows Registry (accurate values) |
+
+### CPU Core Topology
+| CPU Type            | Display                                          |
+|---------------------|--------------------------------------------------|
+| Intel Hybrid (P+E)  | Two separate sections, two distinct box designs  |
+| Intel / AMD with HT/SMT | Paired columns: physical core + logical sibling |
+| Single-thread cores | Simple uniform grid                              |
+
+---
+
+## 🗂️ Changelog
+
+### v0.2 *(current)*
+- Multi-GPU support — each GPU gets its own color-coded row (up to 4)
+- Intel P/E Core visual separation — different box design per core type (not just color)
+- HT / AMD SMT pairs visualized as aligned columns
+- Auto-detection of RAM type (DDR4/DDR5) via WMI
+- Auto-detection of multi-socket systems
+- VRAM detection iterates all GPU Registry entries to avoid iGPU winning
+- Improved LUID tracking for stable GPU row ordering
+
+### v0.1 *(initial release)*
+- Basic 2×5 global metrics grid
+- Per-thread CPU graphs
+- Single GPU support
+- Dark mode PyQt5 dashboard at 20 FPS
+
+---
+
 ## 🤝 Contributing
 
-Feel free to open issues or submit pull requests if you have ideas for new features or hardware support improvements!
+This is my first public project — feedback, issues, and pull requests are very welcome!
+
+If you run it on an interesting setup (dual GPU, server CPU, AMD APU, etc.) and something looks off or broken, please open an issue with your CPU model and thread count.
+
+---
+
+## 📄 License
+
+MIT — do whatever you want with it.

@@ -1,146 +1,143 @@
 # 📊 System Tricorder
 
-> A real-time hardware monitoring dashboard for Windows — dark mode, 20 FPS, no fluff.
+> A real-time hardware monitoring dashboard for Windows — dark mode, 20 FPS, fully customisable layout.
 
-![Version](https://img.shields.io/badge/version-0.2-00ff88?style=flat-square)
+![Version](https://img.shields.io/badge/version-0.3-00ff88?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 
 ---
 
-## ✨ What it does
-
-System Tricorder gives you a live, graph-based view of your entire system at a glance — CPU, RAM, GPU(s), NPU, iGPU, and disk I/O — all updating at 20 FPS in a clean dark-mode window.
-
-It's smart about your hardware:
-
-- **Intel Hybrid CPUs (P/E Cores)** get separate sections with distinct visual designs — Performance Cores show as top-bordered boxes, Efficiency Cores as left-bordered boxes, so you can tell them apart without reading the labels
-- **Hyperthreading & AMD SMT** is visualized as paired columns — physical core on top, logical sibling below with a dimmed `HT` / `SMT` badge
-- **Multiple GPUs** each get their own color-coded row with independent 3D, Copy, and VRAM graphs
-- **RAM type** (DDR4 / DDR5) is auto-detected and shown in the label
-- **VRAM** is read directly from the Windows Registry for accurate values (the WMI 32-bit cap workaround is handled internally)
-
----
-
 ## 🖥️ Screenshots
 
 ![alt text](image.png)
+
+---
+## ✨ What it does
+
+System Tricorder gives you a live, graph-based view of your entire system at a glance — CPU, RAM, GPU(s), NPU, iGPU, and per-drive disk I/O — all updating at 20 FPS in a clean dark-mode window.
+
+Everything is customisable: drag tiles to rearrange them, hide what you don't care about, restore anything later, and adjust how many columns fit on screen. The layout is saved automatically so it survives restarts.
+
+---
+
+## 🎛️ Edit Mode — Customising your layout
+
+Press **✏ Edit Layout** in the top-right toolbar to enter edit mode. All tiles highlight with a yellow accent border and show a **×** close button.
+
+While in edit mode you can:
+
+- **Drag & drop** any tile to a new position — a dashed yellow outline shows the drop target.
+- **× button** — hides a tile (not deleted, just moved to the hidden pool).
+- **＋ Add Tile** — opens a dialog listing all hidden tiles with checkboxes so you can restore any of them.
+- **‹ / ›** — decrease or increase the number of grid columns (1–12).
+- **↺ Reset** — restores the factory default layout and column count.
+
+Press **✔ Fertig** to leave edit mode. Your layout is saved automatically to `~/.tricorder_layout.json`.
+
+---
+
+## 💾 Per-Drive Tiles
+
+Each physical drive gets its own tile showing **Read** and **Write** throughput as two stacked sparklines in a single landscape tile:
+
+```
+💾  C:/D:                         ↑ 623 MB/s
+R  ──────────────────────────────  847.2 MB/s
+W  ──────────────────────────────    0.1 MB/s
+```
+
+The y-axis auto-scales based on the current peak, with slow decay. Values display in MB/s; automatically switches to GB/s for NVMe Gen 5 drives doing ≥ 1000 MB/s.
+
+On Windows, drive tiles are labelled with their drive letters (e.g. `C:`, `D:`, `C:/D:` for a multi-partition drive).
+
 ---
 
 ## 🚀 Installation
 
-**1. Clone the repo**
 ```bash
 git clone https://github.com/YOUR_USERNAME/system-tricorder.git
 cd system-tricorder
-```
-
-**2. Install dependencies**
-```bash
-pip install PyQt5
-pip install psutil
-pip install pywin32        # Required for GPU/WMI metrics
-```
-
-Or all at once:
-```bash
 pip install PyQt5 psutil pywin32
-```
-
-**3. Run**
-```bash
 python system_tricorder.py
 ```
 
-> ⚠️ Windows only. The GPU and RAM-type detection relies on WMI and the Windows Registry.
-
----
-
-## 🔧 Requirements
-
-| Package   | Purpose                                    |
-|-----------|--------------------------------------------|
-| `PyQt5`   | GUI framework                              |
-| `psutil`  | CPU / RAM / Disk metrics                   |
-| `pywin32` | GPU utilization & VRAM via WMI + Registry  |
-
-Python 3.8 or newer is recommended.
+> ⚠️ Windows only. GPU and RAM-type detection relies on WMI and the Windows Registry.
 
 ---
 
 ## 📦 Building an Executable (.exe)
 
-If you want to run this without installing Python (or share it with others), you can compile it into a standalone executable using `pyinstaller`:
-
-1. Install PyInstaller:
-
 ```bash
 pip install pyinstaller
-```
-
-2. Build the executable:
-
-```bash
 pyinstaller --noconsole --onefile system_tricorder.py
 ```
-
-You will find the compiled `system_tricorder.exe` inside the newly created `dist` folder.
 
 ---
 
 ## 📐 What's monitored
 
-### Global Grid
-| Metric        | Source                        |
-|---------------|-------------------------------|
-| CPU Total     | psutil                        |
-| DDR4/DDR5 RAM | psutil + WMI type detection   |
-| SSD Read/Write| psutil disk I/O (MB/s)        |
-| NPU           | WMI GPU engine counters       |
-| iGPU          | WMI GPU engine counters       |
+### Global Grid (all tiles draggable / hideable)
 
-### Per GPU (up to 4)
-| Metric    | Source                             |
-|-----------|------------------------------------|
-| 3D/Compute| WMI GPU engine utilization         |
-| Copy 0/1  | WMI GPU engine utilization         |
-| VRAM Used | WMI adapter memory counters        |
-| VRAM Total| Windows Registry (accurate values) |
+| Tile | Source |
+|------|--------|
+| CPU Gesamt | psutil total |
+| DDR4/DDR5 RAM | psutil + WMI type |
+| iGPU | WMI GPU engine |
+| NPU | WMI GPU engine |
+| GPU N · 3D | WMI GPU engine |
+| GPU N · Copy0/1 | WMI GPU engine |
+| GPU N · VRAM | WMI adapter memory |
+| Drive X (Read + Write) | psutil per-disk I/O |
 
-### CPU Core Topology
-| CPU Type            | Display                                          |
-|---------------------|--------------------------------------------------|
-| Intel Hybrid (P+E)  | Two separate sections, two distinct box designs  |
+### CPU Core Topology (collapsible section)
+
+| CPU Type | Display |
+|----------|---------|
+| Intel Hybrid (P+E) | Two separate sections, two distinct box designs |
 | Intel / AMD with HT/SMT | Paired columns: physical core + logical sibling |
-| Single-thread cores | Simple uniform grid                              |
+| Single-thread cores | Simple uniform grid |
+
+---
+
+## 🗂️ Layout Config Format
+
+`~/.tricorder_layout.json` example:
+```json
+{
+  "version": "0.3",
+  "cols": 5,
+  "tile_order": ["cpu_total", "ram", "gpu_0_3d", "gpu_0_vram", "drive_PhysicalDrive0"],
+  "hidden_tiles": ["igpu", "npu", "gpu_0_copy0", "gpu_0_copy1"]
+}
+```
+
+Delete the file to reset to factory defaults.
 
 ---
 
 ## 🗂️ Changelog
 
-### v0.2 *(current)*
-- Multi-GPU support — each GPU gets its own color-coded row (up to 4)
-- Intel P/E Core visual separation — different box design per core type (not just color)
+### v0.3 *(current)*
+- **Edit Mode** — drag-to-reorder tiles, × to hide, ＋ to restore, ‹/› to adjust columns
+- **Per-drive tiles** — each physical drive gets one landscape tile with dual Read/Write sparklines and auto-scaling MB/s axis (auto-switches to GB/s for fast NVMe)
+- **Layout persistence** — order, hidden tiles, and column count saved to `~/.tricorder_layout.json`
+- **Collapsible CPU section** — click the ▼ header to collapse/expand the thread topology grid
+- WMI drive-letter mapping — tiles show `C:`, `D:` etc. instead of `PhysicalDrive0`
+- Fixed Qt CSS selectors — custom class names replaced with `QFrame` (invisible tile bug)
+- Fixed `CollapsibleSection` — rebuilt as QWidget row + QLabel (QPushButton ignores HTML)
+
+### v0.2
+- Multi-GPU support (up to 4), each with its own color-coded row
+- Intel P/E Core visual separation — different box design per core type
 - HT / AMD SMT pairs visualized as aligned columns
 - Auto-detection of RAM type (DDR4/DDR5) via WMI
 - Auto-detection of multi-socket systems
-- VRAM detection iterates all GPU Registry entries to avoid iGPU winning
-- Improved LUID tracking for stable GPU row ordering
+- Registry-based VRAM detection (avoids 4 GB WMI cap)
 
 ### v0.1 *(initial release)*
-- Basic 2×5 global metrics grid
-- Per-thread CPU graphs
-- Single GPU support
-- Dark mode PyQt5 dashboard at 20 FPS
-
----
-
-## 🤝 Contributing
-
-This is my first public project — feedback, issues, and pull requests are very welcome!
-
-If you run it on an interesting setup (dual GPU, server CPU, AMD APU, etc.) and something looks off or broken, please open an issue with your CPU model and thread count.
+- Basic 2×5 global metrics grid, per-thread CPU graphs, single GPU, dark mode 20 FPS
 
 ---
 

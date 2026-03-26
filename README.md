@@ -119,7 +119,17 @@ Delete the file to reset to factory defaults.
 
 ## 🗂️ Changelog
 
-### v0.3 *(current)*
+### v0.4 (current)
+
+- GPU 3D / Compute split — the 3D / Compute tile now shows two separate sparklines: 3D (rasterisation) and Cmp (Compute / CUDA / OpenCL), instead of a single combined value
+- GPU Copy tile — Cp0 and Cp1 combined into one landscape tile (matching the Drive tile layout), instead of two separate metric tiles
+- Free row positioning via drag — tiles can now be inserted before or after any other tile instead of just swapping positions. Left half of target tile = insert before, right half = insert after; a yellow bar on the tile edge shows live where the tile will land → fully custom row layout possible (e.g. row 1 CPU only, row 2 GPU only)
+- Dynamic column count — both the global tile grid and the CPU topology grid automatically adjust their column count to fit the window width; the ‹ › buttons control minimum tile width instead of a fixed column count
+- Collapsible sections — both Global System & Graphics and CPU Thread Topology can be collapsed by clicking their header; freed space is correctly redistributed to the remaining sections
+- Responsive CPU grid — P-Core, E-Core and HT/SMT pairs reflow automatically on window resize; HT/SMT pairs always stay together in the same column
+- Clock & date enlarged to 36 px
+
+### v0.3
 - **Edit Mode** — drag-to-reorder tiles, × to hide, ＋ to restore, ‹/› to adjust columns
 - **Per-drive tiles** — each physical drive gets one landscape tile with dual Read/Write sparklines and auto-scaling MB/s axis (auto-switches to GB/s for fast NVMe)
 - **Layout persistence** — order, hidden tiles, and column count saved to `~/.tricorder_layout.json`

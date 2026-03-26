@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-System Tricorder v0.3 — Hardware Monitoring Dashboard
+System Tricorder v0.4 — Hardware Monitoring Dashboard
 Dark Mode | 20 FPS | Multi-GPU | P/E Cores | Customisable Layout | Per-Drive Tiles
 """
 
@@ -201,11 +201,12 @@ def build_drive_info() -> List[Tuple[str, str]]:
 class GPUMetrics:
     name: str
     luid: str
-    gpu_3d_percent:   float = 0.0
-    gpu_copy0_percent: float = 0.0
-    gpu_copy1_percent: float = 0.0
-    gpu_vram_used_gb:  float = 0.0
-    gpu_vram_total_gb: float = 8.0
+    gpu_3d_percent:      float = 0.0
+    gpu_compute_percent: float = 0.0
+    gpu_copy0_percent:   float = 0.0
+    gpu_copy1_percent:   float = 0.0
+    gpu_vram_used_gb:    float = 0.0
+    gpu_vram_total_gb:   float = 8.0
 
 
 @dataclass
@@ -315,7 +316,7 @@ class HardwareMonitorThread(QThread):
                         ):
                             luid = str(a.Name).split('_phys')[0]
                             used = float(a.DedicatedUsage or 0) / (1024 ** 3)
-                            ld = luid_data.setdefault(luid, {'3d': 0.0, 'c0': 0.0, 'c1': 0.0, 'used': 0.0})
+                            ld = luid_data.setdefault(luid, {'3d': 0.0, 'compute': 0.0, 'c0': 0.0, 'c1': 0.0, 'used': 0.0})
                             ld['used'] = max(ld['used'], used)
                     except Exception:
                         pass
@@ -337,8 +338,10 @@ class HardwareMonitorThread(QThread):
                                 continue
                             for luid in luid_data:
                                 if luid.lower() in en:
-                                    if any(x in en for x in ('3d', 'compute', 'cuda', 'graphics_1')):
+                                    if any(x in en for x in ('3d', 'graphics_1')):
                                         luid_data[luid]['3d'] = min(luid_data[luid]['3d'] + util, 100.0)
+                                    elif any(x in en for x in ('compute', 'cuda')):
+                                        luid_data[luid]['compute'] = min(luid_data[luid]['compute'] + util, 100.0)
                                     elif 'copy' in en:
                                         tail = en.split('copy')[-1]
                                         if tail.strip().startswith(('_0', ' 0', '0')):
@@ -365,6 +368,7 @@ class HardwareMonitorThread(QThread):
                     gpus.append(GPUMetrics(
                         name=name, luid=luid,
                         gpu_3d_percent=d.get('3d', 0.0),
+                        gpu_compute_percent=d.get('compute', 0.0),
                         gpu_copy0_percent=d.get('c0', 0.0),
                         gpu_copy1_percent=d.get('c1', 0.0),
                         gpu_vram_used_gb=used,
@@ -590,27 +594,28 @@ class BaseTile(QFrame):
     Provides drag-to-reorder and edit-mode × button.
     Subclass and implement _build_content().
     """
-    swap_requested   = pyqtSignal(str, str)   # (source_id, target_id)
-    remove_requested = pyqtSignal(str)         # tile_id
+    move_requested     = pyqtSignal(str, str, bool)  # (src_id, target_id, insert_before)
+    remove_requested   = pyqtSignal(str)              # tile_id
+    rowbreak_requested = pyqtSignal(str)              # tile_id — toggle row-break before this tile
 
     _BTN_SIZE = 18
 
     def __init__(self, tile_id: str, color_hex: str, parent=None):
         super().__init__(parent)
-        self.tile_id    = tile_id
-        self._color_hex = color_hex
-        self._edit_mode = False
-        self._drop_hl   = False
+        self.tile_id     = tile_id
+        self._color_hex  = color_hex
+        self._edit_mode  = False
+        self._drop_hl    = False
+        self._drop_before = True
         self._drag_pos: Optional[QPoint] = None
 
         self.setAcceptDrops(True)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._apply_frame_style(color_hex, edit=False)
 
-        # Build tile-specific content (implemented by subclass)
         self._build_content()
 
-        # Remove (×) overlay button — hidden until edit mode
+        # ── × close button (top-right) ────────────────────────────────────────
         self._btn_x = QPushButton("×", self)
         self._btn_x.setFixedSize(self._BTN_SIZE, self._BTN_SIZE)
         self._btn_x.setStyleSheet("""
@@ -622,6 +627,39 @@ class BaseTile(QFrame):
         """)
         self._btn_x.hide()
         self._btn_x.clicked.connect(lambda: self.remove_requested.emit(self.tile_id))
+
+        # ── ↵ row-break button (top-left) ─────────────────────────────────────
+        self._btn_rn = QPushButton("↵", self)
+        self._btn_rn.setFixedSize(self._BTN_SIZE, self._BTN_SIZE)
+        self._btn_rn.setToolTip("Toggle row break before this tile")
+        self._rowbreak_active = False
+        self._style_rowbreak_btn()
+        self._btn_rn.hide()
+        self._btn_rn.clicked.connect(lambda: self.rowbreak_requested.emit(self.tile_id))
+
+    def _style_rowbreak_btn(self):
+        if self._rowbreak_active:
+            self._btn_rn.setStyleSheet("""
+                QPushButton {
+                    background: #00aa55; color: #fff;
+                    border-radius: 9px; font-size: 9px; font-weight: bold;
+                }
+                QPushButton:hover { background: #00ff88; color: #000; }
+            """)
+        else:
+            self._btn_rn.setStyleSheet("""
+                QPushButton {
+                    background: #1e2a1e; color: #446644;
+                    border-radius: 9px; font-size: 9px; font-weight: bold;
+                    border: 1px solid #2a3a2a;
+                }
+                QPushButton:hover { background: #2a3a2a; color: #00ff88; }
+            """)
+
+    def set_rowbreak_active(self, active: bool):
+        """Highlight the ↵ button when a row break is active before this tile."""
+        self._rowbreak_active = active
+        self._style_rowbreak_btn()
 
     def _apply_frame_style(self, accent: str, edit: bool):
         border_side = "#3a3a2a" if edit else "#222"
@@ -644,6 +682,7 @@ class BaseTile(QFrame):
     def set_edit_mode(self, enabled: bool):
         self._edit_mode = enabled
         self._btn_x.setVisible(enabled)
+        self._btn_rn.setVisible(enabled)
         self.setCursor(Qt.SizeAllCursor if enabled else Qt.ArrowCursor)  # type: ignore
         accent = "#ffdd55" if enabled else self._color_hex
         self._apply_frame_style(accent, edit=enabled)
@@ -651,6 +690,7 @@ class BaseTile(QFrame):
     def resizeEvent(self, event):                                   # type: ignore
         super().resizeEvent(event)
         self._btn_x.move(self.width() - self._BTN_SIZE - 3, 3)
+        self._btn_rn.move(3, 3)
 
     # ── Drag source ────────────────────────────────────────────────────────────
     def mousePressEvent(self, event):                               # type: ignore
@@ -687,8 +727,17 @@ class BaseTile(QFrame):
         if (self._edit_mode and event.mimeData().hasText()
                 and event.mimeData().text() != self.tile_id):
             event.acceptProposedAction()
-            self._drop_hl = True
+            self._drop_hl    = True
+            self._drop_before = event.pos().x() < self.width() / 2
             self.update()
+
+    def dragMoveEvent(self, event):                                 # type: ignore
+        if self._drop_hl:
+            new_before = event.pos().x() < self.width() / 2
+            if new_before != self._drop_before:
+                self._drop_before = new_before
+                self.update()
+            event.acceptProposedAction()
 
     def dragLeaveEvent(self, event):                                # type: ignore
         self._drop_hl = False
@@ -697,7 +746,8 @@ class BaseTile(QFrame):
     def dropEvent(self, event):                                     # type: ignore
         src = event.mimeData().text()
         if src != self.tile_id:
-            self.swap_requested.emit(src, self.tile_id)
+            insert_before = event.pos().x() < self.width() / 2
+            self.move_requested.emit(src, self.tile_id, insert_before)
             event.acceptProposedAction()
         self._drop_hl = False
         self.update()
@@ -707,8 +757,13 @@ class BaseTile(QFrame):
         if self._drop_hl:
             p = QPainter(self)
             p.setRenderHint(QPainter.Antialiasing)
-            p.setPen(QPen(QColor("#ffdd55"), 2, Qt.DashLine))       # type: ignore
-            p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 5, 5)
+            p.setPen(QPen(QColor("#ffdd55"), 3))                    # type: ignore
+            if self._drop_before:
+                # Vertical bar on left edge = "insert before this tile"
+                p.drawLine(2, 4, 2, self.height() - 4)
+            else:
+                # Vertical bar on right edge = "insert after this tile"
+                p.drawLine(self.width() - 2, 4, self.width() - 2, self.height() - 4)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -919,6 +974,82 @@ class GPUCopyTile(BaseTile):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# GPU 3D / COMPUTE TILE  — two sparklines: 3D engine + Compute/CUDA engine
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class GPU3DComputeTile(BaseTile):
+    """
+    Landscape 3D+Compute tile: two stacked sparklines for the 3D rasterisation
+    engine and the Compute/CUDA engine separately.
+    Layout mirrors GPUCopyTile / DriveTile.  palette[0] = 3D colour.
+    """
+    def __init__(self, tile_id: str, gpu_name: str,
+                 palette: Tuple[str, str, str, str], parent=None):
+        self._gpu_name  = gpu_name
+        self._palette   = palette
+        self._color_hex = palette[0]
+        super().__init__(tile_id, palette[0], parent)
+
+    def _build_content(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(6, 5, 6, 5)
+        outer.setSpacing(3)
+
+        # ── Header ────────────────────────────────────────────────────────────
+        hdr = QHBoxLayout()
+        icon_lbl = QLabel("🎮")
+        icon_lbl.setStyleSheet("font-size: 11px;")
+        name_lbl = QLabel(f"{self._gpu_name} · 3D / Compute")
+        name_lbl.setStyleSheet(
+            f"color: {self._palette[0]}; font-size: 11px; font-weight: bold;")
+        hdr.addWidget(icon_lbl)
+        hdr.addSpacing(3)
+        hdr.addWidget(name_lbl)
+        hdr.addStretch()
+        outer.addLayout(hdr)
+
+        # ── 3D row ────────────────────────────────────────────────────────────
+        d3_row = QHBoxLayout()
+        d3_row.setSpacing(4)
+        d3_lbl = QLabel("3D ")
+        d3_lbl.setStyleSheet(
+            f"color: {self._palette[0]}; font-size: 10px; font-weight: bold;")
+        d3_lbl.setFixedWidth(28)
+        self._d3_graph = SparklineWidget(self._palette[0], min_height=24)
+        self._d3_val   = QLabel("0%")
+        self._d3_val.setStyleSheet(f"color: {self._palette[0]}; font-size: 10px;")
+        self._d3_val.setFixedWidth(34)
+        self._d3_val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)  # type: ignore
+        d3_row.addWidget(d3_lbl)
+        d3_row.addWidget(self._d3_graph)
+        d3_row.addWidget(self._d3_val)
+        outer.addLayout(d3_row)
+
+        # ── Compute row ───────────────────────────────────────────────────────
+        cm_row = QHBoxLayout()
+        cm_row.setSpacing(4)
+        cm_lbl = QLabel("Cmp")
+        cm_lbl.setStyleSheet(
+            f"color: {self._palette[1]}; font-size: 10px; font-weight: bold;")
+        cm_lbl.setFixedWidth(28)
+        self._cm_graph = SparklineWidget(self._palette[1], min_height=24)
+        self._cm_val   = QLabel("0%")
+        self._cm_val.setStyleSheet(f"color: {self._palette[1]}; font-size: 10px;")
+        self._cm_val.setFixedWidth(34)
+        self._cm_val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)  # type: ignore
+        cm_row.addWidget(cm_lbl)
+        cm_row.addWidget(self._cm_graph)
+        cm_row.addWidget(self._cm_val)
+        outer.addLayout(cm_row)
+
+    def update_3d_compute(self, d3: float, compute: float):
+        self._d3_graph.add_value(d3)
+        self._cm_graph.add_value(compute)
+        self._d3_val.setText(f"{int(d3)}%")
+        self._cm_val.setText(f"{int(compute)}%")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # RESPONSIVE CORE GRID  — CPU topology grid that auto-reflows on window resize
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -948,15 +1079,32 @@ class ResponsiveCoreGrid(QWidget):
         self._grid = QGridLayout(self)
         self._grid.setSpacing(6)
         self._grid.setContentsMargins(0, 0, 0, 0)
-        self._do_layout(max(1, len(columns)))   # sensible initial layout
+        # Initial layout: balanced distribution across rows
+        n = len(columns)
+        if n > 0:
+            raw = max(1, n)
+            rows_guess = max(1, math.ceil(n / 8))   # assume ~8 cols max initially
+            init_cols  = math.ceil(n / rows_guess)
+        else:
+            init_cols = 1
+        self._do_layout(init_cols)
 
     # ── Layout ─────────────────────────────────────────────────────────────────
 
+    def _balanced_cols(self, raw_cols: int) -> int:
+        """Given raw col count, reduce to evenly distribute items across rows."""
+        n = len(self._columns)
+        if n == 0:
+            return 1
+        rows = max(1, math.ceil(n / raw_cols))
+        return math.ceil(n / rows)
+
     def resizeEvent(self, event):                                   # type: ignore
         super().resizeEvent(event)
-        new_cols = max(1, min(self.width() // self._min_col_w, len(self._columns)))
-        if new_cols != self._last_cols:
-            self._do_layout(new_cols)
+        raw  = max(1, min(self.width() // self._min_col_w, len(self._columns)))
+        cols = self._balanced_cols(raw)
+        if cols != self._last_cols:
+            self._do_layout(cols)
 
     def _do_layout(self, grid_cols: int):
         self._last_cols = grid_cols
@@ -1017,12 +1165,14 @@ class TileGrid(QWidget):
 
         for t in self._tiles.values():
             t.setParent(self)
-            t.swap_requested.connect(self._on_swap)
+            t.move_requested.connect(self._on_move)
             t.remove_requested.connect(self._on_hide)
+            t.rowbreak_requested.connect(self._on_rowbreak)
 
         cfg = self._load_config()
         if cfg:
-            saved_order  = [tid for tid in cfg.get('tile_order', []) if tid in self._tiles]
+            saved_order  = [tid for tid in cfg.get('tile_order', [])
+                            if tid == "__row__" or tid in self._tiles]
             saved_hidden = [tid for tid in cfg.get('hidden_tiles', []) if tid in self._tiles]
             known = set(saved_order) | set(saved_hidden)
             for tid in default_order:
@@ -1074,16 +1224,30 @@ class TileGrid(QWidget):
         for c in range(max(self._grid.columnCount(), 1)):
             self._grid.setColumnStretch(c, 0)
 
-        for i, tid in enumerate(self._tile_order):
+        # Place tiles, honouring __row__ sentinels as explicit line breaks
+        row = 0
+        col = 0
+        for tid in self._tile_order:
+            if tid == "__row__":
+                if col > 0:          # only break if something is on this row
+                    row += 1
+                    col = 0
+                continue
             tile = self._tiles[tid]
-            self._grid.addWidget(tile, i // cols, i % cols)
+            self._grid.addWidget(tile, row, col)
             tile.show()
+            col += 1
+            if col >= cols:
+                col = 0
+                row += 1
 
-        total_rows = max(1, math.ceil(len(self._tile_order) / cols))
-        for r in range(total_rows):
+        total_rows = row + (1 if col > 0 else 0)
+        for r in range(max(1, total_rows)):
             self._grid.setRowStretch(r, 1)
         for c in range(cols):
             self._grid.setColumnStretch(c, 1)
+
+        self._update_rowbreak_buttons()
 
     # ── Edit mode ──────────────────────────────────────────────────────────────
 
@@ -1091,6 +1255,8 @@ class TileGrid(QWidget):
         self._edit_mode = enabled
         for tile in self._tiles.values():
             tile.set_edit_mode(enabled)
+        if enabled:
+            self._update_rowbreak_buttons()
 
     def set_min_tile_w(self, w: int):
         """Adjust minimum tile width (controls auto-column count on resize)."""
@@ -1105,12 +1271,56 @@ class TileGrid(QWidget):
 
     # ── Tile management ────────────────────────────────────────────────────────
 
-    def _on_swap(self, id_a: str, id_b: str):
-        if id_a in self._tile_order and id_b in self._tile_order:
-            i, j = self._tile_order.index(id_a), self._tile_order.index(id_b)
-            self._tile_order[i], self._tile_order[j] = self._tile_order[j], self._tile_order[i]
-            self._relayout()
-            self._save_config()
+    def _on_move(self, src: str, target: str, insert_before: bool):
+        """Remove src from its current position and insert it before/after target."""
+        if src not in self._tile_order or target not in self._tile_order or src == target:
+            return
+        self._tile_order.remove(src)
+        idx = self._tile_order.index(target)
+        if not insert_before:
+            idx += 1
+        self._tile_order.insert(idx, src)
+        self._cleanup_rowbreaks()
+        self._relayout()
+        self._save_config()
+
+    def _on_rowbreak(self, tile_id: str):
+        """Toggle a __row__ sentinel immediately before tile_id."""
+        if tile_id not in self._tile_order:
+            return
+        idx = self._tile_order.index(tile_id)
+        if idx > 0 and self._tile_order[idx - 1] == "__row__":
+            self._tile_order.pop(idx - 1)   # remove existing break
+        elif idx > 0:                        # don't add break before the very first tile
+            self._tile_order.insert(idx, "__row__")
+        self._relayout()
+        self._save_config()
+
+    def _cleanup_rowbreaks(self):
+        """Remove duplicate, leading, and trailing __row__ sentinels."""
+        result: List[str] = []
+        last_was_break = True   # treat start as already broken (no leading breaks)
+        for item in self._tile_order:
+            if item == "__row__":
+                if not last_was_break:
+                    result.append(item)
+                last_was_break = True
+            else:
+                result.append(item)
+                last_was_break = False
+        while result and result[-1] == "__row__":
+            result.pop()
+        self._tile_order = result
+
+    def _update_rowbreak_buttons(self):
+        """Refresh the ↵ button highlight on every visible tile."""
+        for i, tid in enumerate(self._tile_order):
+            if tid == "__row__":
+                continue
+            tile = self._tiles.get(tid)
+            if tile:
+                has_break = (i > 0 and self._tile_order[i - 1] == "__row__")
+                tile.set_rowbreak_active(has_break)
 
     def _on_hide(self, tile_id: str):
         if tile_id in self._tile_order:
@@ -1118,6 +1328,7 @@ class TileGrid(QWidget):
             if tile_id not in self._hidden:
                 self._hidden.append(tile_id)
             self._tiles[tile_id].hide()
+            self._cleanup_rowbreaks()
             self._relayout()
             self._save_config()
 
@@ -1135,7 +1346,8 @@ class TileGrid(QWidget):
 
     def hidden_tiles(self) -> List[Tuple[str, str]]:
         """Returns [(tile_id, display_name)] for all hidden tiles."""
-        return [(tid, self._tile_names.get(tid, tid)) for tid in self._hidden]
+        return [(tid, self._tile_names.get(tid, tid))
+                for tid in self._hidden if tid != "__row__"]
 
     # ── Config ─────────────────────────────────────────────────────────────────
 
@@ -1161,7 +1373,7 @@ class TileGrid(QWidget):
             pass
 
     def reset_layout(self, default_order: List[str]):
-        """Restore factory layout."""
+        """Restore factory layout (removes all row breaks)."""
         self._tile_order  = [tid for tid in default_order if tid in self._tiles]
         self._hidden      = [tid for tid in self._tiles if tid not in self._tile_order]
         self._min_tile_w  = 220
@@ -1307,7 +1519,7 @@ def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD  v0.3
+# MAIN DASHBOARD  v0.4
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TricorderDashboard(QMainWindow):
@@ -1322,7 +1534,7 @@ class TricorderDashboard(QMainWindow):
         except Exception:
             pass
 
-        self.setWindowTitle("System Tricorder v0.3")
+        self.setWindowTitle("System Tricorder v0.4")
         self.setMinimumSize(1280, 900)
         self.setStyleSheet("QMainWindow, QWidget { background-color: #0a0a0f; color: white; }")
 
@@ -1428,7 +1640,7 @@ class TricorderDashboard(QMainWindow):
 
         title = QLabel(
             "📊  System Tricorder  "
-            "<span style='font-size:18px; color:#00aa55;'>v0.3</span>"
+            "<span style='font-size:18px; color:#00aa55;'>v0.4</span>"
         )
         title.setStyleSheet(
             "font-size: 28px; font-weight: bold; color: #00ff88; background: transparent;")
@@ -1558,7 +1770,7 @@ class TricorderDashboard(QMainWindow):
             pal = GPU_PALETTES[gi % len(GPU_PALETTES)]
             sn  = short_gpu_name(gname)
             reg(f"gpu_{gi}_3d",
-                MetricTile(f"gpu_{gi}_3d", f"{sn} · 3D / Compute", pal[0]),
+                GPU3DComputeTile(f"gpu_{gi}_3d", sn, pal),
                 f"{sn} · 3D / Compute")
             reg(f"gpu_{gi}_copy",
                 GPUCopyTile(f"gpu_{gi}_copy", sn, pal),
@@ -1717,7 +1929,9 @@ class TricorderDashboard(QMainWindow):
         upd("npu",  m.npu_percent)
 
         for i, gm in enumerate(m.gpus):
-            upd(f"gpu_{i}_3d", gm.gpu_3d_percent)
+            w_3d = _t(f"gpu_{i}_3d")
+            if w_3d and isinstance(w_3d, GPU3DComputeTile):
+                w_3d.update_3d_compute(gm.gpu_3d_percent, gm.gpu_compute_percent)
             w_copy = _t(f"gpu_{i}_copy")
             if w_copy and isinstance(w_copy, GPUCopyTile):
                 w_copy.update_copy(gm.gpu_copy0_percent, gm.gpu_copy1_percent)

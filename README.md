@@ -129,7 +129,7 @@ Delete the file to reset to factory defaults.
 - Responsive CPU grid — P-Core, E-Core and HT/SMT pairs reflow automatically on window resize; HT/SMT pairs always stay together in the same column
 - Clock & date enlarged to 36 px
 
-### v0.3
+### v0.4
 - **Edit Mode** — drag-to-reorder tiles, × to hide, ＋ to restore, ‹/› to adjust columns
 - **Per-drive tiles** — each physical drive gets one landscape tile with dual Read/Write sparklines and auto-scaling MB/s axis (auto-switches to GB/s for fast NVMe)
 - **Layout persistence** — order, hidden tiles, and column count saved to `~/.tricorder_layout.json`

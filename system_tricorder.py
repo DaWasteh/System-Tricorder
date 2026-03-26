@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-System Tricorder v0.4 — Hardware Monitoring Dashboard
+System Tricorder v0.5 — Hardware Monitoring Dashboard
 Dark Mode | 20 FPS | Multi-GPU | P/E Cores | Customisable Layout | Per-Drive Tiles
 """
 
@@ -602,10 +602,10 @@ class BaseTile(QFrame):
 
     def __init__(self, tile_id: str, color_hex: str, parent=None):
         super().__init__(parent)
-        self.tile_id     = tile_id
-        self._color_hex  = color_hex
-        self._edit_mode  = False
-        self._drop_hl    = False
+        self.tile_id      = tile_id
+        self._color_hex   = color_hex
+        self._edit_mode   = False
+        self._drop_hl     = False
         self._drop_before = True
         self._drag_pos: Optional[QPoint] = None
 
@@ -633,11 +633,11 @@ class BaseTile(QFrame):
         self._btn_rn.setFixedSize(self._BTN_SIZE, self._BTN_SIZE)
         self._btn_rn.setToolTip("Toggle row break before this tile")
         self._rowbreak_active = False
-        self._style_rowbreak_btn()
+        self._style_rn_btn()
         self._btn_rn.hide()
         self._btn_rn.clicked.connect(lambda: self.rowbreak_requested.emit(self.tile_id))
 
-    def _style_rowbreak_btn(self):
+    def _style_rn_btn(self):
         if self._rowbreak_active:
             self._btn_rn.setStyleSheet("""
                 QPushButton {
@@ -649,7 +649,7 @@ class BaseTile(QFrame):
         else:
             self._btn_rn.setStyleSheet("""
                 QPushButton {
-                    background: #1e2a1e; color: #446644;
+                    background: #1a2a1a; color: #336633;
                     border-radius: 9px; font-size: 9px; font-weight: bold;
                     border: 1px solid #2a3a2a;
                 }
@@ -657,9 +657,9 @@ class BaseTile(QFrame):
             """)
 
     def set_rowbreak_active(self, active: bool):
-        """Highlight the ↵ button when a row break is active before this tile."""
+        """Highlight ↵ when a row break is active before this tile."""
         self._rowbreak_active = active
-        self._style_rowbreak_btn()
+        self._style_rn_btn()
 
     def _apply_frame_style(self, accent: str, edit: bool):
         border_side = "#3a3a2a" if edit else "#222"
@@ -1050,6 +1050,115 @@ class GPU3DComputeTile(BaseTile):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# ROW DROP ZONE  — accepts drops at end of each row in edit mode
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class RowDropZone(QWidget):
+    """
+    Thin droppable area appended to the end of each tile row in edit mode.
+    Drag a tile onto it to append that tile to the end of this row.
+    """
+    drop_received = pyqtSignal(str, int)   # (tile_id, row_index)
+
+    def __init__(self, row_idx: int, parent=None):
+        super().__init__(parent)
+        self._row_idx = row_idx
+        self._hover   = False
+        self.setAcceptDrops(True)
+        self.setFixedWidth(28)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.setMinimumHeight(40)
+
+    def dragEnterEvent(self, event):                                # type: ignore
+        if event.mimeData().hasText():
+            event.acceptProposedAction()
+            self._hover = True
+            self.update()
+
+    def dragMoveEvent(self, event):                                 # type: ignore
+        event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):                                # type: ignore
+        self._hover = False
+        self.update()
+
+    def dropEvent(self, event):                                     # type: ignore
+        tid = event.mimeData().text()
+        self.drop_received.emit(tid, self._row_idx)
+        event.acceptProposedAction()
+        self._hover = False
+        self.update()
+
+    def paintEvent(self, event):                                    # type: ignore
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        if self._hover:
+            p.setPen(QPen(QColor("#ffdd55"), 2))
+            p.setBrush(QBrush(QColor(40, 40, 10, 80)))
+            p.drawRoundedRect(self.rect().adjusted(2, 2, -2, -2), 4, 4)
+            p.setPen(QColor("#ffdd55"))
+        else:
+            p.setPen(QPen(QColor("#2a3a2a"), 1, Qt.DashLine))      # type: ignore
+            p.drawRoundedRect(self.rect().adjusted(2, 2, -2, -2), 4, 4)
+            p.setPen(QColor("#2a4a2a"))
+        p.setPen(QColor("#444444") if self._hover else QColor("#2a4a2a"))
+        p.drawText(self.rect(), Qt.AlignCenter, "+")                # type: ignore
+
+
+class InterRowDropZone(QWidget):
+    """
+    Thin horizontal droppable bar shown between rows (and at the bottom)
+    in edit mode.  Dropping a tile here inserts it as the FIRST tile of
+    a brand-new row at that position.
+    Emits: new_row_requested(tile_id, after_row_idx)
+      after_row_idx == -1  →  prepend a new first row
+      after_row_idx ==  N  →  insert a new row after existing row N
+    """
+    new_row_requested = pyqtSignal(str, int)
+
+    def __init__(self, after_row_idx: int, parent=None):
+        super().__init__(parent)
+        self._after  = after_row_idx
+        self._hover  = False
+        self.setAcceptDrops(True)
+        self.setFixedHeight(16)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def dragEnterEvent(self, event):                                # type: ignore
+        if event.mimeData().hasText():
+            event.acceptProposedAction()
+            self._hover = True
+            self.update()
+
+    def dragMoveEvent(self, event):                                 # type: ignore
+        event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):                                # type: ignore
+        self._hover = False
+        self.update()
+
+    def dropEvent(self, event):                                     # type: ignore
+        self.new_row_requested.emit(event.mimeData().text(), self._after)
+        event.acceptProposedAction()
+        self._hover = False
+        self.update()
+
+    def paintEvent(self, event):                                    # type: ignore
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        y = self.height() // 2
+        if self._hover:
+            p.setPen(QPen(QColor("#ffdd55"), 2))
+            p.drawLine(0, y, self.width(), y)
+            # Small centre label
+            p.setPen(QColor("#ffdd55"))
+            p.drawText(self.rect(), Qt.AlignCenter, "── new row ──")  # type: ignore
+        else:
+            p.setPen(QPen(QColor("#2a3a2a"), 1, Qt.DashLine))          # type: ignore
+            p.drawLine(4, y, self.width() - 4, y)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # RESPONSIVE CORE GRID  — CPU topology grid that auto-reflows on window resize
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1079,32 +1188,15 @@ class ResponsiveCoreGrid(QWidget):
         self._grid = QGridLayout(self)
         self._grid.setSpacing(6)
         self._grid.setContentsMargins(0, 0, 0, 0)
-        # Initial layout: balanced distribution across rows
-        n = len(columns)
-        if n > 0:
-            raw = max(1, n)
-            rows_guess = max(1, math.ceil(n / 8))   # assume ~8 cols max initially
-            init_cols  = math.ceil(n / rows_guess)
-        else:
-            init_cols = 1
-        self._do_layout(init_cols)
+        self._do_layout(max(1, len(columns)))   # sensible initial layout
 
     # ── Layout ─────────────────────────────────────────────────────────────────
 
-    def _balanced_cols(self, raw_cols: int) -> int:
-        """Given raw col count, reduce to evenly distribute items across rows."""
-        n = len(self._columns)
-        if n == 0:
-            return 1
-        rows = max(1, math.ceil(n / raw_cols))
-        return math.ceil(n / rows)
-
     def resizeEvent(self, event):                                   # type: ignore
         super().resizeEvent(event)
-        raw  = max(1, min(self.width() // self._min_col_w, len(self._columns)))
-        cols = self._balanced_cols(raw)
-        if cols != self._last_cols:
-            self._do_layout(cols)
+        new_cols = max(1, min(self.width() // self._min_col_w, len(self._columns)))
+        if new_cols != self._last_cols:
+            self._do_layout(new_cols)
 
     def _do_layout(self, grid_cols: int):
         self._last_cols = grid_cols
@@ -1142,26 +1234,33 @@ class ResponsiveCoreGrid(QWidget):
 
 class TileGrid(QWidget):
     """
-    Hosts all global-metric tiles in a configurable grid.
+    Hosts all global-metric tiles in a free-form row layout.
 
-    • tile_order  — list of currently visible tile IDs in display order
-    • _hidden     — list of hidden tile IDs
-    • _cols       — number of grid columns (adjustable in edit mode)
+    Layout model
+    ────────────
+    _tile_order is a flat list that may contain real tile IDs and the special
+    sentinel '__row__' which forces a new row.  Each row is rendered as an
+    independent QHBoxLayout — so rows can have different numbers of tiles and
+    each row fills the full width equally regardless of tile count.
 
-    Layout is recomputed on every change.  Config is auto-saved to
-    CONFIG_FILE after each user-initiated change.
+    In edit mode every tile shows:
+      • ↵  (top-left)  — toggle a row break before this tile  (green = active)
+      • ×  (top-right) — hide this tile
+    A small '+' drop zone appears at the end of each row; dropping a tile on it
+    appends that tile to the end of that row.
     """
 
     def __init__(self, tiles: Dict[str, BaseTile],
                  tile_names: Dict[str, str],
                  default_order: List[str],
-                 cols: int = 5,
+                 cols: int = 5,          # kept for API compat, ignored
                  parent=None):
         super().__init__(parent)
         self._tiles      = tiles
         self._tile_names = tile_names
         self._edit_mode  = False
-        self._last_cols  = 0    # tracks last rendered col-count to avoid redundant relayouts
+        self._min_row_h  = 130    # minimum height per tile row (px)
+        self._row_widgets: List[QWidget] = []
 
         for t in self._tiles.values():
             t.setParent(self)
@@ -1172,107 +1271,114 @@ class TileGrid(QWidget):
         cfg = self._load_config()
         if cfg:
             saved_order  = [tid for tid in cfg.get('tile_order', [])
-                            if tid == "__row__" or tid in self._tiles]
+                            if tid == '__row__' or tid in self._tiles]
             saved_hidden = [tid for tid in cfg.get('hidden_tiles', []) if tid in self._tiles]
-            known = set(saved_order) | set(saved_hidden)
+            known = set(t for t in saved_order if t != '__row__') | set(saved_hidden)
             for tid in default_order:
                 if tid not in known:
                     saved_order.append(tid)
-            self._tile_order  = saved_order
-            self._hidden      = saved_hidden
-            # min_tile_w stored in config; fall back to old 'cols'-based estimate
-            saved_mtw = cfg.get('min_tile_w')
-            if saved_mtw:
-                self._min_tile_w = int(saved_mtw)
-            else:
-                old_cols = cfg.get('cols', cols)
-                self._min_tile_w = max(100, 1280 // max(1, old_cols))
+            self._tile_order = saved_order
+            self._hidden     = saved_hidden
+            self._min_row_h  = int(cfg.get('min_row_h', self._min_row_h))
         else:
-            self._tile_order  = list(default_order)
-            self._hidden      = [tid for tid in self._tiles if tid not in default_order]
-            self._min_tile_w  = 220   # default: ~5–6 cols at 1280 px
+            self._tile_order = list(default_order)
+            self._hidden     = [tid for tid in self._tiles if tid not in default_order]
 
-        self._grid = QGridLayout(self)
-        self._grid.setSpacing(6)
+        self._vbox = QVBoxLayout(self)
+        self._vbox.setSpacing(6)
+        self._vbox.setContentsMargins(0, 0, 0, 0)
         self._relayout()
 
-    # ── Layout helpers ─────────────────────────────────────────────────────────
+    # ── Layout ────────────────────────────────────────────────────────────────
 
-    def _compute_cols(self) -> int:
-        """Compute column count from current widget width and min tile width."""
-        w = self.width()
-        if w <= 0:
-            w = 1280   # pre-layout fallback
-        return max(1, w // self._min_tile_w)
-
-    def resizeEvent(self, event):                                   # type: ignore
-        super().resizeEvent(event)
-        new_cols = self._compute_cols()
-        if new_cols != self._last_cols:
-            self._relayout()
+    def _parse_rows(self) -> List[List[str]]:
+        """Split _tile_order into rows of tile IDs (sentinels consumed)."""
+        rows: List[List[str]] = [[]]
+        for tid in self._tile_order:
+            if tid == '__row__':
+                if rows[-1]:          # only break if current row has content
+                    rows.append([])
+            else:
+                rows[-1].append(tid)
+        return [r for r in rows if r]
 
     def _relayout(self):
-        cols = self._compute_cols()
-        self._last_cols = cols
-
+        # 1. Reparent all tiles to self so row-widget deletion doesn't kill them
         for tile in self._tiles.values():
-            self._grid.removeWidget(tile)
+            tile.setParent(self)
             tile.hide()
 
-        for r in range(max(self._grid.rowCount(), 1)):
-            self._grid.setRowStretch(r, 0)
-        for c in range(max(self._grid.columnCount(), 1)):
-            self._grid.setColumnStretch(c, 0)
+        # 2. Remove and destroy old row wrapper widgets
+        for rw in self._row_widgets:
+            self._vbox.removeWidget(rw)
+            rw.deleteLater()
+        self._row_widgets.clear()
 
-        # Place tiles, honouring __row__ sentinels as explicit line breaks
-        row = 0
-        col = 0
-        for tid in self._tile_order:
-            if tid == "__row__":
-                if col > 0:          # only break if something is on this row
-                    row += 1
-                    col = 0
-                continue
-            tile = self._tiles[tid]
-            self._grid.addWidget(tile, row, col)
-            tile.show()
-            col += 1
-            if col >= cols:
-                col = 0
-                row += 1
+        # 3. Build rows — interleave InterRowDropZones in edit mode
+        rows = self._parse_rows()
 
-        total_rows = row + (1 if col > 0 else 0)
-        for r in range(max(1, total_rows)):
-            self._grid.setRowStretch(r, 1)
-        for c in range(cols):
-            self._grid.setColumnStretch(c, 1)
+        if self._edit_mode:
+            # Drop zone BEFORE first row (after_row_idx = -1)
+            dz0 = InterRowDropZone(-1)
+            dz0.new_row_requested.connect(self._on_new_row)
+            self._vbox.addWidget(dz0)
+            self._row_widgets.append(dz0)
+
+        for row_idx, row_tiles in enumerate(rows):
+            rw = QWidget(self)
+            rw.setStyleSheet("background: transparent;")
+            rw.setMinimumHeight(self._min_row_h)
+            hbox = QHBoxLayout(rw)
+            hbox.setContentsMargins(0, 0, 0, 0)
+            hbox.setSpacing(6)
+
+            for tid in row_tiles:
+                tile = self._tiles[tid]
+                tile.setParent(rw)
+                tile.set_edit_mode(self._edit_mode)
+                hbox.addWidget(tile, stretch=1)
+                tile.show()
+
+            if self._edit_mode:
+                dz = RowDropZone(row_idx, rw)
+                dz.drop_received.connect(self._on_drop_to_row)
+                hbox.addWidget(dz, stretch=0)
+
+            self._vbox.addWidget(rw, stretch=1)
+            self._row_widgets.append(rw)
+
+            if self._edit_mode:
+                # Drop zone AFTER this row
+                sep = InterRowDropZone(row_idx)
+                sep.new_row_requested.connect(self._on_new_row)
+                self._vbox.addWidget(sep)
+                self._row_widgets.append(sep)
 
         self._update_rowbreak_buttons()
 
-    # ── Edit mode ──────────────────────────────────────────────────────────────
+    # ── Edit mode ─────────────────────────────────────────────────────────────
 
     def set_edit_mode(self, enabled: bool):
         self._edit_mode = enabled
-        for tile in self._tiles.values():
-            tile.set_edit_mode(enabled)
-        if enabled:
-            self._update_rowbreak_buttons()
+        self._relayout()   # rebuild to show/hide drop zones
 
-    def set_min_tile_w(self, w: int):
-        """Adjust minimum tile width (controls auto-column count on resize)."""
-        self._min_tile_w = max(100, min(w, 800))
-        self._relayout()
+    def set_min_row_h(self, h: int):
+        """Adjust minimum row height — tiles shrink/grow vertically."""
+        self._min_row_h = max(80, min(h, 600))
+        for rw in self._row_widgets:
+            rw.setMinimumHeight(self._min_row_h)
         self._save_config()
 
     @property
     def cols(self) -> int:
-        """Current auto-computed column count."""
-        return self._compute_cols()
+        """Not meaningful in free layout — returns longest row length."""
+        rows = self._parse_rows()
+        return max((len(r) for r in rows), default=1)
 
-    # ── Tile management ────────────────────────────────────────────────────────
+    # ── Tile management ───────────────────────────────────────────────────────
 
     def _on_move(self, src: str, target: str, insert_before: bool):
-        """Remove src from its current position and insert it before/after target."""
+        """Insert src immediately before or after target in _tile_order."""
         if src not in self._tile_order or target not in self._tile_order or src == target:
             return
         self._tile_order.remove(src)
@@ -1284,50 +1390,78 @@ class TileGrid(QWidget):
         self._relayout()
         self._save_config()
 
+    def _on_drop_to_row(self, tile_id: str, row_idx: int):
+        """Append tile_id to the end of row_idx."""
+        rows = self._parse_rows()
+        if tile_id not in self._tile_order or row_idx >= len(rows):
+            return
+        row_tiles = rows[row_idx]
+        if not row_tiles:
+            return
+        last_tid = row_tiles[-1]
+        if tile_id == last_tid:
+            return
+        self._on_move(tile_id, last_tid, insert_before=False)
+
+    def _on_new_row(self, tile_id: str, after_row_idx: int):
+        """
+        Move tile_id to start a brand-new row.
+        after_row_idx == -1  → new row becomes the first row
+        after_row_idx ==  N  → new row inserted after existing row N
+        """
+        if tile_id not in self._tile_order:
+            return
+        rows = self._parse_rows()
+
+        # Remove tile from current position (and clean up orphaned sentinels)
+        self._tile_order.remove(tile_id)
+        self._cleanup_rowbreaks()
+
+        if after_row_idx == -1:
+            # Prepend: tile goes before everything else
+            self._tile_order.insert(0, tile_id)
+            # Add a row-break after it only if there are other tiles
+            if len(self._tile_order) > 1 and self._tile_order[1] != '__row__':
+                self._tile_order.insert(1, '__row__')
+        else:
+            # Find the last tile of the target row and insert after it
+            if after_row_idx < len(rows):
+                anchor = rows[after_row_idx][-1]
+                idx = self._tile_order.index(anchor)
+                # Insert: __row__ + tile_id after anchor
+                self._tile_order.insert(idx + 1, '__row__')
+                self._tile_order.insert(idx + 2, tile_id)
+                # If next item is also a tile (not __row__), add another break
+                next_idx = idx + 3
+                if (next_idx < len(self._tile_order) and
+                        self._tile_order[next_idx] != '__row__'):
+                    self._tile_order.insert(next_idx, '__row__')
+            else:
+                # after_row_idx beyond existing rows → append new last row
+                self._tile_order.append('__row__')
+                self._tile_order.append(tile_id)
+
+        self._cleanup_rowbreaks()
+        self._relayout()
+        self._save_config()
+
     def _on_rowbreak(self, tile_id: str):
         """Toggle a __row__ sentinel immediately before tile_id."""
         if tile_id not in self._tile_order:
             return
         idx = self._tile_order.index(tile_id)
-        if idx > 0 and self._tile_order[idx - 1] == "__row__":
-            self._tile_order.pop(idx - 1)   # remove existing break
-        elif idx > 0:                        # don't add break before the very first tile
-            self._tile_order.insert(idx, "__row__")
+        if idx > 0 and self._tile_order[idx - 1] == '__row__':
+            self._tile_order.pop(idx - 1)    # remove existing break
+        elif idx > 0:                         # don't break before the very first tile
+            self._tile_order.insert(idx, '__row__')
         self._relayout()
         self._save_config()
-
-    def _cleanup_rowbreaks(self):
-        """Remove duplicate, leading, and trailing __row__ sentinels."""
-        result: List[str] = []
-        last_was_break = True   # treat start as already broken (no leading breaks)
-        for item in self._tile_order:
-            if item == "__row__":
-                if not last_was_break:
-                    result.append(item)
-                last_was_break = True
-            else:
-                result.append(item)
-                last_was_break = False
-        while result and result[-1] == "__row__":
-            result.pop()
-        self._tile_order = result
-
-    def _update_rowbreak_buttons(self):
-        """Refresh the ↵ button highlight on every visible tile."""
-        for i, tid in enumerate(self._tile_order):
-            if tid == "__row__":
-                continue
-            tile = self._tiles.get(tid)
-            if tile:
-                has_break = (i > 0 and self._tile_order[i - 1] == "__row__")
-                tile.set_rowbreak_active(has_break)
 
     def _on_hide(self, tile_id: str):
         if tile_id in self._tile_order:
             self._tile_order.remove(tile_id)
             if tile_id not in self._hidden:
                 self._hidden.append(tile_id)
-            self._tiles[tile_id].hide()
             self._cleanup_rowbreaks()
             self._relayout()
             self._save_config()
@@ -1337,19 +1471,41 @@ class TileGrid(QWidget):
             self._hidden.remove(tile_id)
         if tile_id not in self._tile_order:
             self._tile_order.append(tile_id)
-        tile = self._tiles.get(tile_id)
-        if tile:
-            tile.set_edit_mode(self._edit_mode)
-            tile.show()
         self._relayout()
         self._save_config()
 
     def hidden_tiles(self) -> List[Tuple[str, str]]:
-        """Returns [(tile_id, display_name)] for all hidden tiles."""
         return [(tid, self._tile_names.get(tid, tid))
-                for tid in self._hidden if tid != "__row__"]
+                for tid in self._hidden if tid != '__row__']
 
-    # ── Config ─────────────────────────────────────────────────────────────────
+    # ── Row-break helpers ─────────────────────────────────────────────────────
+
+    def _cleanup_rowbreaks(self):
+        """Remove leading, trailing, and consecutive __row__ sentinels."""
+        result: List[str] = []
+        last_was_break = True   # treat start as break → no leading break
+        for item in self._tile_order:
+            if item == '__row__':
+                if not last_was_break:
+                    result.append(item)
+                last_was_break = True
+            else:
+                result.append(item)
+                last_was_break = False
+        while result and result[-1] == '__row__':
+            result.pop()
+        self._tile_order = result
+
+    def _update_rowbreak_buttons(self):
+        for i, tid in enumerate(self._tile_order):
+            if tid == '__row__':
+                continue
+            tile = self._tiles.get(tid)
+            if tile:
+                has_break = (i > 0 and self._tile_order[i - 1] == '__row__')
+                tile.set_rowbreak_active(has_break)
+
+    # ── Config ────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _load_config() -> dict:
@@ -1362,8 +1518,8 @@ class TileGrid(QWidget):
         try:
             CONFIG_FILE.write_text(
                 json.dumps({
-                    'version':      '0.3',
-                    'min_tile_w':   self._min_tile_w,
+                    'version':      '0.5',
+                    'min_row_h':    self._min_row_h,
                     'tile_order':   self._tile_order,
                     'hidden_tiles': self._hidden,
                 }, indent=2, ensure_ascii=False),
@@ -1373,10 +1529,10 @@ class TileGrid(QWidget):
             pass
 
     def reset_layout(self, default_order: List[str]):
-        """Restore factory layout (removes all row breaks)."""
-        self._tile_order  = [tid for tid in default_order if tid in self._tiles]
-        self._hidden      = [tid for tid in self._tiles if tid not in self._tile_order]
-        self._min_tile_w  = 220
+        """Restore factory layout — removes all row breaks."""
+        self._tile_order = [tid for tid in default_order if tid in self._tiles]
+        self._hidden     = [tid for tid in self._tiles if tid not in self._tile_order]
+        self._min_row_h  = 130
         self._relayout()
         self._save_config()
 
@@ -1519,7 +1675,7 @@ def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD  v0.4
+# MAIN DASHBOARD  v0.5
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TricorderDashboard(QMainWindow):
@@ -1534,7 +1690,7 @@ class TricorderDashboard(QMainWindow):
         except Exception:
             pass
 
-        self.setWindowTitle("System Tricorder v0.4")
+        self.setWindowTitle("System Tricorder v0.5")
         self.setMinimumSize(1280, 900)
         self.setStyleSheet("QMainWindow, QWidget { background-color: #0a0a0f; color: white; }")
 
@@ -1640,7 +1796,7 @@ class TricorderDashboard(QMainWindow):
 
         title = QLabel(
             "📊  System Tricorder  "
-            "<span style='font-size:18px; color:#00aa55;'>v0.4</span>"
+            "<span style='font-size:18px; color:#00aa55;'>v0.5</span>"
         )
         title.setStyleSheet(
             "font-size: 28px; font-weight: bold; color: #00ff88; background: transparent;")
@@ -1759,13 +1915,17 @@ class TricorderDashboard(QMainWindow):
             if in_default:
                 default_order.append(tile_id)
 
-        # ── System-wide ───────────────────────────────────────────────────────
+        def row():
+            """Insert a row-break sentinel into the default layout."""
+            if default_order and default_order[-1] != '__row__':
+                default_order.append('__row__')
+
+        # ── Row 1: CPU + RAM ──────────────────────────────────────────────────
         reg("cpu_total", MetricTile("cpu_total", "CPU Gesamt",          "#00d4ff"), "CPU Gesamt")
         reg("ram",       MetricTile("ram",       f"{self.ram_type} RAM","#ff007f"), f"{self.ram_type} RAM")
-        reg("igpu",      MetricTile("igpu",      "iGPU",                "#0055ff"), "iGPU")
-        reg("npu",       MetricTile("npu",       "NPU",                 "#aa00ff"), "NPU")
 
-        # ── GPUs ──────────────────────────────────────────────────────────────
+        # ── Row 2: GPU engines ────────────────────────────────────────────────
+        row()
         for gi, (gname, _) in enumerate(self.detected_gpus):
             pal = GPU_PALETTES[gi % len(GPU_PALETTES)]
             sn  = short_gpu_name(gname)
@@ -1778,8 +1938,16 @@ class TricorderDashboard(QMainWindow):
             reg(f"gpu_{gi}_vram",
                 MetricTile(f"gpu_{gi}_vram", f"{sn} · VRAM", pal[3]),
                 f"{sn} · VRAM")
+            if gi < len(self.detected_gpus) - 1:
+                row()   # each GPU on its own row if multiple GPUs
 
-        # ── Drives ────────────────────────────────────────────────────────────
+        # ── Row 3: iGPU + NPU ─────────────────────────────────────────────────
+        row()
+        reg("igpu", MetricTile("igpu", "iGPU", "#0055ff"), "iGPU")
+        reg("npu",  MetricTile("npu",  "NPU",  "#aa00ff"), "NPU")
+
+        # ── Row 4+: Drives (all drives on one row) ────────────────────────────
+        row()
         for key, label in self._drive_info:
             tid = f"drive_{key}"
             reg(tid, DriveTile(tid, label), f"Drive {label}")
@@ -1806,12 +1974,12 @@ class TricorderDashboard(QMainWindow):
                 self._tile_grid.show_tile(tid)
 
     def _change_cols(self, delta: int):
-        # delta=+1 → more columns (narrower tiles), delta=-1 → fewer columns (wider tiles)
-        self._tile_grid.set_min_tile_w(self._tile_grid._min_tile_w - delta * 30)
+        # ‹ = rows taller (delta=-1 → +30px),  › = rows shorter (delta=+1 → -30px)
+        self._tile_grid.set_min_row_h(self._tile_grid._min_row_h - delta * 30)
         self._update_cols_label()
 
     def _update_cols_label(self):
-        self._cols_lbl.setText(f"{self._tile_grid.cols} Spalten")
+        self._cols_lbl.setText(f"Zeilenhöhe {self._tile_grid._min_row_h}px")
 
     def _on_reset_layout(self):
         self._tile_grid.reset_layout(self._default_tile_order)

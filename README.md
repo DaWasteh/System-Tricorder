@@ -12,7 +12,6 @@
 ## 🖥️ Screenshots
 
 ![alt text](image.png)
-
 ---
 
 ## ✨ What it does

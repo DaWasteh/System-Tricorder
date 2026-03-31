@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-System Tricorder v0.5 — Hardware Monitoring Dashboard
+System Tricorder v0.6 — Hardware Monitoring Dashboard
 Dark Mode | 20 FPS | Multi-GPU | P/E Cores | Customisable Layout | Per-Drive Tiles
 """
 
@@ -10,12 +10,24 @@ import math
 import json
 import re
 import platform
+import logging
 import psutil
 from pathlib import Path
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    handlers=[
+        logging.FileHandler(Path.home() / ".tricorder.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger("tricorder")
 
 from PyQt5.QtWidgets import (                                       # type: ignore
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -242,8 +254,9 @@ class HardwareMonitorThread(QThread):
 
     def __init__(self, drive_info: List[Tuple[str, str]], parent=None):
         super().__init__(parent)
-        self._running    = False
-        self._drive_info = drive_info   # [(key, label), ...]
+        self._running         = False
+        self._com_initialized = False
+        self._drive_info      = drive_info   # [(key, label), ...]
 
         # GPU static info
         reg_vrams = get_registry_gpu_vrams()
@@ -263,10 +276,15 @@ class HardwareMonitorThread(QThread):
     def run(self):
         self._running = True
         if WMI_AVAILABLE:
-            pythoncom.CoInitialize()                                # type: ignore
+            try:
+                pythoncom.CoInitialize()                            # type: ignore
+                self._com_initialized = True
+            except Exception as exc:
+                logger.warning("CoInitialize failed: %s", exc)
         try:
             wmi = win32com.client.GetObject("winmgmts:root\\cimv2") if WMI_AVAILABLE else None  # type: ignore
-        except Exception:
+        except Exception as exc:
+            logger.warning("WMI connect failed: %s", exc)
             wmi = None
 
         self._last_io      = psutil.disk_io_counters()
@@ -393,13 +411,19 @@ class HardwareMonitorThread(QThread):
                     drives=drives,
                     timestamp=datetime.now(),
                 ))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Monitor loop error: %s", exc)
             time.sleep(0.05)
 
     def stop(self):
         self._running = False
         self.wait()
+        if self._com_initialized:
+            try:
+                pythoncom.CoUninitialize()                          # type: ignore
+            except Exception as exc:
+                logger.debug("CoUninitialize: %s", exc)
+            self._com_initialized = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1174,10 +1198,11 @@ class ResponsiveCoreGrid(QWidget):
     min_col_w — minimum width in px per group-column before wrapping occurs.
     """
     def __init__(self, columns: List[List[QWidget]],
-                 min_col_w: int = 120, parent=None):
+                 min_col_w: int = 120, max_cols: int = 0, parent=None):
         super().__init__(parent)
         self._columns    = columns
         self._min_col_w  = min_col_w
+        self._max_cols   = max_cols   # 0 = no cap
         self._last_cols  = 0
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
@@ -1195,6 +1220,8 @@ class ResponsiveCoreGrid(QWidget):
     def resizeEvent(self, event):                                   # type: ignore
         super().resizeEvent(event)
         new_cols = max(1, min(self.width() // self._min_col_w, len(self._columns)))
+        if self._max_cols:
+            new_cols = min(new_cols, self._max_cols)
         if new_cols != self._last_cols:
             self._do_layout(new_cols)
 
@@ -1510,23 +1537,31 @@ class TileGrid(QWidget):
     @staticmethod
     def _load_config() -> dict:
         try:
-            return json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
-        except Exception:
+            data = json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
+            if data.get('version') != '0.6':
+                logger.warning(
+                    "Config version '%s' differs from '0.6' — "
+                    "layout will be kept as-is; delete %s to reset.",
+                    data.get('version'), CONFIG_FILE,
+                )
+            return data
+        except Exception as exc:
+            logger.debug("Config load: %s", exc)
             return {}
 
     def _save_config(self):
         try:
-            CONFIG_FILE.write_text(
-                json.dumps({
-                    'version':      '0.5',
-                    'min_row_h':    self._min_row_h,
-                    'tile_order':   self._tile_order,
-                    'hidden_tiles': self._hidden,
-                }, indent=2, ensure_ascii=False),
-                encoding='utf-8',
-            )
-        except Exception:
-            pass
+            payload = json.dumps({
+                'version':      '0.6',
+                'min_row_h':    self._min_row_h,
+                'tile_order':   self._tile_order,
+                'hidden_tiles': self._hidden,
+            }, indent=2, ensure_ascii=False)
+            tmp = CONFIG_FILE.with_suffix('.tmp')
+            tmp.write_text(payload, encoding='utf-8')
+            tmp.replace(CONFIG_FILE)          # atomic on same filesystem
+        except Exception as exc:
+            logger.warning("Config save failed: %s", exc)
 
     def reset_layout(self, default_order: List[str]):
         """Restore factory layout — removes all row breaks."""
@@ -1675,7 +1710,7 @@ def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD  v0.5
+# MAIN DASHBOARD  v0.6
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TricorderDashboard(QMainWindow):
@@ -1690,7 +1725,7 @@ class TricorderDashboard(QMainWindow):
         except Exception:
             pass
 
-        self.setWindowTitle("System Tricorder v0.5")
+        self.setWindowTitle("System Tricorder v0.6")
         self.setMinimumSize(1280, 900)
         self.setStyleSheet("QMainWindow, QWidget { background-color: #0a0a0f; color: white; }")
 
@@ -1796,7 +1831,7 @@ class TricorderDashboard(QMainWindow):
 
         title = QLabel(
             "📊  System Tricorder  "
-            "<span style='font-size:18px; color:#00aa55;'>v0.5</span>"
+            "<span style='font-size:18px; color:#00aa55;'>v0.6</span>"
         )
         title.setStyleSheet(
             "font-size: 28px; font-weight: bold; color: #00ff88; background: transparent;")
@@ -2029,7 +2064,8 @@ class TricorderDashboard(QMainWindow):
             w = MasterMetricBox(f"E-Core {i}", E_COLOR, variant='efficiency')
             self.thread_widgets[t] = w
             e_groups.append([w])
-        parent.addWidget(ResponsiveCoreGrid(e_groups, min_col_w=100), 1)
+        parent.addWidget(ResponsiveCoreGrid(e_groups, min_col_w=100,
+                                            max_cols=math.ceil(self.e_cores / 2)), 1)
 
     def _build_ht_cores(self, parent: QVBoxLayout):
         PHYS_COLOR = "#ff6600" if self.is_amd else "#00d4ff"

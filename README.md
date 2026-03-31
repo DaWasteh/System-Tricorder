@@ -2,7 +2,7 @@
 
 > A real-time hardware monitoring dashboard for Windows — dark mode, 20 FPS, fully customisable free-form layout.
 
-![Version](https://img.shields.io/badge/version-0.5-00ff88?style=flat-square)
+![Version](https://img.shields.io/badge/version-0.6-00ff88?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
@@ -12,6 +12,7 @@
 ## 🖥️ Screenshots
 
 ![alt text](image.png)
+
 ---
 
 ## ✨ What it does
@@ -146,7 +147,7 @@ Values are shown in MB/s and automatically switch to GB/s for drives exceeding 1
 
 ```json
 {
-  "version": "0.5",
+  "version": "0.6",
   "min_row_h": 130,
   "tile_order": [
     "cpu_total", "ram",
@@ -167,7 +168,13 @@ Delete the file to reset to factory defaults.
 
 ## 🗂️ Changelog
 
-### v0.5 *(current)*
+### v0.6 *(current)*
+- **COM cleanup** — `pythoncom.CoUninitialize()` is now correctly called when the monitor thread exits, pairing every `CoInitialize()` and releasing the COM apartment cleanly
+- **Logging** — a `logging` handler writes warnings and errors to `~/.tricorder.log`; WMI init failures and config I/O problems are now visible instead of silently discarded
+- **Atomic config writes** — the layout config is written to a `.tmp` file first and then renamed into place, preventing a corrupt config if the process is killed mid-write
+- **Config version migration warning** — loading a config from a different version now logs a warning to `~/.tricorder.log` instead of silently proceeding
+
+### v0.5
 - **Fully free row layout** — the global tile grid no longer has a fixed column count. Each row is independent and can hold any number of tiles. Any arrangement of row lengths is possible
 - **`── new row ──` drop zones** — horizontal drop bars appear between every row in edit mode; dragging a tile onto one creates a brand-new row at that exact position
 - **`+` row-end drop zones** — small drop targets at the right end of each row let you append tiles directly to a specific row

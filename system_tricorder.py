@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 System Tricorder v0.6 — Hardware Monitoring Dashboard
-Dark Mode | 20 FPS | Multi-GPU | P/E Cores | Customisable Layout | Per-Drive Tiles
+Dark Mode | 30 FPS | Multi-GPU | P/E Cores | Customisable Layout | Per-Drive Tiles
 """
 
 import sys
@@ -246,7 +246,7 @@ class SystemMetrics:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HARDWARE MONITOR THREAD  (20 FPS)
+# HARDWARE MONITOR THREAD  (30 FPS)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class HardwareMonitorThread(QThread):
@@ -413,7 +413,7 @@ class HardwareMonitorThread(QThread):
                 ))
             except Exception as exc:
                 logger.debug("Monitor loop error: %s", exc)
-            time.sleep(0.05)
+            time.sleep(0.033)
 
     def stop(self):
         self._running = False
@@ -498,8 +498,8 @@ class SparklineWidget(QWidget):
     Single horizontal sparkline with filled area.
     Expects values 0–100 (percentage).
     """
-    def __init__(self, color_hex: str, history_len: int = 60,
-                 min_height: int = 50, parent=None):
+    def __init__(self, color_hex: str, history_len: int = 90,
+                 min_height: int = 70, parent=None):
         super().__init__(parent)
         self.color   = QColor(color_hex)
         self.history: deque = deque([0.0] * history_len, maxlen=history_len)
@@ -513,9 +513,10 @@ class SparklineWidget(QWidget):
     def paintEvent(self, _):                                        # type: ignore
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+        painter.setClipRect(self.rect())
         w, h = self.width(), self.height()
 
-        painter.fillRect(self.rect(), QColor(0, 0, 0, 0))
+        painter.fillRect(self.rect(), QColor(12, 12, 20))
         painter.setPen(QPen(QColor(40, 40, 52), 1))
         for x in range(0, w, 25):
             painter.drawLine(x, 0, x, h)
@@ -592,9 +593,9 @@ class MasterMetricBox(QFrame):
 
         header = QHBoxLayout()
         self.id_lbl  = QLabel(f"{title}{title_extra}")
-        self.id_lbl.setStyleSheet(f"color: {color_hex}; font-size: 11px; font-weight: bold;")
+        self.id_lbl.setStyleSheet(f"color: {color_hex}; font-size: 13px; font-weight: bold;")
         self.val_lbl = QLabel("0%")
-        self.val_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        self.val_lbl.setStyleSheet("color: #888; font-size: 14px;")
         header.addWidget(self.id_lbl)
         header.addStretch()
         header.addWidget(self.val_lbl)
@@ -808,9 +809,9 @@ class MetricTile(BaseTile):
         hdr = QHBoxLayout()
         self._title_lbl = QLabel(self._title)
         self._title_lbl.setStyleSheet(
-            f"color: {self._color_hex}; font-size: 11px; font-weight: bold;")
+            f"color: {self._color_hex}; font-size: 13px; font-weight: bold;")
         self._val_lbl = QLabel("0%")
-        self._val_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        self._val_lbl.setStyleSheet("color: #888; font-size: 14px;")
         hdr.addWidget(self._title_lbl)
         hdr.addStretch()
         hdr.addWidget(self._val_lbl)
@@ -854,9 +855,9 @@ class DriveTile(BaseTile):
         icon_lbl.setStyleSheet("font-size: 12px;")
         name_lbl = QLabel(self._label)
         name_lbl.setStyleSheet(
-            f"color: {DRIVE_R_COLOR}; font-size: 11px; font-weight: bold;")
+            f"color: {DRIVE_R_COLOR}; font-size: 13px; font-weight: bold;")
         self._peak_lbl = QLabel("↑100 MB/s")
-        self._peak_lbl.setStyleSheet("color: #444; font-size: 9px;")
+        self._peak_lbl.setStyleSheet("color: #444; font-size: 11px;")
         hdr.addWidget(icon_lbl)
         hdr.addSpacing(3)
         hdr.addWidget(name_lbl)
@@ -868,11 +869,11 @@ class DriveTile(BaseTile):
         r_row = QHBoxLayout()
         r_row.setSpacing(4)
         r_lbl = QLabel("R")
-        r_lbl.setStyleSheet(f"color: {DRIVE_R_COLOR}; font-size: 10px; font-weight: bold;")
+        r_lbl.setStyleSheet(f"color: {DRIVE_R_COLOR}; font-size: 12px; font-weight: bold;")
         r_lbl.setFixedWidth(12)
         self._r_graph = SparklineWidget(DRIVE_R_COLOR, min_height=24)
         self._r_val   = QLabel("0 MB/s")
-        self._r_val.setStyleSheet(f"color: {DRIVE_R_COLOR}; font-size: 10px;")
+        self._r_val.setStyleSheet(f"color: {DRIVE_R_COLOR}; font-size: 12px;")
         self._r_val.setFixedWidth(72)
         self._r_val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)   # type: ignore
         r_row.addWidget(r_lbl)
@@ -884,11 +885,11 @@ class DriveTile(BaseTile):
         w_row = QHBoxLayout()
         w_row.setSpacing(4)
         w_lbl = QLabel("W")
-        w_lbl.setStyleSheet(f"color: {DRIVE_W_COLOR}; font-size: 10px; font-weight: bold;")
+        w_lbl.setStyleSheet(f"color: {DRIVE_W_COLOR}; font-size: 12px; font-weight: bold;")
         w_lbl.setFixedWidth(12)
         self._w_graph = SparklineWidget(DRIVE_W_COLOR, min_height=24)
         self._w_val   = QLabel("0 MB/s")
-        self._w_val.setStyleSheet(f"color: {DRIVE_W_COLOR}; font-size: 10px;")
+        self._w_val.setStyleSheet(f"color: {DRIVE_W_COLOR}; font-size: 12px;")
         self._w_val.setFixedWidth(72)
         self._w_val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)   # type: ignore
         w_row.addWidget(w_lbl)
@@ -946,10 +947,10 @@ class GPUCopyTile(BaseTile):
         # ── Header ────────────────────────────────────────────────────────────
         hdr = QHBoxLayout()
         icon_lbl = QLabel("📋")
-        icon_lbl.setStyleSheet("font-size: 11px;")
+        icon_lbl.setStyleSheet("font-size: 13px;")
         name_lbl = QLabel(f"{self._gpu_name} · Copy")
         name_lbl.setStyleSheet(
-            f"color: {self._palette[1]}; font-size: 11px; font-weight: bold;")
+            f"color: {self._palette[1]}; font-size: 13px; font-weight: bold;")
         hdr.addWidget(icon_lbl)
         hdr.addSpacing(3)
         hdr.addWidget(name_lbl)
@@ -961,11 +962,11 @@ class GPUCopyTile(BaseTile):
         c0_row.setSpacing(4)
         c0_lbl = QLabel("Cp0")
         c0_lbl.setStyleSheet(
-            f"color: {self._palette[1]}; font-size: 10px; font-weight: bold;")
+            f"color: {self._palette[1]}; font-size: 12px; font-weight: bold;")
         c0_lbl.setFixedWidth(28)
         self._c0_graph = SparklineWidget(self._palette[1], min_height=24)
         self._c0_val   = QLabel("0%")
-        self._c0_val.setStyleSheet(f"color: {self._palette[1]}; font-size: 10px;")
+        self._c0_val.setStyleSheet(f"color: {self._palette[1]}; font-size: 12px;")
         self._c0_val.setFixedWidth(34)
         self._c0_val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)  # type: ignore
         c0_row.addWidget(c0_lbl)
@@ -978,11 +979,11 @@ class GPUCopyTile(BaseTile):
         c1_row.setSpacing(4)
         c1_lbl = QLabel("Cp1")
         c1_lbl.setStyleSheet(
-            f"color: {self._palette[2]}; font-size: 10px; font-weight: bold;")
+            f"color: {self._palette[2]}; font-size: 12px; font-weight: bold;")
         c1_lbl.setFixedWidth(28)
         self._c1_graph = SparklineWidget(self._palette[2], min_height=24)
         self._c1_val   = QLabel("0%")
-        self._c1_val.setStyleSheet(f"color: {self._palette[2]}; font-size: 10px;")
+        self._c1_val.setStyleSheet(f"color: {self._palette[2]}; font-size: 12px;")
         self._c1_val.setFixedWidth(34)
         self._c1_val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)  # type: ignore
         c1_row.addWidget(c1_lbl)
@@ -1022,10 +1023,10 @@ class GPU3DComputeTile(BaseTile):
         # ── Header ────────────────────────────────────────────────────────────
         hdr = QHBoxLayout()
         icon_lbl = QLabel("🎮")
-        icon_lbl.setStyleSheet("font-size: 11px;")
+        icon_lbl.setStyleSheet("font-size: 13px;")
         name_lbl = QLabel(f"{self._gpu_name} · 3D / Compute")
         name_lbl.setStyleSheet(
-            f"color: {self._palette[0]}; font-size: 11px; font-weight: bold;")
+            f"color: {self._palette[0]}; font-size: 13px; font-weight: bold;")
         hdr.addWidget(icon_lbl)
         hdr.addSpacing(3)
         hdr.addWidget(name_lbl)
@@ -1037,11 +1038,11 @@ class GPU3DComputeTile(BaseTile):
         d3_row.setSpacing(4)
         d3_lbl = QLabel("3D ")
         d3_lbl.setStyleSheet(
-            f"color: {self._palette[0]}; font-size: 10px; font-weight: bold;")
+            f"color: {self._palette[0]}; font-size: 12px; font-weight: bold;")
         d3_lbl.setFixedWidth(28)
         self._d3_graph = SparklineWidget(self._palette[0], min_height=24)
         self._d3_val   = QLabel("0%")
-        self._d3_val.setStyleSheet(f"color: {self._palette[0]}; font-size: 10px;")
+        self._d3_val.setStyleSheet(f"color: {self._palette[0]}; font-size: 12px;")
         self._d3_val.setFixedWidth(34)
         self._d3_val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)  # type: ignore
         d3_row.addWidget(d3_lbl)
@@ -1054,11 +1055,11 @@ class GPU3DComputeTile(BaseTile):
         cm_row.setSpacing(4)
         cm_lbl = QLabel("Cmp")
         cm_lbl.setStyleSheet(
-            f"color: {self._palette[1]}; font-size: 10px; font-weight: bold;")
+            f"color: {self._palette[1]}; font-size: 12px; font-weight: bold;")
         cm_lbl.setFixedWidth(28)
         self._cm_graph = SparklineWidget(self._palette[1], min_height=24)
         self._cm_val   = QLabel("0%")
-        self._cm_val.setStyleSheet(f"color: {self._palette[1]}; font-size: 10px;")
+        self._cm_val.setStyleSheet(f"color: {self._palette[1]}; font-size: 12px;")
         self._cm_val.setFixedWidth(34)
         self._cm_val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)  # type: ignore
         cm_row.addWidget(cm_lbl)
@@ -2117,7 +2118,7 @@ class TricorderDashboard(QMainWindow):
             col_groups.append([w])
         parent.addWidget(ResponsiveCoreGrid(col_groups, min_col_w=120), 1)
 
-    # ── UI update  (20 FPS) ────────────────────────────────────────────────────
+    # ── UI update  (30 FPS) ────────────────────────────────────────────────────
 
     def _update_ui(self, m: SystemMetrics):
         _t = self._tiles.get

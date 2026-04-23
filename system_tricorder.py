@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-System Tricorder v0.6 — Hardware Monitoring Dashboard
-Dark Mode | 30 FPS | Multi-GPU | P/E Cores | Customisable Layout | Per-Drive Tiles
-"""
-
 import sys
 import time
 import math
@@ -413,7 +408,7 @@ class HardwareMonitorThread(QThread):
                 ))
             except Exception as exc:
                 logger.debug("Monitor loop error: %s", exc)
-            time.sleep(0.033)
+            time.sleep(1.0 / 30.0)  # Exact 30 FPS interval
 
     def stop(self):
         self._running = False
@@ -503,12 +498,37 @@ class SparklineWidget(QWidget):
         super().__init__(parent)
         self.color   = QColor(color_hex)
         self.history: deque = deque([0.0] * history_len, maxlen=history_len)
+        self._dirty  = False
+        self._grid_cache: Optional[Tuple[int, int, QPixmap]] = None  # (w, h, pixmap)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumHeight(min_height)
 
     def add_value(self, value: float):
         self.history.append(value)
-        self.update()
+        # Mark dirty but defer update - parent will batch-call update() once
+        self._dirty = True
+
+    def batch_update(self):
+        """Call once per frame after all add_value() calls."""
+        if self._dirty:
+            self._dirty = False
+            self.update()
+
+    def _ensure_grid_cache(self, w: int, h: int):
+        """Cache gridlines pixmap — regenerated only on resize."""
+        if self._grid_cache and self._grid_cache[0] == w and self._grid_cache[1] == h:
+            return self._grid_cache[2]
+        px = QPixmap(w, h)
+        px.fill(QColor(12, 12, 20))
+        p = QPainter(px)
+        p.setPen(QPen(QColor(40, 40, 52), 1))
+        for x in range(0, w, 25):
+            p.drawLine(x, 0, x, h)
+        for y in range(0, h, 15):
+            p.drawLine(0, y, w, y)
+        p.end()
+        self._grid_cache = (w, h, px)
+        return px
 
     def paintEvent(self, _):                                        # type: ignore
         painter = QPainter(self)
@@ -516,12 +536,9 @@ class SparklineWidget(QWidget):
         painter.setClipRect(self.rect())
         w, h = self.width(), self.height()
 
-        painter.fillRect(self.rect(), QColor(12, 12, 20))
-        painter.setPen(QPen(QColor(40, 40, 52), 1))
-        for x in range(0, w, 25):
-            painter.drawLine(x, 0, x, h)
-        for y in range(0, h, 15):
-            painter.drawLine(0, y, w, y)
+        # Optimized: draw cached gridlines pixmap instead of per-frame line loops
+        grid_px = self._ensure_grid_cache(w, h)
+        painter.drawPixmap(0, 0, grid_px)
 
         if not self.history:
             return
@@ -608,9 +625,8 @@ class MasterMetricBox(QFrame):
         self.graph.add_value(val)
         self.val_lbl.setText(text if text else f"{int(val)}%")
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# DRAGGABLE TILE BASE
+    def batch_update(self):
+        self.graph.batch_update()
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class BaseTile(QFrame):
@@ -703,6 +719,10 @@ class BaseTile(QFrame):
         """Override in subclass to populate the tile layout."""
         pass
 
+    def batch_update(self):
+        """No-op base - subclasses override to batch sparkline updates."""
+        pass
+
     # ── Edit mode ──────────────────────────────────────────────────────────────
     def set_edit_mode(self, enabled: bool):
         self._edit_mode = enabled
@@ -737,12 +757,11 @@ class BaseTile(QFrame):
         drag.setMimeData(mime)
 
         px = self.grab()
-        img = px.toImage()
-        for y in range(img.height()):
-            for x in range(img.width()):
-                col = img.pixel(x, y)
-                img.setPixel(x, y, (col & 0x00FFFFFF) | 0xA0000000)
-        drag.setPixmap(QPixmap.fromImage(img))
+        # Optimized: use QPixmap.setAlphaChannel instead of per-pixel loop
+        alpha = QPixmap(px.size())
+        alpha.fill(QColor(0, 0, 0, 160))
+        px.setAlphaChannel(alpha)
+        drag.setPixmap(px)
         drag.setHotSpot(self._drag_pos)
         drag.exec_(Qt.MoveAction)                                   # type: ignore
         self._drag_pos = None
@@ -823,6 +842,9 @@ class MetricTile(BaseTile):
     def update_val(self, val: float, text: Optional[str] = None):
         self._graph.add_value(val)
         self._val_lbl.setText(text if text else f"{int(val)}%")
+
+    def batch_update(self):
+        self._graph.batch_update()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -913,6 +935,10 @@ class DriveTile(BaseTile):
         self._w_val.setText(_fmt_mbps(write_mbps))
         self._peak_lbl.setText(f"↑{_fmt_mbps(self._peak)}")
 
+    def batch_update(self):
+        self._r_graph.batch_update()
+        self._w_graph.batch_update()
+
 
 def _fmt_mbps(v: float) -> str:
     """Format MB/s → auto-unit (GB/s if >= 1000)."""
@@ -997,6 +1023,10 @@ class GPUCopyTile(BaseTile):
         self._c0_val.setText(f"{int(c0)}%")
         self._c1_val.setText(f"{int(c1)}%")
 
+    def batch_update(self):
+        self._c0_graph.batch_update()
+        self._c1_graph.batch_update()
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GPU 3D / COMPUTE TILE  — two sparklines: 3D engine + Compute/CUDA engine
@@ -1072,6 +1102,10 @@ class GPU3DComputeTile(BaseTile):
         self._cm_graph.add_value(compute)
         self._d3_val.setText(f"{int(d3)}%")
         self._cm_val.setText(f"{int(compute)}%")
+
+    def batch_update(self):
+        self._d3_graph.batch_update()
+        self._cm_graph.batch_update()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1539,9 +1573,9 @@ class TileGrid(QWidget):
     def _load_config() -> dict:
         try:
             data = json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
-            if data.get('version') != '0.6':
+            if data.get('version') != '0.7':
                 logger.warning(
-                    "Config version '%s' differs from '0.6' — "
+                    "Config version '%s' differs from '0.7' — "
                     "layout will be kept as-is; delete %s to reset.",
                     data.get('version'), CONFIG_FILE,
                 )
@@ -1553,7 +1587,7 @@ class TileGrid(QWidget):
     def _save_config(self):
         try:
             payload = json.dumps({
-                'version':      '0.6',
+                'version':      '0.7',
                 'min_row_h':    self._min_row_h,
                 'tile_order':   self._tile_order,
                 'hidden_tiles': self._hidden,
@@ -1711,7 +1745,7 @@ def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD  v0.6
+# MAIN DASHBOARD  v0.7
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TricorderDashboard(QMainWindow):
@@ -1726,7 +1760,7 @@ class TricorderDashboard(QMainWindow):
         except Exception:
             pass
 
-        self.setWindowTitle("System Tricorder v0.6")
+        self.setWindowTitle("System Tricorder v0.7")
         self.setMinimumSize(1280, 900)
         self.setStyleSheet("QMainWindow, QWidget { background-color: #0a0a0f; color: white; }")
 
@@ -1832,7 +1866,7 @@ class TricorderDashboard(QMainWindow):
 
         title = QLabel(
             "📊  System Tricorder  "
-            "<span style='font-size:18px; color:#00aa55;'>v0.6</span>"
+            "<span style='font-size:18px; color:#00aa55;'>v0.7</span>"
         )
         title.setStyleSheet(
             "font-size: 28px; font-weight: bold; color: #00ff88; background: transparent;")
@@ -2123,35 +2157,51 @@ class TricorderDashboard(QMainWindow):
     def _update_ui(self, m: SystemMetrics):
         _t = self._tiles.get
 
-        def upd(tid, val, text=None):
-            w = _t(tid)
-            if w and isinstance(w, MetricTile):
-                w.update_val(val, text)
+        # Optimized: direct attribute access instead of isinstance() checks
+        # Tiles are registered with known types - no runtime type checking needed
 
-        upd("cpu_total", m.cpu_total_percent)
-        upd("ram",  m.ram_percent,   f"{m.ram_used_gb:.1f}/{m.ram_total_gb:.1f} GB")
-        upd("igpu", m.igpu_percent)
-        upd("npu",  m.npu_percent)
+        w = _t("cpu_total")
+        if w:
+            w.update_val(m.cpu_total_percent)
+        w = _t("ram")
+        if w:
+            w.update_val(m.ram_percent, f"{m.ram_used_gb:.1f}/{m.ram_total_gb:.1f} GB")
+        w = _t("igpu")
+        if w:
+            w.update_val(m.igpu_percent)
+        w = _t("npu")
+        if w:
+            w.update_val(m.npu_percent)
 
         for i, gm in enumerate(m.gpus):
             w_3d = _t(f"gpu_{i}_3d")
-            if w_3d and isinstance(w_3d, GPU3DComputeTile):
+            if w_3d:
                 w_3d.update_3d_compute(gm.gpu_3d_percent, gm.gpu_compute_percent)
             w_copy = _t(f"gpu_{i}_copy")
-            if w_copy and isinstance(w_copy, GPUCopyTile):
+            if w_copy:
                 w_copy.update_copy(gm.gpu_copy0_percent, gm.gpu_copy1_percent)
             vp = (gm.gpu_vram_used_gb / gm.gpu_vram_total_gb * 100) if gm.gpu_vram_total_gb else 0
-            upd(f"gpu_{i}_vram", vp,
-                f"{gm.gpu_vram_used_gb:.1f}/{gm.gpu_vram_total_gb:.0f} GB")
+            w_vram = _t(f"gpu_{i}_vram")
+            if w_vram:
+                w_vram.update_val(vp,
+                    f"{gm.gpu_vram_used_gb:.1f}/{gm.gpu_vram_total_gb:.0f} GB")
 
         for dm in m.drives:
             w = _t(f"drive_{dm.key}")
-            if w and isinstance(w, DriveTile):
+            if w:
                 w.update_drive(dm.read_mbps, dm.write_mbps)
 
         for ti, val in m.cpu_cores.items():
             if ti in self.thread_widgets:
                 self.thread_widgets[ti].update_val(val)
+
+        # Batch update all sparklines once per frame instead of per-widget.
+        # Global tiles AND per-thread CPU widgets both need this — the latter
+        # live in self.thread_widgets and are not part of self._tiles.
+        for tile in self._tiles.values():
+            tile.batch_update()
+        for tw in self.thread_widgets.values():
+            tw.batch_update()
 
     def closeEvent(self, event):                                    # type: ignore
         self.hw_thread.stop()

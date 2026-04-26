@@ -1,0 +1,341 @@
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║           System Tricorder — GitHub Actions CI/CD               ║
+# ║                                                                  ║
+# ║  Jobs:                                                           ║
+# ║    lint     — Ruff (fast linter) + Pyflakes (undefined names)   ║
+# ║    typecheck — Pyright static type analysis                      ║
+# ║    test     — pytest on Windows (only supported platform)        ║
+# ║    build    — PyInstaller .exe artefact                          ║
+# ║    release  — Upload .exe to GitHub Release on tag push          ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+name: CI
+
+on:
+  push:
+    branches: ["main", "dev"]
+    tags:     ["v*.*"]          # triggers release job
+  pull_request:
+    branches: ["main"]
+
+# Cancel superseded runs on the same branch/PR
+concurrency:
+  group:  ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared Python version matrix — change here to roll out everywhere
+# ─────────────────────────────────────────────────────────────────────────────
+env:
+  PYTHON_DEFAULT: "3.11"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# JOB 1 — LINT
+# Runs on Ubuntu (cheap & fast).  No Windows deps needed for static analysis.
+# Checks: Ruff (style + imports), Pyflakes (undefined names, unused imports)
+# ═════════════════════════════════════════════════════════════════════════════
+jobs:
+  lint:
+    name: "Lint (Ruff + Pyflakes)"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_DEFAULT }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT }}
+          cache: pip
+
+      # Stub out Windows-only packages so the linter can import them
+      - name: Install lint tools + stubs
+        run: |
+          pip install --upgrade pip
+          pip install ruff pyflakes
+          # Lightweight stubs — linter only, not runtime
+          pip install types-pywin32 || true
+
+      - name: Ruff — lint & import order
+        run: |
+          ruff check system_tricorder.py \
+            --select E,W,F,I,UP,B,SIM \
+            --ignore E501,E402,W503 \
+            --output-format github
+
+      - name: Pyflakes — undefined names
+        run: python -m pyflakes system_tricorder.py
+
+# ═════════════════════════════════════════════════════════════════════════════
+# JOB 2 — TYPE CHECK
+# Pyright on Ubuntu with minimal stubs.  Catches type errors before runtime.
+# ═════════════════════════════════════════════════════════════════════════════
+  typecheck:
+    name: "Type check (Pyright)"
+    runs-on: ubuntu-latest
+    needs: lint             # only run if lint passes
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT }}
+          cache: pip
+
+      - name: Install Pyright + stubs
+        run: |
+          pip install pyright
+          # Install pure-Python deps so Pyright can resolve them
+          pip install psutil
+          # Windows-only: use community stubs
+          pip install types-pywin32 || true
+
+      - name: Create minimal pyrightconfig
+        run: |
+          cat > pyrightconfig.json << 'EOF'
+          {
+            "include": ["system_tricorder.py"],
+            "pythonVersion": "3.11",
+            "typeCheckingMode": "basic",
+            "reportMissingModuleSource": "none",
+            "reportMissingImports": "warning",
+            "reportGeneralTypeIssues": "warning",
+            "ignore": ["**/win32com/**", "**/pythoncom*"]
+          }
+          EOF
+
+      - name: Run Pyright
+        run: pyright system_tricorder.py
+        continue-on-error: true   # warnings only — don't block builds
+
+# ═════════════════════════════════════════════════════════════════════════════
+# JOB 3 — TEST
+# Must run on Windows: PyQt5, psutil, pywin32 need the Windows runtime.
+# Smoke-tests verify the module imports and key helper functions run without
+# crashing.  No display needed — PyQt5 headless mode via offscreen platform.
+# ═════════════════════════════════════════════════════════════════════════════
+  test:
+    name: "Test (Windows / Python ${{ matrix.python-version }})"
+    runs-on: windows-latest
+    needs: lint
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # ── Dependency cache key includes OS + Python version ──────────────────
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: pip-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('requirements*.txt') }}
+          restore-keys: pip-${{ runner.os }}-${{ matrix.python-version }}-
+
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyQt5 psutil pywin32
+          pip install pytest pytest-qt
+
+      - name: Create smoke-test file
+        shell: pwsh
+        run: |
+          @'
+          """
+          Smoke tests for System Tricorder.
+          Run with: pytest tests/test_smoke.py -v
+          These tests do NOT require a display — they test pure logic only.
+          """
+          import sys, os, types
+
+          # ── Mock display-requiring Qt before any import ───────────────────
+          os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+          # ── Import helpers that have no Qt/WMI dependency ─────────────────
+          import importlib.util, pathlib
+          spec = importlib.util.spec_from_file_location(
+              "tricorder", pathlib.Path("system_tricorder.py"))
+          mod  = importlib.util.module_from_spec(spec)
+
+          # Provide minimal stubs for optional Windows-only modules
+          for name in ("win32com", "win32com.client", "pythoncom", "winreg"):
+              if name not in sys.modules:
+                  sys.modules[name] = types.ModuleType(name)
+
+          spec.loader.exec_module(mod)
+
+          # ─────────────────────────────────────────────────────────────────
+          # Test: _fmt_mbps — pure function, no deps
+          # ─────────────────────────────────────────────────────────────────
+          def test_fmt_mbps_bytes():
+              assert mod._fmt_mbps(0.0)   == "0.0 MB/s"
+              assert mod._fmt_mbps(99.9)  == "99.9 MB/s"
+              assert mod._fmt_mbps(100.0) == "100 MB/s"
+              assert mod._fmt_mbps(999.9) == "999.9 MB/s"
+
+          def test_fmt_mbps_gigabytes():
+              assert mod._fmt_mbps(1000.0) == "1.00 GB/s"
+              assert mod._fmt_mbps(2500.0) == "2.50 GB/s"
+
+          # ─────────────────────────────────────────────────────────────────
+          # Test: short_gpu_name — pure string logic
+          # ─────────────────────────────────────────────────────────────────
+          def test_short_gpu_name_rtx():
+              result = mod.short_gpu_name("NVIDIA GeForce RTX 4090 24GB")
+              assert result.startswith("RTX")
+              assert len(result) <= 18
+
+          def test_short_gpu_name_radeon():
+              result = mod.short_gpu_name("AMD Radeon RX 7900 XTX")
+              assert len(result) <= 18
+
+          def test_short_gpu_name_fallback():
+              result = mod.short_gpu_name("SomeUnknownGPUModel")
+              assert len(result) <= 18
+
+          # ─────────────────────────────────────────────────────────────────
+          # Test: DriveMetrics dataclass
+          # ─────────────────────────────────────────────────────────────────
+          def test_drive_metrics_fields():
+              dm = mod.DriveMetrics(
+                  key="PhysicalDrive0", label="C:",
+                  read_mbps=123.4, write_mbps=45.6)
+              assert dm.key        == "PhysicalDrive0"
+              assert dm.read_mbps  == 123.4
+              assert dm.write_mbps == 45.6
+
+          # ─────────────────────────────────────────────────────────────────
+          # Test: GPUMetrics defaults
+          # ─────────────────────────────────────────────────────────────────
+          def test_gpu_metrics_defaults():
+              gm = mod.GPUMetrics(name="Test GPU", luid="abc123")
+              assert gm.gpu_3d_percent      == 0.0
+              assert gm.gpu_vram_total_gb   == 8.0
+
+          # ─────────────────────────────────────────────────────────────────
+          # Test: GPU palette list completeness
+          # ─────────────────────────────────────────────────────────────────
+          def test_gpu_palettes():
+              assert len(mod.GPU_PALETTES) >= 4
+              for pal in mod.GPU_PALETTES:
+                  assert len(pal) == 4
+                  for colour in pal:
+                      assert colour.startswith("#")
+          '@ | Out-File -FilePath tests/test_smoke.py -Encoding utf8
+          New-Item -ItemType Directory -Force -Path tests | Out-Null
+          if (-not (Test-Path "tests/__init__.py")) {
+            New-Item -ItemType File -Path "tests/__init__.py" | Out-Null
+          }
+        # Note: test file written above; the here-string creates it idempotently.
+
+      - name: Run pytest (offscreen, no display required)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          pytest tests/test_smoke.py -v --tb=short
+
+# ═════════════════════════════════════════════════════════════════════════════
+# JOB 4 — BUILD
+# Compiles a standalone .exe with PyInstaller.
+# Runs only on pushes to main or on version tags — not on every PR.
+# Uploads the .exe as a workflow artefact (available for 14 days).
+# ═════════════════════════════════════════════════════════════════════════════
+  build:
+    name: "Build .exe (PyInstaller)"
+    runs-on: windows-latest
+    needs: [lint, test]
+    if: github.event_name == 'push'   # skip on PRs
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT }}
+          cache: pip
+
+      - name: Install build dependencies
+        run: pip install PyQt5 psutil pywin32 pyinstaller
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller `
+            --noconsole `
+            --onefile `
+            --name "SystemTricorder" `
+            --icon NONE `
+            system_tricorder.py
+
+      - name: Verify .exe exists
+        run: |
+          if (-not (Test-Path "dist\SystemTricorder.exe")) {
+            Write-Error "Build failed — .exe not found"
+            exit 1
+          }
+          $size = (Get-Item "dist\SystemTricorder.exe").Length / 1MB
+          Write-Host "✅ SystemTricorder.exe — $([math]::Round($size,1)) MB"
+
+      - name: Upload build artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SystemTricorder-${{ github.sha }}
+          path: dist/SystemTricorder.exe
+          retention-days: 14
+
+# ═════════════════════════════════════════════════════════════════════════════
+# JOB 5 — RELEASE
+# Triggered only on "v*.*" tag pushes (e.g. git tag v0.8 && git push --tags).
+# Downloads the .exe from job 4 and attaches it to a GitHub Release.
+# ═════════════════════════════════════════════════════════════════════════════
+  release:
+    name: "GitHub Release"
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: write    # required to create a release
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artefact
+        uses: actions/download-artifact@v4
+        with:
+          name: SystemTricorder-${{ github.sha }}
+          path: dist/
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release + attach .exe
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "System Tricorder ${{ steps.version.outputs.VERSION }}"
+          body: |
+            ## System Tricorder ${{ steps.version.outputs.VERSION }}
+
+            ### Installation
+            1. Download `SystemTricorder.exe`
+            2. Run it — no Python installation required
+
+            ### Requirements
+            - Windows 10 / 11 (64-bit)
+
+            ### What's new
+            See [CHANGELOG in README](https://github.com/${{ github.repository }}/blob/main/README.md#-changelog)
+          files: dist/SystemTricorder.exe
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.VERSION, '-') }}

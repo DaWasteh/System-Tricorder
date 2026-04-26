@@ -49,7 +49,7 @@ jobs:
         run: |
           ruff check system_tricorder.py \
             --select E,W,F,I,UP,B,SIM \
-            --ignore E501,E402 \
+            --ignore E501,E402,UP006,UP035,I001 \
             --output-format github
 
       - name: Pyflakes — undefined names

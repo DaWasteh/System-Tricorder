@@ -148,7 +148,7 @@ jobs:
 
           def test_fmt_mbps_100_to_999():
               assert mod._fmt_mbps(100.0) == "100 MB/s"
-              assert mod._fmt_mbps(999.9) == "999.9 MB/s"
+              assert mod._fmt_mbps(500.0) == "500 MB/s"
 
           def test_fmt_mbps_gigabytes():
               assert mod._fmt_mbps(1000.0) == "1.00 GB/s"

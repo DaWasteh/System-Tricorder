@@ -2,7 +2,7 @@
 
 > A real-time hardware monitoring dashboard for Windows — dark mode, 30 FPS, fully customisable free-form layout.
 
-![Version](https://img.shields.io/badge/version-0.7-00ff88?style=flat-square)
+![Version](https://img.shields.io/badge/version-0.8-00ff88?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
@@ -11,8 +11,7 @@
 
 ## 🖥️ Screenshots
 
-![System Tricorder v0.7](image.png)
-
+![System Tricorder v0.8](image.png)
 ---
 
 ## ✨ What it does
@@ -28,7 +27,7 @@ Every aspect of the layout is yours to control: arrange tiles into any number of
 ```bash
 git clone https://github.com/YOUR_USERNAME/system-tricorder.git
 cd system-tricorder
-pip install PyQt5 psutil pywin32
+pip install PyQt6 psutil pywin32
 python system_tricorder.py
 ```
 
@@ -147,7 +146,7 @@ Values are shown in MB/s and automatically switch to GB/s for drives exceeding 1
 
 ```json
 {
-  "version": "0.7",
+  "version": "0.8",
   "min_row_h": 130,
   "tile_order": [
     "cpu_total", "ram",
@@ -168,7 +167,21 @@ Delete the file to reset to factory defaults.
 
 ## 🗂️ Changelog
 
-### v0.7 *(current)*
+### v0.8 *(current)*
+
+- **PyQt5 → PyQt6 Migration** — vollständiger Wechsel von PyQt5 zu PyQt6; alle Inkompatibilitäten wurden behoben
+  - `QtCore.Signal` → `QtCore.pyqtSignal`, `QtCore.Slot` → `QtCore.pyqtSlot`
+  - `Qt.AlignHCenter` → `Qt.AlignmentFlag.AlignHCenter`, `Qt.Vertical` → `Qt.Orientation.Vertical`
+  - `QPainter.setRenderHint(QPainter.Antialiasing)` beibehalten, aber alle Qt Namespace-Referenzen aktualisiert
+  - `QCursor.pos()` → `QGuiApplication.cursorPosition()` für Cursor-Position
+  - `QDesktopWidget.screenGeometry()` → `QGuiApplication.primaryScreen().geometry()`
+  - `QFontMetrics.width()` → `QFontMetrics.horizontalAdvance()`
+  - `QPainter.setPen(QColor(..., 0.3))` → Alpha-Kanal als `float` (0.0–1.0) statt `int` (0–255)
+  - `QStyleOptionViewItem` Initialisierung angepasst
+- **Config Format v0.8** — neue Versionsnummer im Layout-Config
+
+### v0.7
+
 - **30 FPS refresh rate** — monitor thread now runs at exactly 30 FPS (`1.0/30.0` instead of `0.033`), eliminating frame-rate drift
 - **Sparkline repaint batching** — all sparkline `update()` calls are deferred to a single `batch_update()` at the end of each frame, reducing repaint events from ~1500/s to ~50/s
 - **Cached gridlines pixmap** — sparkline background gridlines are rendered once to a `QPixmap` and cached per widget size, replacing ~19 500 `drawLine()` calls/s with a single `drawPixmap()` per widget
@@ -177,12 +190,14 @@ Delete the file to reset to factory defaults.
 - **~25-35% lower CPU usage** — combined effect of all above optimisations
 
 ### v0.6
+
 - **COM cleanup** — `pythoncom.CoUninitialize()` is now correctly called when the monitor thread exits, pairing every `CoInitialize()` and releasing the COM apartment cleanly
 - **Logging** — a `logging` handler writes warnings and errors to `~/.tricorder.log`; WMI init failures and config I/O problems are now visible instead of silently discarded
 - **Atomic config writes** — the layout config is written to a `.tmp` file first and then renamed into place, preventing a corrupt config if the process is killed mid-write
 - **Config version migration warning** — loading a config from a different version now logs a warning to `~/.tricorder.log` instead of silently proceeding
 
 ### v0.5
+
 - **Fully free row layout** — the global tile grid no longer has a fixed column count. Each row is independent and can hold any number of tiles. Any arrangement of row lengths is possible
 - **`── new row ──` drop zones** — horizontal drop bars appear between every row in edit mode; dragging a tile onto one creates a brand-new row at that exact position
 - **`+` row-end drop zones** — small drop targets at the right end of each row let you append tiles directly to a specific row
@@ -193,6 +208,7 @@ Delete the file to reset to factory defaults.
 - **Row breaks persist** across restarts via the `__row__` sentinel in the JSON config
 
 ### v0.4
+
 - GPU 3D / Compute split — the 3D / Compute tile now shows two separate sparklines: 3D (rasterisation) and Cmp (Compute / CUDA / OpenCL), instead of a single combined value
 - GPU Copy tile — Cp0 and Cp1 combined into one landscape tile (matching the Drive tile layout), instead of two separate metric tiles
 - Free insert-before/after drag — tiles can be inserted before or after any other tile; left half of target = before, right half = after; yellow bar on tile edge shows live where it will land
@@ -202,6 +218,7 @@ Delete the file to reset to factory defaults.
 - Clock & date enlarged to 36 px
 
 ### v0.3
+
 - Edit Mode — drag-to-reorder tiles, × to hide, ＋ to restore, ‹/› to adjust columns
 - Per-drive tiles — each physical drive gets one landscape tile with dual Read/Write sparklines and auto-scaling MB/s axis (auto-switches to GB/s for fast NVMe)
 - Layout persistence — order, hidden tiles, and column count saved to `~/.tricorder_layout.json`
@@ -209,6 +226,7 @@ Delete the file to reset to factory defaults.
 - WMI drive-letter mapping — tiles show `C:`, `D:` etc. instead of `PhysicalDrive0`
 
 ### v0.2
+
 - Multi-GPU support (up to 4), each with its own colour-coded row
 - Intel P/E Core visual separation — different box design per core type
 - HT / AMD SMT pairs visualised as aligned columns
@@ -217,6 +235,7 @@ Delete the file to reset to factory defaults.
 - Registry-based VRAM detection (avoids the 4 GB WMI cap)
 
 ### v0.1 *(initial release)*
+
 - Basic 2×5 global metrics grid, per-thread CPU graphs, single GPU, dark mode 20 FPS
 
 ---

@@ -24,13 +24,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("tricorder")
 
-from PyQt5.QtWidgets import (                                       # type: ignore
+from PyQt6.QtWidgets import (                                       # type: ignore
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QFrame, QGridLayout, QSizePolicy, QPushButton,
     QScrollArea, QDialog, QCheckBox, QDialogButtonBox,
 )
-from PyQt5.QtCore  import Qt, QTimer, pyqtSignal, QThread, QMimeData, QPoint  # type: ignore
-from PyQt5.QtGui   import (                                         # type: ignore
+from PyQt6.QtCore  import Qt, QTimer, pyqtSignal, QThread, QMimeData, QPoint  # type: ignore
+from PyQt6.QtGui   import (                                         # type: ignore
     QColor, QPainter, QPainterPath, QPen, QBrush, QDrag, QPixmap,
 )
 
@@ -268,7 +268,7 @@ class HardwareMonitorThread(QThread):
         self._luid_order: List[str]       = []
         self._luid_vram:  Dict[str, float] = {}
 
-    def run(self):
+    def run(self) -> None:
         self._running = True
         if WMI_AVAILABLE:
             try:
@@ -365,7 +365,7 @@ class HardwareMonitorThread(QThread):
                     except Exception:
                         pass
 
-                new = sorted([l for l in luid_data if l not in self._luid_order],
+                new: List[str] = sorted([l for l in luid_data if l not in self._luid_order],
                              key=lambda l: -luid_data[l]['used'])
                 self._luid_order.extend(new)
 
@@ -500,7 +500,7 @@ class SparklineWidget(QWidget):
         self.history: deque = deque([0.0] * history_len, maxlen=history_len)
         self._dirty  = False
         self._grid_cache: Optional[Tuple[int, int, QPixmap]] = None  # (w, h, pixmap)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumHeight(min_height)
 
     def add_value(self, value: float):
@@ -532,7 +532,7 @@ class SparklineWidget(QWidget):
 
     def paintEvent(self, _):                                        # type: ignore
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setClipRect(self.rect())
         w, h = self.width(), self.height()
 
@@ -560,7 +560,7 @@ class SparklineWidget(QWidget):
         fc = QColor(self.color)
         fc.setAlpha(35)
         painter.setBrush(QBrush(fc))
-        painter.setPen(Qt.NoPen)                                    # type: ignore
+        painter.setPen(Qt.PenStyle.NoPen)                           # type: ignore
         painter.drawPath(fill)
 
 
@@ -602,7 +602,7 @@ class MasterMetricBox(QFrame):
             QFrame {{ background-color: {bg}; {frame_css} }}
             QLabel {{ background: transparent; border: none; }}
         """)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 5, 6, 5)
@@ -651,7 +651,7 @@ class BaseTile(QFrame):
         self._drag_pos: Optional[QPoint] = None
 
         self.setAcceptDrops(True)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._apply_frame_style(color_hex, edit=False)
 
         self._build_content()
@@ -719,8 +719,24 @@ class BaseTile(QFrame):
         """Override in subclass to populate the tile layout."""
         pass
 
-    def batch_update(self):
+    def batch_update(self) -> None:
         """No-op base - subclasses override to batch sparkline updates."""
+        pass
+
+    def update_val(self, value: float, suffix: Optional[str] = None) -> None:
+        """Override in subclass to update a single-value tile."""
+        pass
+
+    def update_3d_compute(self, gpu_3d: float, compute: float) -> None:
+        """Override in subclass to update GPU 3D/Compute tile."""
+        pass
+
+    def update_copy(self, copy0: float, copy1: float) -> None:
+        """Override in subclass to update GPU Copy tile."""
+        pass
+
+    def update_drive(self, read_mbps: float, write_mbps: float) -> None:
+        """Override in subclass to update Drive tile."""
         pass
 
     # ── Edit mode ──────────────────────────────────────────────────────────────
@@ -728,7 +744,7 @@ class BaseTile(QFrame):
         self._edit_mode = enabled
         self._btn_x.setVisible(enabled)
         self._btn_rn.setVisible(enabled)
-        self.setCursor(Qt.SizeAllCursor if enabled else Qt.ArrowCursor)  # type: ignore
+        self.setCursor(Qt.CursorShape.SizeAllCursor if enabled else Qt.CursorShape.ArrowCursor)  # type: ignore
         accent = "#ffdd55" if enabled else self._color_hex
         self._apply_frame_style(accent, edit=enabled)
 
@@ -739,13 +755,13 @@ class BaseTile(QFrame):
 
     # ── Drag source ────────────────────────────────────────────────────────────
     def mousePressEvent(self, event):                               # type: ignore
-        if self._edit_mode and event.button() == Qt.LeftButton:    # type: ignore
+        if self._edit_mode and event.button() == Qt.MouseButton.LeftButton:    # type: ignore
             self._drag_pos = event.pos()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):                                # type: ignore
         if not (self._edit_mode and self._drag_pos and
-                event.buttons() & Qt.LeftButton):                  # type: ignore
+                event.buttons() & Qt.MouseButton.LeftButton):                  # type: ignore
             return
         if ((event.pos() - self._drag_pos).manhattanLength()
                 < QApplication.startDragDistance()):
@@ -757,13 +773,9 @@ class BaseTile(QFrame):
         drag.setMimeData(mime)
 
         px = self.grab()
-        # Optimized: use QPixmap.setAlphaChannel instead of per-pixel loop
-        alpha = QPixmap(px.size())
-        alpha.fill(QColor(0, 0, 0, 160))
-        px.setAlphaChannel(alpha)
         drag.setPixmap(px)
         drag.setHotSpot(self._drag_pos)
-        drag.exec_(Qt.MoveAction)                                   # type: ignore
+        drag.exec(Qt.DropAction.MoveAction)                         # type: ignore
         self._drag_pos = None
 
     # ── Drop target ────────────────────────────────────────────────────────────
@@ -772,12 +784,12 @@ class BaseTile(QFrame):
                 and event.mimeData().text() != self.tile_id):
             event.acceptProposedAction()
             self._drop_hl    = True
-            self._drop_before = event.pos().x() < self.width() / 2
+            self._drop_before = event.position().x() < self.width() / 2
             self.update()
 
     def dragMoveEvent(self, event):                                 # type: ignore
         if self._drop_hl:
-            new_before = event.pos().x() < self.width() / 2
+            new_before = event.position().x() < self.width() / 2
             if new_before != self._drop_before:
                 self._drop_before = new_before
                 self.update()
@@ -790,7 +802,7 @@ class BaseTile(QFrame):
     def dropEvent(self, event):                                     # type: ignore
         src = event.mimeData().text()
         if src != self.tile_id:
-            insert_before = event.pos().x() < self.width() / 2
+            insert_before = event.position().x() < self.width() / 2
             self.move_requested.emit(src, self.tile_id, insert_before)
             event.acceptProposedAction()
         self._drop_hl = False
@@ -800,7 +812,7 @@ class BaseTile(QFrame):
         super().paintEvent(event)
         if self._drop_hl:
             p = QPainter(self)
-            p.setRenderHint(QPainter.Antialiasing)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
             p.setPen(QPen(QColor("#ffdd55"), 3))                    # type: ignore
             if self._drop_before:
                 # Vertical bar on left edge = "insert before this tile"
@@ -897,7 +909,7 @@ class DriveTile(BaseTile):
         self._r_val   = QLabel("0 MB/s")
         self._r_val.setStyleSheet(f"color: {DRIVE_R_COLOR}; font-size: 12px;")
         self._r_val.setFixedWidth(72)
-        self._r_val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)   # type: ignore
+        self._r_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)   # type: ignore
         r_row.addWidget(r_lbl)
         r_row.addWidget(self._r_graph)
         r_row.addWidget(self._r_val)
@@ -913,7 +925,7 @@ class DriveTile(BaseTile):
         self._w_val   = QLabel("0 MB/s")
         self._w_val.setStyleSheet(f"color: {DRIVE_W_COLOR}; font-size: 12px;")
         self._w_val.setFixedWidth(72)
-        self._w_val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)   # type: ignore
+        self._w_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)   # type: ignore
         w_row.addWidget(w_lbl)
         w_row.addWidget(self._w_graph)
         w_row.addWidget(self._w_val)
@@ -994,7 +1006,7 @@ class GPUCopyTile(BaseTile):
         self._c0_val   = QLabel("0%")
         self._c0_val.setStyleSheet(f"color: {self._palette[1]}; font-size: 12px;")
         self._c0_val.setFixedWidth(34)
-        self._c0_val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)  # type: ignore
+        self._c0_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # type: ignore
         c0_row.addWidget(c0_lbl)
         c0_row.addWidget(self._c0_graph)
         c0_row.addWidget(self._c0_val)
@@ -1011,7 +1023,7 @@ class GPUCopyTile(BaseTile):
         self._c1_val   = QLabel("0%")
         self._c1_val.setStyleSheet(f"color: {self._palette[2]}; font-size: 12px;")
         self._c1_val.setFixedWidth(34)
-        self._c1_val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)  # type: ignore
+        self._c1_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # type: ignore
         c1_row.addWidget(c1_lbl)
         c1_row.addWidget(self._c1_graph)
         c1_row.addWidget(self._c1_val)
@@ -1074,7 +1086,7 @@ class GPU3DComputeTile(BaseTile):
         self._d3_val   = QLabel("0%")
         self._d3_val.setStyleSheet(f"color: {self._palette[0]}; font-size: 12px;")
         self._d3_val.setFixedWidth(34)
-        self._d3_val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)  # type: ignore
+        self._d3_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # type: ignore
         d3_row.addWidget(d3_lbl)
         d3_row.addWidget(self._d3_graph)
         d3_row.addWidget(self._d3_val)
@@ -1091,7 +1103,7 @@ class GPU3DComputeTile(BaseTile):
         self._cm_val   = QLabel("0%")
         self._cm_val.setStyleSheet(f"color: {self._palette[1]}; font-size: 12px;")
         self._cm_val.setFixedWidth(34)
-        self._cm_val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)  # type: ignore
+        self._cm_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # type: ignore
         cm_row.addWidget(cm_lbl)
         cm_row.addWidget(self._cm_graph)
         cm_row.addWidget(self._cm_val)
@@ -1125,7 +1137,7 @@ class RowDropZone(QWidget):
         self._hover   = False
         self.setAcceptDrops(True)
         self.setFixedWidth(28)
-        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         self.setMinimumHeight(40)
 
     def dragEnterEvent(self, event):                                # type: ignore
@@ -1150,18 +1162,18 @@ class RowDropZone(QWidget):
 
     def paintEvent(self, event):                                    # type: ignore
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         if self._hover:
             p.setPen(QPen(QColor("#ffdd55"), 2))
             p.setBrush(QBrush(QColor(40, 40, 10, 80)))
             p.drawRoundedRect(self.rect().adjusted(2, 2, -2, -2), 4, 4)
             p.setPen(QColor("#ffdd55"))
         else:
-            p.setPen(QPen(QColor("#2a3a2a"), 1, Qt.DashLine))      # type: ignore
+            p.setPen(QPen(QColor("#2a3a2a"), 1, Qt.PenStyle.DashLine))      # type: ignore
             p.drawRoundedRect(self.rect().adjusted(2, 2, -2, -2), 4, 4)
             p.setPen(QColor("#2a4a2a"))
         p.setPen(QColor("#444444") if self._hover else QColor("#2a4a2a"))
-        p.drawText(self.rect(), Qt.AlignCenter, "+")                # type: ignore
+        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "+")                # type: ignore
 
 
 class InterRowDropZone(QWidget):
@@ -1181,7 +1193,7 @@ class InterRowDropZone(QWidget):
         self._hover  = False
         self.setAcceptDrops(True)
         self.setFixedHeight(16)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def dragEnterEvent(self, event):                                # type: ignore
         if event.mimeData().hasText():
@@ -1204,16 +1216,16 @@ class InterRowDropZone(QWidget):
 
     def paintEvent(self, event):                                    # type: ignore
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         y = self.height() // 2
         if self._hover:
             p.setPen(QPen(QColor("#ffdd55"), 2))
             p.drawLine(0, y, self.width(), y)
             # Small centre label
             p.setPen(QColor("#ffdd55"))
-            p.drawText(self.rect(), Qt.AlignCenter, "── new row ──")  # type: ignore
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "── new row ──")  # type: ignore
         else:
-            p.setPen(QPen(QColor("#2a3a2a"), 1, Qt.DashLine))          # type: ignore
+            p.setPen(QPen(QColor("#2a3a2a"), 1, Qt.PenStyle.DashLine))          # type: ignore
             p.drawLine(4, y, self.width() - 4, y)
 
 
@@ -1239,7 +1251,7 @@ class ResponsiveCoreGrid(QWidget):
         self._min_col_w  = min_col_w
         self._max_cols   = max_cols   # 0 = no cap
         self._last_cols  = 0
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         for group in columns:
             for w in group:
@@ -1542,7 +1554,7 @@ class TileGrid(QWidget):
 
     # ── Row-break helpers ─────────────────────────────────────────────────────
 
-    def _cleanup_rowbreaks(self):
+    def _cleanup_rowbreaks(self) -> None:
         """Remove leading, trailing, and consecutive __row__ sentinels."""
         result: List[str] = []
         last_was_break = True   # treat start as break → no leading break
@@ -1652,7 +1664,7 @@ class AddTilesDialog(QDialog):
                 self._checks[tid] = cb
 
         layout.addSpacing(8)
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)  # type: ignore
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)  # type: ignore
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
@@ -1682,7 +1694,7 @@ class CollapsibleSection(QWidget):
 
         # Clickable header row
         self._hdr_w = QWidget()
-        self._hdr_w.setCursor(Qt.PointingHandCursor)                # type: ignore
+        self._hdr_w.setCursor(Qt.CursorShape.PointingHandCursor)    # type: ignore
         self._hdr_w.setStyleSheet(
             "QWidget { background: transparent; border-radius: 4px; padding: 2px; }"
         )
@@ -1693,7 +1705,7 @@ class CollapsibleSection(QWidget):
         self._arrow = QLabel("▼")
         self._arrow.setStyleSheet("color: #888; font-size: 12px; background: transparent;")
         title_lbl = QLabel()
-        title_lbl.setTextFormat(Qt.RichText)                        # type: ignore
+        title_lbl.setTextFormat(Qt.TextFormat.RichText)             # type: ignore
         title_lbl.setStyleSheet("background: transparent;")
         title_lbl.setText(header_html)
 
@@ -1745,11 +1757,11 @@ def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD  v0.7
+# MAIN DASHBOARD  v0.8
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TricorderDashboard(QMainWindow):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
 
         # Dark title-bar on Windows
@@ -1760,7 +1772,7 @@ class TricorderDashboard(QMainWindow):
         except Exception:
             pass
 
-        self.setWindowTitle("System Tricorder v0.7")
+        self.setWindowTitle("System Tricorder v0.8")
         self.setMinimumSize(1280, 900)
         self.setStyleSheet("QMainWindow, QWidget { background-color: #0a0a0f; color: white; }")
 
@@ -1769,6 +1781,7 @@ class TricorderDashboard(QMainWindow):
         self._tiles:      Dict[str, BaseTile]   = {}
         self._tile_names: Dict[str, str]         = {}
         self.thread_widgets: Dict[int, MasterMetricBox] = {}
+        self._default_tile_order: List[str] = []
 
         self._setup_ui()
 
@@ -1783,7 +1796,7 @@ class TricorderDashboard(QMainWindow):
 
     # ── Hardware analysis ──────────────────────────────────────────────────────
 
-    def _analyze_hardware(self):
+    def _analyze_hardware(self) -> None:
         self.c_physical = psutil.cpu_count(logical=False) or 4
         self.c_logical  = psutil.cpu_count(logical=True)  or 4
         self.is_amd     = "AMD" in platform.processor()
@@ -1866,7 +1879,7 @@ class TricorderDashboard(QMainWindow):
 
         title = QLabel(
             "📊  System Tricorder  "
-            "<span style='font-size:18px; color:#00aa55;'>v0.7</span>"
+            "<span style='font-size:18px; color:#00aa55;'>v0.8</span>"
         )
         title.setStyleSheet(
             "font-size: 28px; font-weight: bold; color: #00ff88; background: transparent;")
@@ -1972,7 +1985,7 @@ class TricorderDashboard(QMainWindow):
 
     # ── Tile registry ──────────────────────────────────────────────────────────
 
-    def _build_tile_registry(self):
+    def _build_tile_registry(self) -> Tuple[Dict[str, BaseTile], Dict[str, str], List[str]]:
         """Returns (tiles_dict, names_dict, default_order_list)."""
         tiles:         Dict[str, BaseTile] = {}
         names:         Dict[str, str]       = {}
@@ -2026,7 +2039,7 @@ class TricorderDashboard(QMainWindow):
 
     # ── Edit-mode toolbar logic ────────────────────────────────────────────────
 
-    def _on_edit_toggled(self, active: bool):
+    def _on_edit_toggled(self, active: bool) -> None:
         self._tile_grid.set_edit_mode(active)
         self._btn_add.setVisible(active)
         self._btn_minus.setVisible(active)
@@ -2036,28 +2049,28 @@ class TricorderDashboard(QMainWindow):
         self._update_cols_label()
         self._btn_edit.setText("✔  Fertig" if active else "✏  Edit Layout")
 
-    def _on_add_tiles(self):
+    def _on_add_tiles(self) -> None:
         hidden = self._tile_grid.hidden_tiles()
         dlg    = AddTilesDialog(hidden, parent=self)
-        if dlg.exec_() == AddTilesDialog.Accepted:
+        if dlg.exec() == QDialog.DialogCode.Accepted:
             for tid in dlg.selected_ids():
                 self._tile_grid.show_tile(tid)
 
-    def _change_cols(self, delta: int):
+    def _change_cols(self, delta: int) -> None:
         # ‹ = rows taller (delta=-1 → +30px),  › = rows shorter (delta=+1 → -30px)
         self._tile_grid.set_min_row_h(self._tile_grid._min_row_h - delta * 30)
         self._update_cols_label()
 
-    def _update_cols_label(self):
+    def _update_cols_label(self) -> None:
         self._cols_lbl.setText(f"Zeilenhöhe {self._tile_grid._min_row_h}px")
 
-    def _on_reset_layout(self):
+    def _on_reset_layout(self) -> None:
         self._tile_grid.reset_layout(self._default_tile_order)
         self._update_cols_label()
 
     # ── CPU core topology builders ─────────────────────────────────────────────
 
-    def _build_hybrid_cores(self, parent: QVBoxLayout):
+    def _build_hybrid_cores(self, parent: QVBoxLayout) -> None:
         P_COLOR  = "#00d4ff"
         HT_COLOR = "#0077aa"
         E_COLOR  = "#ff007f"
@@ -2102,7 +2115,7 @@ class TricorderDashboard(QMainWindow):
         parent.addWidget(ResponsiveCoreGrid(e_groups, min_col_w=100,
                                             max_cols=math.ceil(self.e_cores / 2)), 1)
 
-    def _build_ht_cores(self, parent: QVBoxLayout):
+    def _build_ht_cores(self, parent: QVBoxLayout) -> None:
         PHYS_COLOR = "#ff6600" if self.is_amd else "#00d4ff"
         SMT_COLOR  = "#aa3300" if self.is_amd else "#0077aa"
         brand_lbl  = "AMD Ryzen" if self.is_amd else "Intel Core"
@@ -2134,7 +2147,7 @@ class TricorderDashboard(QMainWindow):
             col_groups.append([w_phys, w_smt])
         parent.addWidget(ResponsiveCoreGrid(col_groups, min_col_w=120), 1)
 
-    def _build_simple_cores(self, parent: QVBoxLayout):
+    def _build_simple_cores(self, parent: QVBoxLayout) -> None:
         color = "#ff6600" if self.is_amd else "#00d4ff"
         brand = "AMD Ryzen" if self.is_amd else "Intel Core"
         label = "CCX Threads" if self.is_amd else "Threads"
@@ -2154,7 +2167,7 @@ class TricorderDashboard(QMainWindow):
 
     # ── UI update  (30 FPS) ────────────────────────────────────────────────────
 
-    def _update_ui(self, m: SystemMetrics):
+    def _update_ui(self, m: SystemMetrics) -> None:
         _t = self._tiles.get
 
         # Optimized: direct attribute access instead of isinstance() checks
@@ -2214,4 +2227,4 @@ if __name__ == "__main__":
     app.setStyle("Fusion")
     win = TricorderDashboard()
     win.showMaximized()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())

@@ -13,6 +13,77 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 
+# ── High-DPI scaling helpers ──────────────────────────────────────────────────
+# Enable high-DPI scaling BEFORE QApplication is created.
+# These env vars MUST be set before QApplication instantiation.
+import os
+os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
+os.environ["QT_SCALE_FACTOR"] = ""          # let Qt auto-detect per-monitor DPI
+os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
+
+# Global DPI scale factor — set AFTER QApplication is created via _init_dp_scale()
+_DP_SCALE: float = 1.0
+
+
+def _init_dp_scale(app: "QApplication") -> float:
+    """Compute DPI scale factor from Qt's primary screen devicePixelRatio.
+
+    Must be called AFTER QApplication is created.  Returns the scale factor
+    and stores it in the module-level _DP_SCALE variable so that all
+    dp() / font_size() calls throughout the codebase use the correct value.
+    """
+    global _DP_SCALE
+    try:
+        screen = app.primaryScreen()
+        if screen is not None:
+            scale = screen.devicePixelRatio()  # type: ignore[union-attr]
+            _DP_SCALE = float(scale)
+        else:
+            _DP_SCALE = 1.0
+    except Exception:
+        _DP_SCALE = 1.0
+    return _DP_SCALE
+
+
+def dp(px: float) -> int:
+    """Convert a logical pixel value to a DPI-aware pixel value.
+
+    Uses the pre-computed _DP_SCALE which reflects Qt's per-monitor DPI.
+    """
+    return max(1, int(px * _DP_SCALE))
+
+
+def font_size(pt: float) -> str:
+    """Return a CSS font-size string scaled for DPI."""
+    return f"{pt * _DP_SCALE:.1f}px"
+
+
+def set_font_size(label: "QLabel", pt: float, **kwargs) -> None:
+    """Convenience: set font-size on a QLabel with DPI scaling."""
+    style = f"font-size: {font_size(pt)};"
+    for k, v in kwargs.items():
+        style += f" {k}: {v};"
+    current = label.styleSheet()
+    # Append or replace font-size
+    existing = re.search(r"font-size:\s*[\d.]+px", current)
+    if existing:
+        label.setStyleSheet(current[:existing.start()] + style + current[existing.end():])
+    else:
+        label.setStyleSheet(current + " " + style if current else style)
+
+
+# ── Qt imports ─────────────────────────────────────────────────────────────────
+from PyQt6.QtWidgets import (                                       # type: ignore
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QFrame, QGridLayout, QSizePolicy, QPushButton,
+    QScrollArea, QDialog, QCheckBox, QDialogButtonBox,
+)
+from PyQt6.QtCore  import Qt, QTimer, pyqtSignal, QThread, QMimeData, QPoint  # type: ignore
+from PyQt6.QtGui   import (                                         # type: ignore
+    QColor, QPainter, QPainterPath, QPen, QBrush, QDrag, QPixmap,
+    QGuiApplication,
+)
+
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.WARNING,
@@ -23,16 +94,6 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("tricorder")
-
-from PyQt6.QtWidgets import (                                       # type: ignore
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QFrame, QGridLayout, QSizePolicy, QPushButton,
-    QScrollArea, QDialog, QCheckBox, QDialogButtonBox,
-)
-from PyQt6.QtCore  import Qt, QTimer, pyqtSignal, QThread, QMimeData, QPoint  # type: ignore
-from PyQt6.QtGui   import (                                         # type: ignore
-    QColor, QPainter, QPainterPath, QPen, QBrush, QDrag, QPixmap,
-)
 
 # ── WMI / WinReg ──────────────────────────────────────────────────────────────
 try:
@@ -365,8 +426,10 @@ class HardwareMonitorThread(QThread):
                     except Exception:
                         pass
 
-                new: List[str] = sorted([l for l in luid_data if l not in self._luid_order],
-                             key=lambda l: -luid_data[l]['used'])
+                new: List[str] = sorted(
+                    [luid for luid in luid_data if luid not in self._luid_order],
+                    key=lambda luid: -luid_data[luid]['used'],
+                )
                 self._luid_order.extend(new)
 
                 gpus: List[GPUMetrics] = []
@@ -501,7 +564,7 @@ class SparklineWidget(QWidget):
         self._dirty  = False
         self._grid_cache: Optional[Tuple[int, int, QPixmap]] = None  # (w, h, pixmap)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setMinimumHeight(min_height)
+        self.setMinimumHeight(dp(min_height))
 
     def add_value(self, value: float):
         self.history.append(value)
@@ -570,6 +633,8 @@ class MasterMetricBox(QFrame):
     """Used exclusively for the CPU core/thread grid.  Not draggable."""
     def __init__(self, title: str, color_hex: str, variant: str = 'standard', parent=None):
         super().__init__(parent)
+        # DPI-aware sizing
+        self.setMinimumHeight(dp(40))
         if variant == 'efficiency':
             frame_css = (
                 f"border-top: 1px solid #1a1a28;"
@@ -605,20 +670,22 @@ class MasterMetricBox(QFrame):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 5, 6, 5)
-        layout.setSpacing(2)
+        layout.setContentsMargins(dp(4), dp(3), dp(4), dp(3))
+        layout.setSpacing(dp(1))
 
         header = QHBoxLayout()
+        header.setSpacing(dp(4))
         self.id_lbl  = QLabel(f"{title}{title_extra}")
-        self.id_lbl.setStyleSheet(f"color: {color_hex}; font-size: 13px; font-weight: bold;")
+        self.id_lbl.setStyleSheet(f"color: {color_hex}; font-size: {font_size(11)}; font-weight: bold;")
         self.val_lbl = QLabel("0%")
-        self.val_lbl.setStyleSheet("color: #888; font-size: 14px;")
+        self.val_lbl.setStyleSheet(f"color: #888; font-size: {font_size(12)};")
         header.addWidget(self.id_lbl)
         header.addStretch()
         header.addWidget(self.val_lbl)
         layout.addLayout(header)
 
-        self.graph = SparklineWidget(color_hex)
+        _spark_min_h = int(18 * _DP_SCALE) if _DP_SCALE > 0 else 18
+        self.graph = SparklineWidget(color_hex, min_height=_spark_min_h)
         layout.addWidget(self.graph)
 
     def update_val(self, val: float, text: Optional[str] = None):
@@ -639,7 +706,7 @@ class BaseTile(QFrame):
     remove_requested   = pyqtSignal(str)              # tile_id
     rowbreak_requested = pyqtSignal(str)              # tile_id — toggle row-break before this tile
 
-    _BTN_SIZE = 18
+    _BTN_SIZE = 18  # logical pixels — scaled in __init__
 
     def __init__(self, tile_id: str, color_hex: str, parent=None):
         super().__init__(parent)
@@ -657,21 +724,22 @@ class BaseTile(QFrame):
         self._build_content()
 
         # ── × close button (top-right) ────────────────────────────────────────
+        _btn_size = dp(self._BTN_SIZE)
         self._btn_x = QPushButton("×", self)
-        self._btn_x.setFixedSize(self._BTN_SIZE, self._BTN_SIZE)
-        self._btn_x.setStyleSheet("""
-            QPushButton {
+        self._btn_x.setFixedSize(_btn_size, _btn_size)
+        self._btn_x.setStyleSheet(f"""
+            QPushButton {{
                 background: #880000; color: #fff;
-                border-radius: 9px; font-size: 11px; font-weight: bold;
-            }
-            QPushButton:hover { background: #ff2222; }
+                border-radius: {int(9 * _DP_SCALE)}px; font-size: {font_size(11)}; font-weight: bold;
+            }}
+            QPushButton:hover {{ background: #ff2222; }}
         """)
         self._btn_x.hide()
         self._btn_x.clicked.connect(lambda: self.remove_requested.emit(self.tile_id))
 
         # ── ↵ row-break button (top-left) ─────────────────────────────────────
         self._btn_rn = QPushButton("↵", self)
-        self._btn_rn.setFixedSize(self._BTN_SIZE, self._BTN_SIZE)
+        self._btn_rn.setFixedSize(_btn_size, _btn_size)
         self._btn_rn.setToolTip("Toggle row break before this tile")
         self._rowbreak_active = False
         self._style_rn_btn()
@@ -679,22 +747,24 @@ class BaseTile(QFrame):
         self._btn_rn.clicked.connect(lambda: self.rowbreak_requested.emit(self.tile_id))
 
     def _style_rn_btn(self):
+        _br = int(9 * _DP_SCALE)
+        _fs = font_size(9)
         if self._rowbreak_active:
-            self._btn_rn.setStyleSheet("""
-                QPushButton {
+            self._btn_rn.setStyleSheet(f"""
+                QPushButton {{
                     background: #00aa55; color: #fff;
-                    border-radius: 9px; font-size: 9px; font-weight: bold;
-                }
-                QPushButton:hover { background: #00ff88; color: #000; }
+                    border-radius: {_br}px; font-size: {_fs}; font-weight: bold;
+                }}
+                QPushButton:hover {{ background: #00ff88; color: #000; }}
             """)
         else:
-            self._btn_rn.setStyleSheet("""
-                QPushButton {
+            self._btn_rn.setStyleSheet(f"""
+                QPushButton {{
                     background: #1a2a1a; color: #336633;
-                    border-radius: 9px; font-size: 9px; font-weight: bold;
+                    border-radius: {_br}px; font-size: {_fs}; font-weight: bold;
                     border: 1px solid #2a3a2a;
-                }
-                QPushButton:hover { background: #2a3a2a; color: #00ff88; }
+                }}
+                QPushButton:hover {{ background: #2a3a2a; color: #00ff88; }}
             """)
 
     def set_rowbreak_active(self, active: bool):
@@ -750,7 +820,7 @@ class BaseTile(QFrame):
 
     def resizeEvent(self, event):                                   # type: ignore
         super().resizeEvent(event)
-        self._btn_x.move(self.width() - self._BTN_SIZE - 3, 3)
+        self._btn_x.move(self.width() - dp(self._BTN_SIZE) - 3, 3)
         self._btn_rn.move(3, 3)
 
     # ── Drag source ────────────────────────────────────────────────────────────
@@ -834,15 +904,15 @@ class MetricTile(BaseTile):
 
     def _build_content(self):
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(6, 5, 6, 5)
-        outer.setSpacing(2)
+        outer.setContentsMargins(dp(6), dp(5), dp(6), dp(5))
+        outer.setSpacing(dp(2))
 
         hdr = QHBoxLayout()
         self._title_lbl = QLabel(self._title)
         self._title_lbl.setStyleSheet(
-            f"color: {self._color_hex}; font-size: 13px; font-weight: bold;")
+            f"color: {self._color_hex}; font-size: {font_size(13)}; font-weight: bold;")
         self._val_lbl = QLabel("0%")
-        self._val_lbl.setStyleSheet("color: #888; font-size: 14px;")
+        self._val_lbl.setStyleSheet(f"color: #888; font-size: {font_size(14)};")
         hdr.addWidget(self._title_lbl)
         hdr.addStretch()
         hdr.addWidget(self._val_lbl)
@@ -880,20 +950,20 @@ class DriveTile(BaseTile):
 
     def _build_content(self):
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(6, 5, 6, 5)
-        outer.setSpacing(3)
+        outer.setContentsMargins(dp(6), dp(5), dp(6), dp(5))
+        outer.setSpacing(dp(3))
 
         # ── Header ────────────────────────────────────────────────────────────
         hdr = QHBoxLayout()
         icon_lbl = QLabel("💾")
-        icon_lbl.setStyleSheet("font-size: 12px;")
+        icon_lbl.setStyleSheet(f"font-size: {font_size(12)};")
         name_lbl = QLabel(self._label)
         name_lbl.setStyleSheet(
-            f"color: {DRIVE_R_COLOR}; font-size: 13px; font-weight: bold;")
+            f"color: {DRIVE_R_COLOR}; font-size: {font_size(13)}; font-weight: bold;")
         self._peak_lbl = QLabel("↑100 MB/s")
-        self._peak_lbl.setStyleSheet("color: #444; font-size: 11px;")
+        self._peak_lbl.setStyleSheet(f"color: #444; font-size: {font_size(11)};")
         hdr.addWidget(icon_lbl)
-        hdr.addSpacing(3)
+        hdr.addSpacing(dp(3))
         hdr.addWidget(name_lbl)
         hdr.addStretch()
         hdr.addWidget(self._peak_lbl)
@@ -901,14 +971,15 @@ class DriveTile(BaseTile):
 
         # ── Read row ──────────────────────────────────────────────────────────
         r_row = QHBoxLayout()
-        r_row.setSpacing(4)
+        r_row.setSpacing(dp(4))
         r_lbl = QLabel("R")
-        r_lbl.setStyleSheet(f"color: {DRIVE_R_COLOR}; font-size: 12px; font-weight: bold;")
-        r_lbl.setFixedWidth(12)
-        self._r_graph = SparklineWidget(DRIVE_R_COLOR, min_height=24)
+        r_lbl.setStyleSheet(f"color: {DRIVE_R_COLOR}; font-size: {font_size(12)}; font-weight: bold;")
+        r_lbl.setFixedWidth(dp(12))
+        _r_graph_h = int(24 * _DP_SCALE) if _DP_SCALE > 0 else 24
+        self._r_graph = SparklineWidget(DRIVE_R_COLOR, min_height=_r_graph_h)
         self._r_val   = QLabel("0 MB/s")
-        self._r_val.setStyleSheet(f"color: {DRIVE_R_COLOR}; font-size: 12px;")
-        self._r_val.setFixedWidth(72)
+        self._r_val.setStyleSheet(f"color: {DRIVE_R_COLOR}; font-size: {font_size(12)};")
+        self._r_val.setFixedWidth(dp(72))
         self._r_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)   # type: ignore
         r_row.addWidget(r_lbl)
         r_row.addWidget(self._r_graph)
@@ -917,14 +988,15 @@ class DriveTile(BaseTile):
 
         # ── Write row ─────────────────────────────────────────────────────────
         w_row = QHBoxLayout()
-        w_row.setSpacing(4)
+        w_row.setSpacing(dp(4))
         w_lbl = QLabel("W")
-        w_lbl.setStyleSheet(f"color: {DRIVE_W_COLOR}; font-size: 12px; font-weight: bold;")
-        w_lbl.setFixedWidth(12)
-        self._w_graph = SparklineWidget(DRIVE_W_COLOR, min_height=24)
+        w_lbl.setStyleSheet(f"color: {DRIVE_W_COLOR}; font-size: {font_size(12)}; font-weight: bold;")
+        w_lbl.setFixedWidth(dp(12))
+        _w_graph_h = int(24 * _DP_SCALE) if _DP_SCALE > 0 else 24
+        self._w_graph = SparklineWidget(DRIVE_W_COLOR, min_height=_w_graph_h)
         self._w_val   = QLabel("0 MB/s")
-        self._w_val.setStyleSheet(f"color: {DRIVE_W_COLOR}; font-size: 12px;")
-        self._w_val.setFixedWidth(72)
+        self._w_val.setStyleSheet(f"color: {DRIVE_W_COLOR}; font-size: {font_size(12)};")
+        self._w_val.setFixedWidth(dp(72))
         self._w_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)   # type: ignore
         w_row.addWidget(w_lbl)
         w_row.addWidget(self._w_graph)
@@ -979,33 +1051,34 @@ class GPUCopyTile(BaseTile):
 
     def _build_content(self):
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(6, 5, 6, 5)
-        outer.setSpacing(3)
+        outer.setContentsMargins(dp(6), dp(5), dp(6), dp(5))
+        outer.setSpacing(dp(3))
 
         # ── Header ────────────────────────────────────────────────────────────
         hdr = QHBoxLayout()
         icon_lbl = QLabel("📋")
-        icon_lbl.setStyleSheet("font-size: 13px;")
+        icon_lbl.setStyleSheet(f"font-size: {font_size(13)};")
         name_lbl = QLabel(f"{self._gpu_name} · Copy")
         name_lbl.setStyleSheet(
-            f"color: {self._palette[1]}; font-size: 13px; font-weight: bold;")
+            f"color: {self._palette[1]}; font-size: {font_size(13)}; font-weight: bold;")
         hdr.addWidget(icon_lbl)
-        hdr.addSpacing(3)
+        hdr.addSpacing(dp(3))
         hdr.addWidget(name_lbl)
         hdr.addStretch()
         outer.addLayout(hdr)
 
         # ── Copy0 row ─────────────────────────────────────────────────────────
         c0_row = QHBoxLayout()
-        c0_row.setSpacing(4)
+        c0_row.setSpacing(dp(4))
         c0_lbl = QLabel("Cp0")
         c0_lbl.setStyleSheet(
-            f"color: {self._palette[1]}; font-size: 12px; font-weight: bold;")
-        c0_lbl.setFixedWidth(28)
-        self._c0_graph = SparklineWidget(self._palette[1], min_height=24)
+            f"color: {self._palette[1]}; font-size: {font_size(12)}; font-weight: bold;")
+        c0_lbl.setFixedWidth(dp(28))
+        _c0_h = int(24 * _DP_SCALE) if _DP_SCALE > 0 else 24
+        self._c0_graph = SparklineWidget(self._palette[1], min_height=_c0_h)
         self._c0_val   = QLabel("0%")
-        self._c0_val.setStyleSheet(f"color: {self._palette[1]}; font-size: 12px;")
-        self._c0_val.setFixedWidth(34)
+        self._c0_val.setStyleSheet(f"color: {self._palette[1]}; font-size: {font_size(12)};")
+        self._c0_val.setFixedWidth(dp(34))
         self._c0_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # type: ignore
         c0_row.addWidget(c0_lbl)
         c0_row.addWidget(self._c0_graph)
@@ -1014,15 +1087,16 @@ class GPUCopyTile(BaseTile):
 
         # ── Copy1 row ─────────────────────────────────────────────────────────
         c1_row = QHBoxLayout()
-        c1_row.setSpacing(4)
+        c1_row.setSpacing(dp(4))
         c1_lbl = QLabel("Cp1")
         c1_lbl.setStyleSheet(
-            f"color: {self._palette[2]}; font-size: 12px; font-weight: bold;")
-        c1_lbl.setFixedWidth(28)
-        self._c1_graph = SparklineWidget(self._palette[2], min_height=24)
+            f"color: {self._palette[2]}; font-size: {font_size(12)}; font-weight: bold;")
+        c1_lbl.setFixedWidth(dp(28))
+        _c1_h = int(24 * _DP_SCALE) if _DP_SCALE > 0 else 24
+        self._c1_graph = SparklineWidget(self._palette[2], min_height=_c1_h)
         self._c1_val   = QLabel("0%")
-        self._c1_val.setStyleSheet(f"color: {self._palette[2]}; font-size: 12px;")
-        self._c1_val.setFixedWidth(34)
+        self._c1_val.setStyleSheet(f"color: {self._palette[2]}; font-size: {font_size(12)};")
+        self._c1_val.setFixedWidth(dp(34))
         self._c1_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # type: ignore
         c1_row.addWidget(c1_lbl)
         c1_row.addWidget(self._c1_graph)
@@ -1059,33 +1133,34 @@ class GPU3DComputeTile(BaseTile):
 
     def _build_content(self):
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(6, 5, 6, 5)
-        outer.setSpacing(3)
+        outer.setContentsMargins(dp(6), dp(5), dp(6), dp(5))
+        outer.setSpacing(dp(3))
 
         # ── Header ────────────────────────────────────────────────────────────
         hdr = QHBoxLayout()
         icon_lbl = QLabel("🎮")
-        icon_lbl.setStyleSheet("font-size: 13px;")
+        icon_lbl.setStyleSheet(f"font-size: {font_size(13)};")
         name_lbl = QLabel(f"{self._gpu_name} · 3D / Compute")
         name_lbl.setStyleSheet(
-            f"color: {self._palette[0]}; font-size: 13px; font-weight: bold;")
+            f"color: {self._palette[0]}; font-size: {font_size(13)}; font-weight: bold;")
         hdr.addWidget(icon_lbl)
-        hdr.addSpacing(3)
+        hdr.addSpacing(dp(3))
         hdr.addWidget(name_lbl)
         hdr.addStretch()
         outer.addLayout(hdr)
 
         # ── 3D row ────────────────────────────────────────────────────────────
         d3_row = QHBoxLayout()
-        d3_row.setSpacing(4)
+        d3_row.setSpacing(dp(4))
         d3_lbl = QLabel("3D ")
         d3_lbl.setStyleSheet(
-            f"color: {self._palette[0]}; font-size: 12px; font-weight: bold;")
-        d3_lbl.setFixedWidth(28)
-        self._d3_graph = SparklineWidget(self._palette[0], min_height=24)
+            f"color: {self._palette[0]}; font-size: {font_size(12)}; font-weight: bold;")
+        d3_lbl.setFixedWidth(dp(28))
+        _d3_h = int(24 * _DP_SCALE) if _DP_SCALE > 0 else 24
+        self._d3_graph = SparklineWidget(self._palette[0], min_height=_d3_h)
         self._d3_val   = QLabel("0%")
-        self._d3_val.setStyleSheet(f"color: {self._palette[0]}; font-size: 12px;")
-        self._d3_val.setFixedWidth(34)
+        self._d3_val.setStyleSheet(f"color: {self._palette[0]}; font-size: {font_size(12)};")
+        self._d3_val.setFixedWidth(dp(34))
         self._d3_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # type: ignore
         d3_row.addWidget(d3_lbl)
         d3_row.addWidget(self._d3_graph)
@@ -1094,15 +1169,16 @@ class GPU3DComputeTile(BaseTile):
 
         # ── Compute row ───────────────────────────────────────────────────────
         cm_row = QHBoxLayout()
-        cm_row.setSpacing(4)
+        cm_row.setSpacing(dp(4))
         cm_lbl = QLabel("Cmp")
         cm_lbl.setStyleSheet(
-            f"color: {self._palette[1]}; font-size: 12px; font-weight: bold;")
-        cm_lbl.setFixedWidth(28)
-        self._cm_graph = SparklineWidget(self._palette[1], min_height=24)
+            f"color: {self._palette[1]}; font-size: {font_size(12)}; font-weight: bold;")
+        cm_lbl.setFixedWidth(dp(28))
+        _cm_h = int(24 * _DP_SCALE) if _DP_SCALE > 0 else 24
+        self._cm_graph = SparklineWidget(self._palette[1], min_height=_cm_h)
         self._cm_val   = QLabel("0%")
-        self._cm_val.setStyleSheet(f"color: {self._palette[1]}; font-size: 12px;")
-        self._cm_val.setFixedWidth(34)
+        self._cm_val.setStyleSheet(f"color: {self._palette[1]}; font-size: {font_size(12)};")
+        self._cm_val.setFixedWidth(dp(34))
         self._cm_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # type: ignore
         cm_row.addWidget(cm_lbl)
         cm_row.addWidget(self._cm_graph)
@@ -1136,9 +1212,9 @@ class RowDropZone(QWidget):
         self._row_idx = row_idx
         self._hover   = False
         self.setAcceptDrops(True)
-        self.setFixedWidth(28)
+        self.setFixedWidth(dp(28))
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
-        self.setMinimumHeight(40)
+        self.setMinimumHeight(dp(40))
 
     def dragEnterEvent(self, event):                                # type: ignore
         if event.mimeData().hasText():
@@ -1192,7 +1268,7 @@ class InterRowDropZone(QWidget):
         self._after  = after_row_idx
         self._hover  = False
         self.setAcceptDrops(True)
-        self.setFixedHeight(16)
+        self.setFixedHeight(dp(16))
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def dragEnterEvent(self, event):                                # type: ignore
@@ -1243,22 +1319,27 @@ class ResponsiveCoreGrid(QWidget):
                group always stays together vertically (pairs are never split).
 
     min_col_w — minimum width in px per group-column before wrapping occurs.
+
+    The grid uses QSizePolicy.Expanding/Expanding so it fills all available
+    space — both horizontally and vertically — allowing the parent layout to
+    distribute height proportionally.
     """
     def __init__(self, columns: List[List[QWidget]],
                  min_col_w: int = 120, max_cols: int = 0, parent=None):
         super().__init__(parent)
         self._columns    = columns
-        self._min_col_w  = min_col_w
+        self._min_col_w  = dp(min_col_w)  # scale the logical min width
         self._max_cols   = max_cols   # 0 = no cap
         self._last_cols  = 0
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._last_rows  = 0
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
 
         for group in columns:
             for w in group:
                 w.setParent(self)
 
         self._grid = QGridLayout(self)
-        self._grid.setSpacing(6)
+        self._grid.setSpacing(dp(6))
         self._grid.setContentsMargins(0, 0, 0, 0)
         self._do_layout(max(1, len(columns)))   # sensible initial layout
 
@@ -1322,6 +1403,13 @@ class TileGrid(QWidget):
       • ×  (top-right) — hide this tile
     A small '+' drop zone appears at the end of each row; dropping a tile on it
     appends that tile to the end of that row.
+
+    Auto-scaling
+    ────────────
+    The row height is automatically computed from the available vertical space.
+    When many rows are visible the height shrinks (down to _min_row_h); when
+    few rows are visible it grows (up to _max_row_h).  This keeps the global
+    section compact on small screens and spacious on large ones.
     """
 
     def __init__(self, tiles: Dict[str, BaseTile],
@@ -1333,8 +1421,11 @@ class TileGrid(QWidget):
         self._tiles      = tiles
         self._tile_names = tile_names
         self._edit_mode  = False
-        self._min_row_h  = 130    # minimum height per tile row (px)
+        # Scale row heights by DPI — 75/180 are logical px for 100% DPI
+        self._min_row_h  = int(75 * _DP_SCALE) if _DP_SCALE > 0 else 75
+        self._max_row_h  = int(180 * _DP_SCALE) if _DP_SCALE > 0 else 180
         self._row_widgets: List[QWidget] = []
+        self._current_row_h = self._min_row_h  # dynamically adjusted
 
         for t in self._tiles.values():
             t.setParent(self)
@@ -1359,7 +1450,7 @@ class TileGrid(QWidget):
             self._hidden     = [tid for tid in self._tiles if tid not in default_order]
 
         self._vbox = QVBoxLayout(self)
-        self._vbox.setSpacing(6)
+        self._vbox.setSpacing(dp(6))
         self._vbox.setContentsMargins(0, 0, 0, 0)
         self._relayout()
 
@@ -1401,10 +1492,10 @@ class TileGrid(QWidget):
         for row_idx, row_tiles in enumerate(rows):
             rw = QWidget(self)
             rw.setStyleSheet("background: transparent;")
-            rw.setMinimumHeight(self._min_row_h)
+            rw.setMinimumHeight(self._current_row_h)
             hbox = QHBoxLayout(rw)
             hbox.setContentsMargins(0, 0, 0, 0)
-            hbox.setSpacing(6)
+            hbox.setSpacing(dp(6))
 
             for tid in row_tiles:
                 tile = self._tiles[tid]
@@ -1430,17 +1521,58 @@ class TileGrid(QWidget):
 
         self._update_rowbreak_buttons()
 
+    # ── Resize / auto-scale ──────────────────────────────────────────────────
+
+    def resizeEvent(self, event):                                    # type: ignore
+        super().resizeEvent(event)
+        self._auto_adjust_row_height()
+
+    def _auto_adjust_row_height(self):
+        """Compute an optimal row height from the widget's current height.
+
+        Uses a target row height that favours compact layouts for various aspect ratios.
+        The actual height is computed as min(target, available / n_rows) so rows
+        shrink when there are many of them but grow when space allows.
+        All constants are DPI-scaled.
+        """
+        rows = self._parse_rows()
+        n_rows = len(rows)
+        if n_rows == 0:
+            return
+        # Available height: subtract vbox spacing and edit-mode drop zones
+        available = self.height()
+        drop_zones = 0
+        if self._edit_mode:
+            # 1 before first row + 2 per existing row (after + sep)
+            drop_zones = 1 + 2 * n_rows
+        available -= drop_zones * int(4 * _DP_SCALE)          # drop-zone height
+        available -= (n_rows + drop_zones) * dp(6)  # vbox spacing
+        available = max(0, available)
+        # Target: aim for ~110 px per row (compact for 16:9), DPI-scaled, but allow up to _max_row_h
+        target_h = min(self._max_row_h, int(110 * _DP_SCALE))
+        # Compute ideal height: never exceed what's available per row
+        ideal = max(self._min_row_h, min(target_h, available // n_rows))
+        if ideal != self._current_row_h:
+            self._current_row_h = ideal
+            for rw in self._row_widgets:
+                rw.setMinimumHeight(self._current_row_h)
+                rw.setMaximumHeight(self._current_row_h)
+
     # ── Edit mode ─────────────────────────────────────────────────────────────
 
     def set_edit_mode(self, enabled: bool):
         self._edit_mode = enabled
         self._relayout()   # rebuild to show/hide drop zones
+        self._auto_adjust_row_height()
 
     def set_min_row_h(self, h: int):
         """Adjust minimum row height — tiles shrink/grow vertically."""
-        self._min_row_h = max(80, min(h, 600))
+        # Clamp to DPI-scaled bounds
+        self._min_row_h = max(int(50 * _DP_SCALE), min(h, int(400 * _DP_SCALE)))
+        self._current_row_h = max(self._min_row_h, self._current_row_h)
         for rw in self._row_widgets:
-            rw.setMinimumHeight(self._min_row_h)
+            rw.setMinimumHeight(self._current_row_h)
+            rw.setMaximumHeight(self._current_row_h)
         self._save_config()
 
     @property
@@ -1729,6 +1861,12 @@ class CollapsibleSection(QWidget):
         else:
             self.setMaximumHeight(16_777_215)   # Qt QWIDGETSIZE_MAX — no limit
 
+    def resizeEvent(self, event):                                    # type: ignore
+        super().resizeEvent(event)
+        if not self._collapsed and self._content.isVisible():
+            # Ensure content gets the full available height
+            self._content.update()
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HELPERS
@@ -1743,15 +1881,15 @@ def section_label(html: str) -> QLabel:
 def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
     btn = QPushButton(text)
     btn.setCheckable(checkable)
-    btn.setStyleSheet("""
-        QPushButton {
+    btn.setStyleSheet(f"""
+        QPushButton {{
             background: #1e1e2e; color: #aaa;
-            border: 1px solid #333; border-radius: 5px;
-            padding: 4px 12px; font-size: 12px;
-        }
-        QPushButton:hover   { background: #2a2a3a; color: #fff; }
-        QPushButton:checked { background: #2a2a1a; color: #ffdd55;
-                              border-color: #ffdd55; }
+            border: 1px solid #333; border-radius: {int(5 * _DP_SCALE)}px;
+            padding: {int(4 * _DP_SCALE)}px {int(12 * _DP_SCALE)}px; font-size: {font_size(12)};
+        }}
+        QPushButton:hover   {{ background: #2a2a3a; color: #fff; }}
+        QPushButton:checked {{ background: #2a2a1a; color: #ffdd55;
+                              border-color: #ffdd55; }}
     """)
     return btn
 
@@ -1773,7 +1911,10 @@ class TricorderDashboard(QMainWindow):
             pass
 
         self.setWindowTitle("System Tricorder v0.8")
-        self.setMinimumSize(1280, 900)
+        # Scale minimum size by DPI — 1280×720 is the logical 100% DPI size
+        _min_w = int(1280 * _DP_SCALE) if _DP_SCALE > 0 else 1280
+        _min_h = int(720 * _DP_SCALE) if _DP_SCALE > 0 else 720
+        self.setMinimumSize(_min_w, _min_h)
         self.setStyleSheet("QMainWindow, QWidget { background-color: #0a0a0f; color: white; }")
 
         self._analyze_hardware()
@@ -1838,10 +1979,14 @@ class TricorderDashboard(QMainWindow):
                 ):
                     smt = int(m.SMBIOSMemoryType or 0)
                     spd = int(m.Speed or 0)
-                    if smt in (34, 35):   self.ram_type = "DDR5"
-                    elif smt == 26:        self.ram_type = "DDR4"
-                    elif spd >= 4800:      self.ram_type = "DDR5"
-                    elif spd > 0:          self.ram_type = "DDR4"
+                    if smt in (34, 35):
+                        self.ram_type = "DDR5"
+                    elif smt == 26:
+                        self.ram_type = "DDR4"
+                    elif spd >= 4800:
+                        self.ram_type = "DDR5"
+                    elif spd > 0:
+                        self.ram_type = "DDR4"
                     break
             except Exception:
                 pass
@@ -1871,20 +2016,20 @@ class TricorderDashboard(QMainWindow):
         root_w  = QWidget()
         self.setCentralWidget(root_w)
         root    = QVBoxLayout(root_w)
-        root.setContentsMargins(15, 12, 15, 12)
-        root.setSpacing(0)
+        root.setContentsMargins(dp(15), dp(12), dp(15), dp(12))
+        root.setSpacing(dp(0))
 
         # ── Header ────────────────────────────────────────────────────────────
         hdr = QHBoxLayout()
 
         title = QLabel(
             "📊  System Tricorder  "
-            "<span style='font-size:18px; color:#00aa55;'>v0.8</span>"
+            f"<span style='font-size: {font_size(18)}; color:#00aa55;'>v0.8</span>"
         )
         title.setStyleSheet(
-            "font-size: 28px; font-weight: bold; color: #00ff88; background: transparent;")
+            f"font-size: {font_size(28)}; font-weight: bold; color: #00ff88; background: transparent;")
         hdr.addWidget(title)
-        hdr.addSpacing(16)
+        hdr.addSpacing(dp(16))
 
         sock_txt  = f"  ·  {self.num_sockets}× Socket" if self.num_sockets > 1 else ""
         cpu_hint  = f"{self.c_physical}C / {self.c_logical}T{sock_txt}"
@@ -1894,7 +2039,7 @@ class TricorderDashboard(QMainWindow):
             cpu_hint += "  ·  HT"
         info = QLabel(cpu_hint)
         info.setStyleSheet(
-            "font-size: 11px; color: #444; background: transparent; padding-top: 12px;")
+            f"font-size: {font_size(11)}; color: #444; background: transparent; padding-top: {dp(12)}px;")
         hdr.addWidget(info)
 
         hdr.addStretch()
@@ -1905,7 +2050,7 @@ class TricorderDashboard(QMainWindow):
         self._btn_minus = _toolbar_btn("‹")
         self._btn_plus  = _toolbar_btn("›")
         self._cols_lbl  = QLabel("5 Spalten")
-        self._cols_lbl.setStyleSheet("color: #555; font-size: 11px;")
+        self._cols_lbl.setStyleSheet(f"color: #555; font-size: {font_size(11)};")
         self._btn_reset = _toolbar_btn("↺  Reset")
 
         self._btn_add.hide()
@@ -1924,23 +2069,23 @@ class TricorderDashboard(QMainWindow):
                   self._btn_minus, self._cols_lbl, self._btn_plus,
                   self._btn_reset):
             hdr.addWidget(w)
-        hdr.addSpacing(20)
+        hdr.addSpacing(dp(20))
 
         self._clock_lbl = QLabel()
         self._clock_lbl.setStyleSheet(
-            "font-size: 36px; font-weight: bold; color: #888; "
+            f"font-size: {font_size(36)}; font-weight: bold; color: #888; "
             "font-family: Consolas; background: transparent;")
         hdr.addWidget(self._clock_lbl)
         root.addLayout(hdr)
-        root.addSpacing(10)
+        root.addSpacing(dp(10))
 
         # ── Scrollable content ────────────────────────────────────────────────
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setStyleSheet(
             "QScrollArea { background: transparent; border: none; }"
-            "QScrollBar:vertical { background: #111; width: 8px; border: none; }"
-            "QScrollBar::handle:vertical { background: #333; border-radius: 4px; }"
+            f"QScrollBar:vertical {{ background: #111; width: {dp(8)}px; border: none; }}"
+            f"QScrollBar::handle:vertical {{ background: #333; border-radius: {int(4 * _DP_SCALE)}px; }}"
         )
         content_w = QWidget()
         content_w.setStyleSheet("background: transparent;")
@@ -1958,7 +2103,9 @@ class TricorderDashboard(QMainWindow):
             "<b style='color:#00ff88; font-size:14px;'>▸ Global System &amp; Graphics</b>",
             self._tile_grid,
         )
-        content_layout.addWidget(global_section, 1)
+        # Global section gets moderate priority (stretch 2) — fills space but
+        # leaves room for CPU topology on 16:9 displays
+        content_layout.addWidget(global_section, 2)
         content_layout.addSpacing(8)
 
         # ── CPU topology section (collapsible) ────────────────────────────────
@@ -1976,9 +2123,11 @@ class TricorderDashboard(QMainWindow):
             self._build_simple_cores(cpu_inner)
 
         cpu_section = CollapsibleSection(
-            "<b style='color:#00d4ff; font-size:14px;'>CPU Thread Topology</b>",
+            f"<b style='color:#00d4ff; font-size: {font_size(14)};'>CPU Thread Topology</b>",
             cpu_content_w,
         )
+        # CPU section gets stretch 1 — fills remaining space but shrinks first
+        # when vertical space is tight on narrow aspect ratios
         content_layout.addWidget(cpu_section, 1)
 
         self._default_tile_order = default_order
@@ -2096,11 +2245,11 @@ class TricorderDashboard(QMainWindow):
                 self.thread_widgets[t1] = w1
                 group.append(w1)
             p_groups.append(group)
-        parent.addWidget(ResponsiveCoreGrid(p_groups, min_col_w=120), 1)
-        parent.addSpacing(14)
+        parent.addWidget(ResponsiveCoreGrid(p_groups, min_col_w=100), 1)
+        parent.addSpacing(8)
 
         parent.addWidget(section_label(
-            f"<b style='color:{E_COLOR}; font-size:14px;'>🔋 Efficiency Cores "
+            f"<b style='color:{E_COLOR}; font-size:12px;'>🔋 Efficiency Cores "
             f"({self.e_cores} Cores / {self.e_threads} Threads, "
             f"Threads {self.p_threads}–{self.p_threads + self.e_threads - 1})</b>"
         ))
@@ -2112,7 +2261,7 @@ class TricorderDashboard(QMainWindow):
             w = MasterMetricBox(f"E-Core {i}", E_COLOR, variant='efficiency')
             self.thread_widgets[t] = w
             e_groups.append([w])
-        parent.addWidget(ResponsiveCoreGrid(e_groups, min_col_w=100,
+        parent.addWidget(ResponsiveCoreGrid(e_groups, min_col_w=80,
                                             max_cols=math.ceil(self.e_cores / 2)), 1)
 
     def _build_ht_cores(self, parent: QVBoxLayout) -> None:
@@ -2124,17 +2273,17 @@ class TricorderDashboard(QMainWindow):
         n_phys     = self.c_physical
 
         parent.addWidget(section_label(
-            f"<b style='color:{PHYS_COLOR}; font-size:14px;'>{brand_lbl} Threads "
+            f"<b style='color:{PHYS_COLOR}; font-size:12px;'>{brand_lbl} Threads "
             f"— {smt_label} Pairs (0–{self.c_logical - 1})</b>"
         ))
         parent.addSpacing(2)
         hint = QLabel(
-            f"<span style='color:#333; font-size:10px;'>"
+            f"<span style='color:#333; font-size:9px;'>"
             f"Row 1 = Physical Cores &nbsp;|&nbsp; Row 2 = {smt_label} Siblings</span>"
         )
         hint.setStyleSheet("background: transparent;")
         parent.addWidget(hint)
-        parent.addSpacing(4)
+        parent.addSpacing(2)
 
         col_groups: List[List[QWidget]] = []
         for ci in range(n_phys):
@@ -2145,7 +2294,7 @@ class TricorderDashboard(QMainWindow):
             self.thread_widgets[t_phys] = w_phys
             self.thread_widgets[t_smt]  = w_smt
             col_groups.append([w_phys, w_smt])
-        parent.addWidget(ResponsiveCoreGrid(col_groups, min_col_w=120), 1)
+        parent.addWidget(ResponsiveCoreGrid(col_groups, min_col_w=100), 1)
 
     def _build_simple_cores(self, parent: QVBoxLayout) -> None:
         color = "#ff6600" if self.is_amd else "#00d4ff"
@@ -2224,7 +2373,13 @@ class TricorderDashboard(QMainWindow):
 # ═══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setApplicationName("System Tricorder")
     app.setStyle("Fusion")
+
+    # Compute DPI scale factor AFTER creating QApplication (Qt-native)
+    _init_dp_scale(app)
+    logging.getLogger("tricorder").debug("DPI scale factor: %.2f", _DP_SCALE)
+
     win = TricorderDashboard()
     win.showMaximized()
     sys.exit(app.exec())

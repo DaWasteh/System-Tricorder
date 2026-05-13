@@ -81,7 +81,6 @@ from PyQt6.QtWidgets import (                                       # type: igno
 from PyQt6.QtCore  import Qt, QTimer, pyqtSignal, QThread, QMimeData, QPoint  # type: ignore
 from PyQt6.QtGui   import (                                         # type: ignore
     QColor, QPainter, QPainterPath, QPen, QBrush, QDrag, QPixmap,
-    QGuiApplication,
 )
 
 # ── Logging ────────────────────────────────────────────────────────────────────

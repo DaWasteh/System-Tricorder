@@ -12,6 +12,7 @@
 ## 🖥️ Screenshots
 
 ![System Tricorder v0.8](image.png)
+
 ---
 
 ## ✨ What it does

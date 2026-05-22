@@ -125,6 +125,10 @@ GPU_PALETTES = [
 _VIRTUAL_NAMES = ('microsoft basic', 'remote desktop', 'parsec', 'virtual',
                   'citrix', 'vmware', 'indirect')
 
+# Discrete Intel Arc model numbers — anything NOT in this list is the iGPU
+# (Arrow Lake / Meteor Lake have an iGPU called "Intel Arc Graphics" with no model number)
+_ARC_DMODEL = ('a310', 'a380', 'a580', 'a750', 'a770', 'b580', 'b770')
+
 # Drive tile colours
 DRIVE_R_COLOR = "#00ffcc"   # read  — teal
 DRIVE_W_COLOR = "#ffcc00"   # write — amber
@@ -167,6 +171,14 @@ def get_wmi_gpu_list() -> List[Tuple[str, bool, float]]:
     """
     Returns (name, is_igpu, vram_gb) for all real GPUs via WMI.
     Sorted: dGPUs first (desc VRAM), then iGPUs.
+
+    iGPU detection rules
+    --------------------
+    Intel: any Intel GPU whose name does NOT contain a discrete Arc model number
+           (e.g. A770, B580) is treated as iGPU.  This correctly classifies
+           "Intel(R) Arc(TM) Graphics" (Arrow Lake / Meteor Lake integrated)
+           as iGPU while keeping Arc A/B dGPUs as dGPU.
+    AMD:   traditional integrated markers (Radeon(TM) Graphics, Vega) without RX.
     """
     result: List[Tuple[str, bool, float]] = []
     if not WMI_AVAILABLE:
@@ -175,16 +187,21 @@ def get_wmi_gpu_list() -> List[Tuple[str, bool, float]]:
         pythoncom.CoInitialize()                                    # type: ignore
         wmi = win32com.client.GetObject("winmgmts:root\\cimv2")    # type: ignore
         for c in wmi.ExecQuery("SELECT Name, AdapterRAM FROM Win32_VideoController"):
-            name = str(c.Name or '').strip()
-            if not name or any(v in name.lower() for v in _VIRTUAL_NAMES):
-                continue
-            nl = name.lower()
-            is_igpu = (
-                ('intel' in nl and 'arc' not in nl and 'xe' not in nl) or
-                ('amd' in nl and ('radeon(tm) graphics' in nl or 'vega' in nl) and 'rx ' not in nl)
-            )
-            vram = float(c.AdapterRAM or 0) / (1024 ** 3)
-            result.append((name, is_igpu, vram))
+            try:
+                name = str(c.Name or '').strip()
+                if not name or any(v in name.lower() for v in _VIRTUAL_NAMES):
+                    continue
+                nl = name.lower()
+                is_igpu = (
+                    # Intel iGPU: any Intel GPU without a known discrete Arc model number
+                    ('intel' in nl and not any(m in nl for m in _ARC_DMODEL)) or
+                    # AMD iGPU: integrated Radeon (Vega/RDNA-integrated, no RX prefix)
+                    ('amd' in nl and ('radeon(tm) graphics' in nl or 'vega' in nl) and 'rx ' not in nl)
+                )
+                vram = float(c.AdapterRAM or 0) / (1024 ** 3)
+                result.append((name, is_igpu, vram))
+            except Exception:
+                pass   # skip problematic WMI rows without aborting the loop
     except Exception:
         pass
     result.sort(key=lambda x: (int(x[1]), -x[2]))
@@ -192,12 +209,12 @@ def get_wmi_gpu_list() -> List[Tuple[str, bool, float]]:
 
 
 def short_gpu_name(name: str) -> str:
-    """Shortens a GPU name to ~18 chars for compact display."""
+    """Shortens a GPU name to ~22 chars for compact display."""
     for kw in ('RTX', 'RX ', 'GTX', 'RX', 'Arc', 'Radeon', 'NVIDIA', 'AMD'):
         idx = name.find(kw)
         if idx != -1:
-            return name[idx:idx + 18].strip()
-    return name[:18].strip()
+            return name[idx:idx + 22].strip()
+    return name[:22].strip()
 
 
 def build_drive_info() -> List[Tuple[str, str]]:
@@ -382,35 +399,68 @@ class HardwareMonitorThread(QThread):
                 luid_data: Dict[str, dict] = {}
 
                 if wmi:
+                    # ── Step 1: fetch engine rows once; seed luid_data from names ──
+                    # This ensures GPUs with 0 VRAM usage (idle) are still tracked.
+                    # Engine name format: luid_0xXXXX_0xYYYY_engtype_<type>_<idx>
+                    # Split on '_engtype_' to extract the LUID prefix.
+                    _IGPU_MARKERS = ('hd graphics', 'uhd graphics', 'iris',
+                                     'intel(r) graphics', 'arc(tm) graphics')
+                    _NPU_MARKERS  = ('ai boost', 'npu', 'xe media')
+                    _engine_rows: list = []
+                    try:
+                        _engine_rows = list(wmi.ExecQuery(
+                            "SELECT Name, UtilizationPercentage "
+                            "FROM Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine"
+                        ))
+                    except Exception as exc:
+                        logger.debug("GPU engine query: %s", exc)
+
+                    for _e in _engine_rows:
+                        try:
+                            _en = str(_e.Name).lower()
+                            if any(x in _en for x in _IGPU_MARKERS):
+                                continue
+                            if any(x in _en for x in _NPU_MARKERS):
+                                continue
+                            if '_engtype_' in _en:
+                                _luid = _en.split('_engtype_')[0]
+                                luid_data.setdefault(_luid, {'3d': 0.0, 'compute': 0.0,
+                                                             'c0': 0.0, 'c1': 0.0, 'used': 0.0})
+                        except Exception:
+                            pass
+
+                    # ── Step 2: fill VRAM usage from memory query ──────────────
                     try:
                         for a in wmi.ExecQuery(
                             "SELECT Name, DedicatedUsage "
                             "FROM Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory"
                         ):
-                            luid = str(a.Name).split('_phys')[0]
-                            used = float(a.DedicatedUsage or 0) / (1024 ** 3)
-                            ld = luid_data.setdefault(luid, {'3d': 0.0, 'compute': 0.0, 'c0': 0.0, 'c1': 0.0, 'used': 0.0})
-                            ld['used'] = max(ld['used'], used)
+                            try:
+                                luid = str(a.Name).lower().split('_phys')[0]
+                                used = float(a.DedicatedUsage or 0) / (1024 ** 3)
+                                ld = luid_data.setdefault(luid, {'3d': 0.0, 'compute': 0.0,
+                                                                 'c0': 0.0, 'c1': 0.0, 'used': 0.0})
+                                ld['used'] = max(ld['used'], used)
+                            except Exception:
+                                pass
                     except Exception:
                         pass
 
-                    try:
-                        for e in wmi.ExecQuery(
-                            "SELECT Name, UtilizationPercentage "
-                            "FROM Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine"
-                        ):
-                            en   = str(e.Name).lower()
-                            util = float(e.UtilizationPercentage or 0)
+                    # ── Step 3: process engine utilizations ────────────────────
+                    for _e in _engine_rows:
+                        try:
+                            en   = str(_e.Name).lower()
+                            util = float(_e.UtilizationPercentage or 0)
                             if util <= 0:
                                 continue
-                            if any(x in en for x in ('hd graphics', 'uhd graphics', 'iris', 'intel(r) graphics')):
+                            if any(x in en for x in _IGPU_MARKERS):
                                 igpu_p = max(igpu_p, util)
                                 continue
-                            if any(x in en for x in ('ai boost', 'npu', 'xe media')):
+                            if any(x in en for x in _NPU_MARKERS):
                                 npu_p = max(npu_p, util)
                                 continue
                             for luid in luid_data:
-                                if luid.lower() in en:
+                                if luid in en:
                                     if any(x in en for x in ('3d', 'graphics_1')):
                                         luid_data[luid]['3d'] = min(luid_data[luid]['3d'] + util, 100.0)
                                     elif any(x in en for x in ('compute', 'cuda')):
@@ -422,8 +472,8 @@ class HardwareMonitorThread(QThread):
                                         else:
                                             luid_data[luid]['c1'] = max(luid_data[luid]['c1'], util)
                                     break
-                    except Exception:
-                        pass
+                        except Exception:
+                            pass
 
                 new: List[str] = sorted(
                     [luid for luid in luid_data if luid not in self._luid_order],
@@ -825,14 +875,16 @@ class BaseTile(QFrame):
     # ── Drag source ────────────────────────────────────────────────────────────
     def mousePressEvent(self, event):                               # type: ignore
         if self._edit_mode and event.button() == Qt.MouseButton.LeftButton:    # type: ignore
-            self._drag_pos = event.pos()
+            # event.position() returns QPointF in PyQt6; toPoint() converts to QPoint
+            # so that drag.setHotSpot() (which requires QPoint) never gets a QPointF.
+            self._drag_pos = event.position().toPoint()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):                                # type: ignore
         if not (self._edit_mode and self._drag_pos and
                 event.buttons() & Qt.MouseButton.LeftButton):                  # type: ignore
             return
-        if ((event.pos() - self._drag_pos).manhattanLength()
+        if ((event.position().toPoint() - self._drag_pos).manhattanLength()
                 < QApplication.startDragDistance()):
             return
 
@@ -843,7 +895,7 @@ class BaseTile(QFrame):
 
         px = self.grab()
         drag.setPixmap(px)
-        drag.setHotSpot(self._drag_pos)
+        drag.setHotSpot(self._drag_pos)                             # QPoint — correct
         drag.exec(Qt.DropAction.MoveAction)                         # type: ignore
         self._drag_pos = None
 
@@ -1716,9 +1768,9 @@ class TileGrid(QWidget):
     def _load_config() -> dict:
         try:
             data = json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
-            if data.get('version') != '0.7':
+            if data.get('version') != '0.8':
                 logger.warning(
-                    "Config version '%s' differs from '0.7' — "
+                    "Config version '%s' differs from '0.8' — "
                     "layout will be kept as-is; delete %s to reset.",
                     data.get('version'), CONFIG_FILE,
                 )
@@ -1730,7 +1782,7 @@ class TileGrid(QWidget):
     def _save_config(self):
         try:
             payload = json.dumps({
-                'version':      '0.7',
+                'version':      '0.8',
                 'min_row_h':    self._min_row_h,
                 'tile_order':   self._tile_order,
                 'hidden_tiles': self._hidden,
@@ -2371,6 +2423,19 @@ class TricorderDashboard(QMainWindow):
 
 # ═══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
+    # ── Crash logging for --noconsole PyInstaller builds ──────────────────────
+    # With --noconsole, sys.stderr is redirected to NUL and unhandled exceptions
+    # disappear silently.  This hook routes them to ~/.tricorder.log instead.
+    import traceback as _tb
+
+    def _excepthook(exc_type, exc_value, exc_tb):
+        logger.critical(
+            "Unhandled exception:\n%s",
+            "".join(_tb.format_exception(exc_type, exc_value, exc_tb)),
+        )
+
+    sys.excepthook = _excepthook
+
     app = QApplication(sys.argv)
     app.setApplicationName("System Tricorder")
     app.setStyle("Fusion")

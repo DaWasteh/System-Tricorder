@@ -459,7 +459,7 @@ class HardwareMonitorThread(QThread):
                             if any(x in en for x in _NPU_MARKERS):
                                 npu_p = max(npu_p, util)
                                 continue
-                            for luid in luid_data:
+                            for luid, data in luid_data.items():
                                 if luid in en:
                                     if any(x in en for x in ('3d', 'graphics_1')):
                                         luid_data[luid]['3d'] = min(luid_data[luid]['3d'] + util, 100.0)
@@ -487,8 +487,8 @@ class HardwareMonitorThread(QThread):
                     if luid not in self._luid_vram:
                         self._luid_vram[luid] = self._dgpu_info[min(i, len(self._dgpu_info) - 1)][1]
                     used = d.get('used', 0.0)
-                    if used > self._luid_vram[luid]:
-                        self._luid_vram[luid] = math.ceil(used)
+                    # Clamp used VRAM to total – never inflate total from usage spikes
+                    used = min(used, self._luid_vram[luid])
                     name = self._dgpu_info[min(i, len(self._dgpu_info) - 1)][0]
                     gpus.append(GPUMetrics(
                         name=name, luid=luid,

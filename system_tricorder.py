@@ -399,13 +399,18 @@ class HardwareMonitorThread(QThread):
                 luid_data: Dict[str, dict] = {}
 
                 if wmi:
-                    # ── Step 1: fetch engine rows once; seed luid_data from names ──
-                    # This ensures GPUs with 0 VRAM usage (idle) are still tracked.
-                    # Engine name format: luid_0xXXXX_0xYYYY_engtype_<type>_<idx>
-                    # Split on '_engtype_' to extract the LUID prefix.
+                    # ── GPU engine utilization ─────────────────────────────────
+                    # Windows GPU perf counters use a per-process format:
+                    #   pid_PPPP_luid_0xAAAA_0xBBBB_phys_0_eng_N_engtype_TYPE
+                    # We extract the GPU LUID with a regex, aggregate max util
+                    # per (luid, eng_idx) across all processes, then sum across
+                    # engine indices of the same type to get total GPU utilization.
                     _IGPU_MARKERS = ('hd graphics', 'uhd graphics', 'iris',
                                      'intel(r) graphics', 'arc(tm) graphics')
                     _NPU_MARKERS  = ('ai boost', 'npu', 'xe media')
+                    _LUID_RE = re.compile(r'luid_(0x[0-9a-f]+_0x[0-9a-f]+)')
+                    _ENG_RE  = re.compile(r'_eng_(\d+)_')
+
                     _engine_rows: list = []
                     try:
                         _engine_rows = list(wmi.ExecQuery(
@@ -415,6 +420,7 @@ class HardwareMonitorThread(QThread):
                     except Exception as exc:
                         logger.debug("GPU engine query: %s", exc)
 
+                    # ── Step 1: seed luid_data from engine rows ────────────────
                     for _e in _engine_rows:
                         try:
                             _en = str(_e.Name).lower()
@@ -422,8 +428,9 @@ class HardwareMonitorThread(QThread):
                                 continue
                             if any(x in _en for x in _NPU_MARKERS):
                                 continue
-                            if '_engtype_' in _en:
-                                _luid = _en.split('_engtype_')[0]
+                            _m = _LUID_RE.search(_en)
+                            if _m:
+                                _luid = 'luid_' + _m.group(1)
                                 luid_data.setdefault(_luid, {'3d': 0.0, 'compute': 0.0,
                                                              'c0': 0.0, 'c1': 0.0, 'used': 0.0})
                         except Exception:
@@ -446,34 +453,67 @@ class HardwareMonitorThread(QThread):
                     except Exception:
                         pass
 
-                    # ── Step 3: process engine utilizations ────────────────────
+                    # ── Step 3: aggregate engine utilization ───────────────────
+                    # Pass A: max util per (luid, eng_idx) across all processes
+                    _eng_max: Dict[tuple, tuple] = {}
                     for _e in _engine_rows:
                         try:
-                            en   = str(_e.Name).lower()
-                            util = float(_e.UtilizationPercentage or 0)
-                            if util <= 0:
+                            _en   = str(_e.Name).lower()
+                            _util = float(_e.UtilizationPercentage or 0)
+                            if _util <= 0:
                                 continue
-                            if any(x in en for x in _IGPU_MARKERS):
-                                igpu_p = max(igpu_p, util)
+                            if any(x in _en for x in _IGPU_MARKERS):
+                                igpu_p = max(igpu_p, _util)
                                 continue
-                            if any(x in en for x in _NPU_MARKERS):
-                                npu_p = max(npu_p, util)
+                            if any(x in _en for x in _NPU_MARKERS):
+                                npu_p = max(npu_p, _util)
                                 continue
-                            for luid, data in luid_data.items():
-                                if luid in en:
-                                    if any(x in en for x in ('3d', 'graphics_1')):
-                                        luid_data[luid]['3d'] = min(luid_data[luid]['3d'] + util, 100.0)
-                                    elif any(x in en for x in ('compute', 'cuda')):
-                                        luid_data[luid]['compute'] = min(luid_data[luid]['compute'] + util, 100.0)
-                                    elif 'copy' in en:
-                                        tail = en.split('copy')[-1]
-                                        if tail.strip().startswith(('_0', ' 0', '0')):
-                                            luid_data[luid]['c0'] = max(luid_data[luid]['c0'], util)
-                                        else:
-                                            luid_data[luid]['c1'] = max(luid_data[luid]['c1'], util)
-                                    break
+                            _lm = _LUID_RE.search(_en)
+                            if not _lm:
+                                continue
+                            _cl = 'luid_' + _lm.group(1)
+                            if _cl not in luid_data:
+                                continue
+                            _em = _ENG_RE.search(_en)
+                            _ei = int(_em.group(1)) if _em else 0
+                            if any(x in _en for x in ('3d', 'graphics_1')):
+                                _et = '3d'
+                            elif any(x in _en for x in ('compute', 'cuda')):
+                                _et = 'compute'
+                            elif 'copy' in _en:
+                                _et = 'copy'
+                            else:
+                                continue
+                            _key = (_cl, _ei)
+                            _prev = _eng_max.get(_key, (0.0, _et))[0]
+                            _eng_max[_key] = (max(_util, _prev), _et)
                         except Exception:
                             pass
+
+                    # Pre-compute copy engine index order per luid
+                    _copy_order: Dict[str, list] = {}
+                    for (_cl2, _ei2), (_, _et2) in _eng_max.items():
+                        if _et2 == 'copy':
+                            _copy_order.setdefault(_cl2, [])
+                            if _ei2 not in _copy_order[_cl2]:
+                                _copy_order[_cl2].append(_ei2)
+                    for _k in _copy_order:
+                        _copy_order[_k].sort()
+
+                    # Pass B: sum unique (luid, eng_idx) entries into luid_data
+                    for (_cl3, _ei3), (_eu3, _et3) in _eng_max.items():
+                        if _cl3 not in luid_data:
+                            continue
+                        if _et3 == '3d':
+                            luid_data[_cl3]['3d'] = min(luid_data[_cl3]['3d'] + _eu3, 100.0)
+                        elif _et3 == 'compute':
+                            luid_data[_cl3]['compute'] = min(luid_data[_cl3]['compute'] + _eu3, 100.0)
+                        elif _et3 == 'copy':
+                            _co = _copy_order.get(_cl3, [])
+                            if _co and _ei3 == _co[0]:
+                                luid_data[_cl3]['c0'] = max(luid_data[_cl3]['c0'], _eu3)
+                            elif len(_co) > 1 and _ei3 == _co[1]:
+                                luid_data[_cl3]['c1'] = max(luid_data[_cl3]['c1'], _eu3)
 
                 new: List[str] = sorted(
                     [luid for luid in luid_data if luid not in self._luid_order],

@@ -167,9 +167,9 @@ def get_registry_gpu_vrams() -> List[float]:
     return vrams if vrams else [8.0]
 
 
-def get_wmi_gpu_list() -> List[Tuple[str, bool, float]]:
+def get_wmi_gpu_list() -> List[Tuple[str, bool, float, str]]:
     """
-    Returns (name, is_igpu, vram_gb) for all real GPUs via WMI.
+    Returns (name, is_igpu, vram_gb, pnp_device_id) for all real GPUs via WMI.
     Sorted: dGPUs first (desc VRAM), then iGPUs.
 
     iGPU detection rules
@@ -180,15 +180,16 @@ def get_wmi_gpu_list() -> List[Tuple[str, bool, float]]:
            as iGPU while keeping Arc A/B dGPUs as dGPU.
     AMD:   traditional integrated markers (Radeon(TM) Graphics, Vega) without RX.
     """
-    result: List[Tuple[str, bool, float]] = []
+    result: List[Tuple[str, bool, float, str]] = []
     if not WMI_AVAILABLE:
         return result
     try:
         pythoncom.CoInitialize()                                    # type: ignore
         wmi = win32com.client.GetObject("winmgmts:root\\cimv2")    # type: ignore
-        for c in wmi.ExecQuery("SELECT Name, AdapterRAM FROM Win32_VideoController"):
+        for c in wmi.ExecQuery("SELECT Name, AdapterRAM, PNPDeviceID FROM Win32_VideoController"):
             try:
                 name = str(c.Name or '').strip()
+                pnp_id = str(c.PNPDeviceID or '').strip()
                 if not name or any(v in name.lower() for v in _VIRTUAL_NAMES):
                     continue
                 nl = name.lower()
@@ -199,7 +200,7 @@ def get_wmi_gpu_list() -> List[Tuple[str, bool, float]]:
                     ('amd' in nl and ('radeon(tm) graphics' in nl or 'vega' in nl) and 'rx ' not in nl)
                 )
                 vram = float(c.AdapterRAM or 0) / (1024 ** 3)
-                result.append((name, is_igpu, vram))
+                result.append((name, is_igpu, vram, pnp_id))
             except Exception:
                 pass   # skip problematic WMI rows without aborting the loop
     except Exception:
@@ -330,20 +331,28 @@ class HardwareMonitorThread(QThread):
         self._com_initialized = False
         self._drive_info      = drive_info   # [(key, label), ...]
 
-        # GPU static info
+        # GPU static info - now with PNPDeviceID for consistent GPU identification
         reg_vrams = get_registry_gpu_vrams()
         wmi_gpus  = get_wmi_gpu_list()
-        dgpu_wmi  = [(n, v) for n, ig, v in wmi_gpus if not ig]
+        dgpu_wmi  = [(n, v, p) for n, ig, v, p in wmi_gpus if not ig]
 
-        self._dgpu_info: List[Tuple[str, float]] = []
-        for i, (name, wv) in enumerate(dgpu_wmi):
+        # Build GPU info list with device ID extracted from PNPDeviceID
+        # Format: (name, vram_gb, device_id_hex) e.g., "0x7550" for RX 9070 XT
+        self._dgpu_info: List[Tuple[str, float, str]] = []
+        for i, (name, wv, pnp_id) in enumerate(dgpu_wmi):
             vram = reg_vrams[i] if i < len(reg_vrams) else (math.ceil(wv) if wv >= 1.0 else 8.0)
-            self._dgpu_info.append((name, float(vram)))
+            # Extract device ID from PNPDeviceID: PCI\VEN_1002&DEV_7550&... -> 0x7550
+            dev_id = ""
+            dev_match = re.search(r'DEV_([0-9A-Fa-f]{4})', pnp_id)
+            if dev_match:
+                dev_id = "0x" + dev_match.group(1).upper()
+            self._dgpu_info.append((name, float(vram), dev_id))
         if not self._dgpu_info:
-            self._dgpu_info = [("GPU", reg_vrams[0])]
+            self._dgpu_info = [("GPU", reg_vrams[0], "")]
 
         self._luid_order: List[str]       = []
         self._luid_vram:  Dict[str, float] = {}
+        self._luid_device_id: Dict[str, str] = {}  # Map LUID → device ID for GPU name lookup
 
     def run(self) -> None:
         self._running = True
@@ -521,17 +530,88 @@ class HardwareMonitorThread(QThread):
                 )
                 self._luid_order.extend(new)
 
+                # ── Map LUIDs to GPU device IDs via VRAM matching ───────────────────
+                # Query Win32_PnPEntity to get PNPDeviceID list with device IDs
+                # Then match LUIDs to GPUs by VRAM size (most reliable identifier)
+                luid_to_device_id: Dict[str, str] = {}
+                luid_to_vram: Dict[str, float] = {}
+
+                if wmi:
+                    # Step 1: Get VRAM per LUID from GPUAdapterMemory counters
+                    try:
+                        for a in wmi.ExecQuery(
+                            "SELECT Name, DedicatedUsage FROM Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory"
+                        ):
+                            try:
+                                luid = str(a.Name).lower().split('_phys')[0]
+                                used = float(a.DedicatedUsage or 0) / (1024 ** 3)
+                                luid_to_vram[luid] = used  # Will be updated with total later
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                    # Step 2: Get PNPDeviceID list to extract device IDs in PCI order
+                    try:
+                        pnp_gpus = wmi.ExecQuery("SELECT PNPDeviceID FROM Win32_PnPEntity WHERE PNPClass = 'Display'")
+                        pnp_order: List[str] = []
+                        for p in pnp_gpus:
+                            try:
+                                pid = str(p.PNPDeviceID or '')
+                                if pid and 'VEN_' in pid:
+                                    pnp_order.append(pid)
+                            except Exception:
+                                pass
+
+                        # Step 3: Build device_id → vram mapping from self._dgpu_info
+                        device_vram_map: Dict[str, float] = {}
+                        for _gname, gvram, gdev_id in self._dgpu_info:
+                            if gdev_id:
+                                device_vram_map[gdev_id] = gvram
+
+                        # Step 4: Match LUIDs to device IDs by VRAM size
+                        # Sort LUIDs by VRAM usage (descending) and match to sorted device VRAMs
+                        sorted_luids = sorted(luid_data.keys(), key=lambda l: -luid_data[l].get('used', 0.0))
+                        sorted_devices = sorted(self._dgpu_info, key=lambda x: -x[1])  # by VRAM descending
+
+                        for idx, luid in enumerate(sorted_luids):
+                            if idx < len(sorted_devices):
+                                _, _, dev_id = sorted_devices[idx]
+                                if dev_id:
+                                    luid_to_device_id[luid] = dev_id
+                    except Exception:
+                        pass
+
                 gpus: List[GPUMetrics] = []
                 for i, luid in enumerate(self._luid_order):
                     d = luid_data.get(luid, {})
+                    device_id = luid_to_device_id.get(luid, self._luid_device_id.get(luid, ""))
+
+                    # Find matching GPU by device ID
+                    gpu_name = "GPU"
+                    gpu_vram = 8.0
+                    for _gn, gvram, gdev_id in self._dgpu_info:
+                        if gdev_id and gdev_id == device_id:
+                            gpu_name = _gn
+                            gpu_vram = gvram
+                            break
+
+                    # Fallback: use index-based assignment if no device ID match
+                    if gpu_name == "GPU" and i < len(self._dgpu_info):
+                        gpu_name = self._dgpu_info[i][0]
+                        gpu_vram = self._dgpu_info[i][1]
+                        device_id = self._dgpu_info[i][2]
+
                     if luid not in self._luid_vram:
-                        self._luid_vram[luid] = self._dgpu_info[min(i, len(self._dgpu_info) - 1)][1]
+                        self._luid_vram[luid] = gpu_vram
+                    self._luid_device_id[luid] = device_id
+
                     used = d.get('used', 0.0)
                     # Clamp used VRAM to total – never inflate total from usage spikes
                     used = min(used, self._luid_vram[luid])
-                    name = self._dgpu_info[min(i, len(self._dgpu_info) - 1)][0]
+
                     gpus.append(GPUMetrics(
-                        name=name, luid=luid,
+                        name=gpu_name, luid=luid,
                         gpu_3d_percent=d.get('3d', 0.0),
                         gpu_compute_percent=d.get('compute', 0.0),
                         gpu_copy0_percent=d.get('c0', 0.0),
@@ -1986,7 +2066,7 @@ def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD  v0.8
+# MAIN DASHBOARD  v0.9
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TricorderDashboard(QMainWindow):
@@ -2001,7 +2081,7 @@ class TricorderDashboard(QMainWindow):
         except Exception:
             pass
 
-        self.setWindowTitle("System Tricorder v0.8")
+        self.setWindowTitle("System Tricorder v0.9")
         # Scale minimum size by DPI — 1280×720 is the logical 100% DPI size
         _min_w = int(1280 * _DP_SCALE) if _DP_SCALE > 0 else 1280
         _min_h = int(720 * _DP_SCALE) if _DP_SCALE > 0 else 720
@@ -2084,13 +2164,18 @@ class TricorderDashboard(QMainWindow):
 
         wmi_gpus  = get_wmi_gpu_list()
         reg_vrams = get_registry_gpu_vrams()
-        dgpu_wmi  = [(n, v) for n, ig, v in wmi_gpus if not ig]
-        self.detected_gpus: List[Tuple[str, float]] = []
-        for i, (name, wv) in enumerate(dgpu_wmi):
+        dgpu_wmi  = [(n, v, p) for n, ig, v, p in wmi_gpus if not ig]
+        self.detected_gpus: List[Tuple[str, float, str]] = []
+        for i, (name, wv, pnp_id) in enumerate(dgpu_wmi):
             vram = reg_vrams[i] if i < len(reg_vrams) else (math.ceil(wv) if wv >= 1.0 else 8.0)
-            self.detected_gpus.append((name, float(vram)))
+            # Extract device ID from PNPDeviceID
+            dev_id = ""
+            dev_match = re.search(r'DEV_([0-9A-Fa-f]{4})', pnp_id)
+            if dev_match:
+                dev_id = "0x" + dev_match.group(1).upper()
+            self.detected_gpus.append((name, float(vram), dev_id))
         if not self.detected_gpus:
-            self.detected_gpus = [("GPU", reg_vrams[0])]
+            self.detected_gpus = [("GPU", reg_vrams[0], "")]
 
         self._drive_info: List[Tuple[str, str]] = build_drive_info()
         if not self._drive_info:
@@ -2115,7 +2200,7 @@ class TricorderDashboard(QMainWindow):
 
         title = QLabel(
             "📊  System Tricorder  "
-            f"<span style='font-size: {font_size(18)}; color:#00aa55;'>v0.8</span>"
+            f"<span style='font-size: {font_size(18)}; color:#00aa55;'>v0.9</span>"
         )
         title.setStyleSheet(
             f"font-size: {font_size(28)}; font-weight: bold; color: #00ff88; background: transparent;")
@@ -2249,7 +2334,7 @@ class TricorderDashboard(QMainWindow):
 
         # ── Row 2: GPU engines ────────────────────────────────────────────────
         row()
-        for gi, (gname, _) in enumerate(self.detected_gpus):
+        for gi, (gname, _, _) in enumerate(self.detected_gpus):
             pal = GPU_PALETTES[gi % len(GPU_PALETTES)]
             sn  = short_gpu_name(gname)
             reg(f"gpu_{gi}_3d",

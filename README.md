@@ -2,7 +2,7 @@
 
 > A real-time hardware monitoring dashboard for Windows — dark mode, 30 FPS, fully customisable free-form layout.
 
-![Version](https://img.shields.io/badge/version-0.8-00ff88?style=flat-square)
+![Version](https://img.shields.io/badge/version-0.9-00ff88?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
@@ -11,7 +11,7 @@
 
 ## 🖥️ Screenshots
 
-![System Tricorder v0.8](image.png)
+![System Tricorder v0.9](image.png)
 
 ---
 

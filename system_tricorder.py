@@ -167,6 +167,99 @@ def get_registry_gpu_vrams() -> List[float]:
     return vrams if vrams else [8.0]
 
 
+def get_dxgi_adapter_map() -> Dict[str, Tuple[str, float]]:
+    """
+    Enumerate GPU adapters via DXGI and return a mapping:
+        luid_string -> (device_id_hex, dedicated_vram_gb)
+
+    The LUID string is formatted to match the LUID that appears verbatim in the
+    Windows GPU performance-counter names, e.g. "luid_0x00000000_0x0001c2e3".
+    DXGI is the authoritative source here: every adapter's kernel LUID is the
+    same one the perf counters use, and DXGI_ADAPTER_DESC also carries the PCI
+    DeviceId — so this lets us bind a perf-counter LUID directly to a physical
+    GPU instead of guessing by VRAM size.
+
+    Returns {} on any failure (non-Windows, no DXGI, etc.); callers degrade
+    gracefully when the map is empty.
+    """
+    result: Dict[str, Tuple[str, float]] = {}
+    try:
+        import ctypes
+        from ctypes import POINTER, byref, c_void_p
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [("Data1", ctypes.c_uint32),
+                        ("Data2", ctypes.c_uint16),
+                        ("Data3", ctypes.c_uint16),
+                        ("Data4", ctypes.c_ubyte * 8)]
+
+        class _LUID(ctypes.Structure):          # NB: LowPart precedes HighPart
+            _fields_ = [("LowPart", ctypes.c_uint32),
+                        ("HighPart", ctypes.c_int32)]
+
+        class _DXGI_ADAPTER_DESC(ctypes.Structure):
+            _fields_ = [
+                ("Description", ctypes.c_wchar * 128),
+                ("VendorId", ctypes.c_uint32),
+                ("DeviceId", ctypes.c_uint32),
+                ("SubSysId", ctypes.c_uint32),
+                ("Revision", ctypes.c_uint32),
+                ("DedicatedVideoMemory", ctypes.c_size_t),
+                ("DedicatedSystemMemory", ctypes.c_size_t),
+                ("SharedSystemMemory", ctypes.c_size_t),
+                ("AdapterLuid", _LUID),
+            ]
+
+        # IID_IDXGIFactory {7b7166ec-21c7-44ae-b21a-c9ae321ae369}
+        iid = _GUID(0x7b7166ec, 0x21c7, 0x44ae,
+                    (ctypes.c_ubyte * 8)(0xb2, 0x1a, 0xc9, 0xae,
+                                         0x32, 0x1a, 0xe3, 0x69))
+
+        dxgi = ctypes.WinDLL("dxgi")            # type: ignore[attr-defined]
+        factory = c_void_p()
+        if dxgi.CreateDXGIFactory(byref(iid), byref(factory)) != 0 or not factory:
+            return {}
+
+        def _method(obj: c_void_p, index: int, restype, argtypes):
+            vtbl = ctypes.cast(obj, POINTER(c_void_p))[0]
+            fn   = ctypes.cast(vtbl, POINTER(c_void_p))[index]
+            return ctypes.WINFUNCTYPE(restype, *argtypes)(fn)   # type: ignore[attr-defined]
+
+        # IDXGIFactory vtable: 2=Release, 7=EnumAdapters
+        enum_adapters   = _method(factory, 7, ctypes.c_long,
+                                  [c_void_p, ctypes.c_uint32, POINTER(c_void_p)])
+        factory_release = _method(factory, 2, ctypes.c_ulong, [c_void_p])
+
+        i = 0
+        while True:
+            adapter = c_void_p()
+            if enum_adapters(factory, i, byref(adapter)) != 0 or not adapter:
+                break
+            try:
+                # IDXGIAdapter vtable: 2=Release, 8=GetDesc
+                get_desc        = _method(adapter, 8, ctypes.c_long,
+                                          [c_void_p, POINTER(_DXGI_ADAPTER_DESC)])
+                adapter_release = _method(adapter, 2, ctypes.c_ulong, [c_void_p])
+                desc = _DXGI_ADAPTER_DESC()
+                if get_desc(adapter, byref(desc)) == 0:
+                    high = desc.AdapterLuid.HighPart & 0xFFFFFFFF
+                    low  = desc.AdapterLuid.LowPart  & 0xFFFFFFFF
+                    luid_str = f"luid_0x{high:08x}_0x{low:08x}"
+                    dev_id   = f"0x{desc.DeviceId:04X}"
+                    vram_gb  = desc.DedicatedVideoMemory / (1024 ** 3)
+                    result[luid_str] = (dev_id, vram_gb)
+                adapter_release(adapter)
+            except Exception:
+                pass
+            i += 1
+
+        factory_release(factory)
+    except Exception as exc:
+        logger.debug("DXGI adapter enumeration failed: %s", exc)
+        return {}
+    return result
+
+
 def get_wmi_gpu_list() -> List[Tuple[str, bool, float, str]]:
     """
     Returns (name, is_igpu, vram_gb, pnp_device_id) for all real GPUs via WMI.
@@ -350,6 +443,11 @@ class HardwareMonitorThread(QThread):
         if not self._dgpu_info:
             self._dgpu_info = [("GPU", reg_vrams[0], "")]
 
+        # Authoritative LUID → (device_id, vram_gb) map from DXGI.  Static for the
+        # lifetime of the process, so we build it once here.  Used to bind each
+        # GPU performance-counter LUID to the correct physical GPU.
+        self._luid_device_map: Dict[str, Tuple[str, float]] = get_dxgi_adapter_map()
+
         self._luid_order: List[str]       = []
         self._luid_vram:  Dict[str, float] = {}
         self._luid_device_id: Dict[str, str] = {}  # Map LUID → device ID for GPU name lookup
@@ -530,94 +628,56 @@ class HardwareMonitorThread(QThread):
                 )
                 self._luid_order.extend(new)
 
-                # ── Map LUIDs to GPU device IDs via VRAM matching ───────────────────
-                # Query Win32_PnPEntity to get PNPDeviceID list with device IDs
-                # Then match LUIDs to GPUs by VRAM size (most reliable identifier)
-                luid_to_device_id: Dict[str, str] = {}
-                luid_to_vram: Dict[str, float] = {}
+                # ── Map LUIDs to GPU device IDs via DXGI adapter LUIDs ──────────────
+                # Each live perf-counter LUID is resolved to its physical GPU through
+                # the DXGI adapter map (LUID → PCI DeviceId).  This replaces the old
+                # "sort LUIDs by *used* VRAM and pair with devices sorted by *total*
+                # VRAM" heuristic, which silently swapped GPUs whenever the busier
+                # card was not the one with the larger total VRAM (exactly the dual
+                # 9070 XT / R9700 case).
+                luid_to_device_id: Dict[str, str] = {
+                    luid: self._luid_device_map[luid][0]
+                    for luid in luid_data
+                    if luid in self._luid_device_map
+                }
+                # Remember resolved ids across frames (covers transient query gaps)
+                for _luid, _dev in luid_to_device_id.items():
+                    self._luid_device_id[_luid] = _dev
 
-                if wmi:
-                    # Step 1: Get VRAM per LUID from GPUAdapterMemory counters
-                    try:
-                        for a in wmi.ExecQuery(
-                            "SELECT Name, DedicatedUsage FROM Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory"
-                        ):
-                            try:
-                                luid = str(a.Name).lower().split('_phys')[0]
-                                used = float(a.DedicatedUsage or 0) / (1024 ** 3)
-                                luid_to_vram[luid] = used  # Will be updated with total later
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
+                # device_id → live LUID (first wins)
+                device_to_luid: Dict[str, str] = {}
+                for luid in luid_data:
+                    dev = luid_to_device_id.get(luid) or self._luid_device_id.get(luid, "")
+                    if dev and dev not in device_to_luid:
+                        device_to_luid[dev] = luid
 
-                    # Step 2: Get PNPDeviceID list to extract device IDs in PCI order
-                    try:
-                        pnp_gpus = wmi.ExecQuery("SELECT PNPDeviceID FROM Win32_PnPEntity WHERE PNPClass = 'Display'")
-                        pnp_order: List[str] = []
-                        for p in pnp_gpus:
-                            try:
-                                pid = str(p.PNPDeviceID or '')
-                                if pid and 'VEN_' in pid:
-                                    pnp_order.append(pid)
-                            except Exception:
-                                pass
+                # LUIDs we could not bind to a device id (e.g. DXGI unavailable):
+                # kept only as a best-effort positional fallback for that case.
+                bound = set(device_to_luid.values())
+                leftover = [luid for luid in self._luid_order if luid not in bound]
 
-                        # Step 3: Build device_id → vram mapping from self._dgpu_info
-                        device_vram_map: Dict[str, float] = {}
-                        for _gname, gvram, gdev_id in self._dgpu_info:
-                            if gdev_id:
-                                device_vram_map[gdev_id] = gvram
-
-                        # Step 4: Match LUIDs to device IDs by VRAM size
-                        # Sort LUIDs by VRAM usage (descending) and match to sorted device VRAMs
-                        sorted_luids = sorted(luid_data.keys(), key=lambda l: -luid_data[l].get('used', 0.0))
-                        sorted_devices = sorted(self._dgpu_info, key=lambda x: -x[1])  # by VRAM descending
-
-                        for idx, luid in enumerate(sorted_luids):
-                            if idx < len(sorted_devices):
-                                _, _, dev_id = sorted_devices[idx]
-                                if dev_id:
-                                    luid_to_device_id[luid] = dev_id
-                    except Exception:
-                        pass
-
+                # Emit GPUs in the SAME order as detected_gpus / self._dgpu_info, since
+                # the dashboard tiles (gpu_<i>_*) are keyed by that index.  Each slot is
+                # filled from its matching LUID's live metrics — never positionally.
                 gpus: List[GPUMetrics] = []
-                for i, luid in enumerate(self._luid_order):
-                    d = luid_data.get(luid, {})
-                    device_id = luid_to_device_id.get(luid, self._luid_device_id.get(luid, ""))
-
-                    # Find matching GPU by device ID
-                    gpu_name = "GPU"
-                    gpu_vram = 8.0
-                    for _gn, gvram, gdev_id in self._dgpu_info:
-                        if gdev_id and gdev_id == device_id:
-                            gpu_name = _gn
-                            gpu_vram = gvram
-                            break
-
-                    # Fallback: use index-based assignment if no device ID match
-                    if gpu_name == "GPU" and i < len(self._dgpu_info):
-                        gpu_name = self._dgpu_info[i][0]
-                        gpu_vram = self._dgpu_info[i][1]
-                        device_id = self._dgpu_info[i][2]
-
-                    if luid not in self._luid_vram:
-                        self._luid_vram[luid] = gpu_vram
-                    self._luid_device_id[luid] = device_id
-
-                    used = d.get('used', 0.0)
+                for name, vram_total, dev_id in self._dgpu_info:
+                    luid = device_to_luid.get(dev_id, "")
+                    if not luid and leftover:
+                        luid = leftover.pop(0)      # degraded fallback only
+                    d = luid_data.get(luid, {}) if luid else {}
+                    if luid:
+                        self._luid_vram[luid]      = vram_total
+                        self._luid_device_id[luid] = dev_id
                     # Clamp used VRAM to total – never inflate total from usage spikes
-                    used = min(used, self._luid_vram[luid])
-
+                    used = min(d.get('used', 0.0), vram_total)
                     gpus.append(GPUMetrics(
-                        name=gpu_name, luid=luid,
+                        name=name, luid=luid,
                         gpu_3d_percent=d.get('3d', 0.0),
                         gpu_compute_percent=d.get('compute', 0.0),
                         gpu_copy0_percent=d.get('c0', 0.0),
                         gpu_copy1_percent=d.get('c1', 0.0),
                         gpu_vram_used_gb=used,
-                        gpu_vram_total_gb=self._luid_vram[luid],
+                        gpu_vram_total_gb=vram_total,
                     ))
 
                 if not gpus:

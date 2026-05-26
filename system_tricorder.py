@@ -129,6 +129,12 @@ _VIRTUAL_NAMES = ('microsoft basic', 'remote desktop', 'parsec', 'virtual',
 # (Arrow Lake / Meteor Lake have an iGPU called "Intel Arc Graphics" with no model number)
 _ARC_DMODEL = ('a310', 'a380', 'a580', 'a750', 'a770', 'b580', 'b770')
 
+# AMD iGPU PCI Device IDs — only these are real integrated GPUs
+# (Ryzen 5800X3D has NO iGPU; Ryzen 7040/8040+ have RDNA2 iGPU)
+_AMD_IGPU_DEV_IDS = ('15d8', '15d9', '164e', '164f', '1681', '1682',  # RDNA2 iGPUs
+                     '1636', '1637', '1638', '1639', '163c', '163d',  # older APU iGPUs
+                     '1002',)  # fallback: VEN_1002 without DEV = not an iGPU
+
 # Drive tile colours
 DRIVE_R_COLOR = "#00ffcc"   # read  — teal
 DRIVE_W_COLOR = "#ffcc00"   # write — amber
@@ -286,12 +292,39 @@ def get_wmi_gpu_list() -> List[Tuple[str, bool, float, str]]:
                 if not name or any(v in name.lower() for v in _VIRTUAL_NAMES):
                     continue
                 nl = name.lower()
-                is_igpu = (
-                    # Intel iGPU: any Intel GPU without a known discrete Arc model number
-                    ('intel' in nl and not any(m in nl for m in _ARC_DMODEL)) or
-                    # AMD iGPU: integrated Radeon (Vega/RDNA-integrated, no RX prefix)
-                    ('amd' in nl and ('radeon(tm) graphics' in nl or 'vega' in nl) and 'rx ' not in nl)
-                )
+                pnp_lower = pnp_id.lower()
+                
+                # AMD iGPU detection via PNPDeviceID VEN/DEV
+                # AMD integrated GPUs have VEN_1002 + specific DEV IDs
+                # Ryzen 5800X3D has NO iGPU — any AMD GPU without known dGPU DEV is NOT an iGPU
+                is_amd = 'amd' in nl or 'advanced micro devices' in nl
+                is_igpu = False
+                if is_amd:
+                    # Check for discrete AMD GPU DEV IDs — if present, NOT an iGPU
+                    amd_dgpu_devs = ('1001', '1002', '1003', '1004', '1005', '1006',  # RX 5000/6000
+                                     '164c', '164d', '164e', '164f',  # RX 6000 series
+                                     '17fd', '17fe', '17df', '17e3',  # RX 7000 series
+                                     '742f', '743f', '7430', '7431',  # RX 9000 series
+                                     '67df', '67d0', '67d1', '67d8',  # RX 6000M
+                                     '67e0', '67e1', '67e8', '67ef')  # RX 6000M
+                    dev_match = re.search(r'dev_([0-9a-f]{4})', pnp_lower)
+                    if dev_match:
+                        dev_id = dev_match.group(1)
+                        if dev_id not in amd_dgpu_devs:
+                            # Could be iGPU — check against known AMD iGPU DEV IDs
+                            amd_igpu_devs = ('15d8', '15d9', '164e', '164f', '1681', '1682',
+                                             '1636', '1637', '1638', '1639', '163c', '163d')
+                            is_igpu = dev_id in amd_igpu_devs
+                        # else: known dGPU DEV → not iGPU
+                    # else: no DEV in PNPID → not an iGPU (fallback: assume dGPU or virtual)
+                else:
+                    is_igpu = (
+                        # Intel iGPU: any Intel GPU without a known discrete Arc model number
+                        ('intel' in nl and not any(m in nl for m in _ARC_DMODEL)) or
+                        # AMD iGPU: integrated Radeon (Vega/RDNA-integrated, no RX prefix)
+                        ('amd' in nl and ('radeon(tm) graphics' in nl or 'vega' in nl) and 'rx ' not in nl)
+                    )
+                
                 vram = float(c.AdapterRAM or 0) / (1024 ** 3)
                 result.append((name, is_igpu, vram, pnp_id))
             except Exception:
@@ -383,6 +416,7 @@ class GPUMetrics:
     gpu_compute_percent: float = 0.0
     gpu_copy0_percent:   float = 0.0
     gpu_copy1_percent:   float = 0.0
+    gpu_codec_percent:   float = 0.0
     gpu_vram_used_gb:    float = 0.0
     gpu_vram_total_gb:   float = 8.0
 
@@ -418,7 +452,7 @@ class SystemMetrics:
 class HardwareMonitorThread(QThread):
     metrics_updated = pyqtSignal(SystemMetrics)
 
-    def __init__(self, drive_info: List[Tuple[str, str]], parent=None):
+    def __init__(self, drive_info: List[Tuple[str, str]], parent=None) -> None:
         super().__init__(parent)
         self._running         = False
         self._com_initialized = False
@@ -514,7 +548,9 @@ class HardwareMonitorThread(QThread):
                     # engine indices of the same type to get total GPU utilization.
                     _IGPU_MARKERS = ('hd graphics', 'uhd graphics', 'iris',
                                      'intel(r) graphics', 'arc(tm) graphics')
-                    _NPU_MARKERS  = ('ai boost', 'npu', 'xe media')
+                    # NPU detection: only specific markers, NOT generic 'npu' which matches AMD engines
+                    _NPU_MARKERS  = ('ai boost', 'npu acceleration', 'intel npu',
+                                     'xe media', 'media engine')
                     _LUID_RE = re.compile(r'luid_(0x[0-9a-f]+_0x[0-9a-f]+)')
                     _ENG_RE  = re.compile(r'_eng_(\d+)_')
 
@@ -539,7 +575,7 @@ class HardwareMonitorThread(QThread):
                             if _m:
                                 _luid = 'luid_' + _m.group(1)
                                 luid_data.setdefault(_luid, {'3d': 0.0, 'compute': 0.0,
-                                                             'c0': 0.0, 'c1': 0.0, 'used': 0.0})
+                                                             'c0': 0.0, 'c1': 0.0, 'codec': 0.0, 'used': 0.0})
                         except Exception:
                             pass
 
@@ -553,7 +589,7 @@ class HardwareMonitorThread(QThread):
                                 luid = str(a.Name).lower().split('_phys')[0]
                                 used = float(a.DedicatedUsage or 0) / (1024 ** 3)
                                 ld = luid_data.setdefault(luid, {'3d': 0.0, 'compute': 0.0,
-                                                                 'c0': 0.0, 'c1': 0.0, 'used': 0.0})
+                                                                 'c0': 0.0, 'c1': 0.0, 'codec': 0.0, 'used': 0.0})
                                 ld['used'] = max(ld['used'], used)
                             except Exception:
                                 pass
@@ -589,6 +625,8 @@ class HardwareMonitorThread(QThread):
                                 _et = 'compute'
                             elif 'copy' in _en:
                                 _et = 'copy'
+                            elif 'video codec' in _en or 'codec' in _en:
+                                _et = 'codec'
                             else:
                                 continue
                             _key = (_cl, _ei)
@@ -621,6 +659,9 @@ class HardwareMonitorThread(QThread):
                                 luid_data[_cl3]['c0'] = max(luid_data[_cl3]['c0'], _eu3)
                             elif len(_co) > 1 and _ei3 == _co[1]:
                                 luid_data[_cl3]['c1'] = max(luid_data[_cl3]['c1'], _eu3)
+                        elif _et3 == 'codec':
+                            # Video Codec Engine: take max util per (luid, eng_idx)
+                            luid_data[_cl3]['codec'] = max(luid_data[_cl3]['codec'], _eu3)
 
                 new: List[str] = sorted(
                     [luid for luid in luid_data if luid not in self._luid_order],
@@ -676,6 +717,7 @@ class HardwareMonitorThread(QThread):
                         gpu_compute_percent=d.get('compute', 0.0),
                         gpu_copy0_percent=d.get('c0', 0.0),
                         gpu_copy1_percent=d.get('c1', 0.0),
+                        gpu_codec_percent=d.get('codec', 0.0),
                         gpu_vram_used_gb=used,
                         gpu_vram_total_gb=vram_total,
                     ))
@@ -702,7 +744,7 @@ class HardwareMonitorThread(QThread):
                 logger.debug("Monitor loop error: %s", exc)
             time.sleep(1.0 / 30.0)  # Exact 30 FPS interval
 
-    def stop(self):
+    def stop(self) -> None:
         self._running = False
         self.wait()
         if self._com_initialized:
@@ -786,7 +828,7 @@ class SparklineWidget(QWidget):
     Expects values 0–100 (percentage).
     """
     def __init__(self, color_hex: str, history_len: int = 90,
-                 min_height: int = 70, parent=None):
+                 min_height: int = 70, parent=None) -> None:
         super().__init__(parent)
         self.color   = QColor(color_hex)
         self.history: deque = deque([0.0] * history_len, maxlen=history_len)
@@ -795,12 +837,12 @@ class SparklineWidget(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumHeight(dp(min_height))
 
-    def add_value(self, value: float):
+    def add_value(self, value: float) -> None:
         self.history.append(value)
         # Mark dirty but defer update - parent will batch-call update() once
         self._dirty = True
 
-    def batch_update(self):
+    def batch_update(self) -> None:
         """Call once per frame after all add_value() calls."""
         if self._dirty:
             self._dirty = False
@@ -822,7 +864,7 @@ class SparklineWidget(QWidget):
         self._grid_cache = (w, h, px)
         return px
 
-    def paintEvent(self, _):                                        # type: ignore
+    def paintEvent(self, _) -> None:                                        # type: ignore
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setClipRect(self.rect())
@@ -860,7 +902,7 @@ class SparklineWidget(QWidget):
 
 class MasterMetricBox(QFrame):
     """Used exclusively for the CPU core/thread grid.  Not draggable."""
-    def __init__(self, title: str, color_hex: str, variant: str = 'standard', parent=None):
+    def __init__(self, title: str, color_hex: str, variant: str = 'standard', parent=None) -> None:
         super().__init__(parent)
         # DPI-aware sizing
         self.setMinimumHeight(dp(40))
@@ -917,11 +959,11 @@ class MasterMetricBox(QFrame):
         self.graph = SparklineWidget(color_hex, min_height=_spark_min_h)
         layout.addWidget(self.graph)
 
-    def update_val(self, val: float, text: Optional[str] = None):
+    def update_val(self, val: float, text: Optional[str] = None) -> None:
         self.graph.add_value(val)
         self.val_lbl.setText(text if text else f"{int(val)}%")
 
-    def batch_update(self):
+    def batch_update(self) -> None:
         self.graph.batch_update()
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -937,7 +979,7 @@ class BaseTile(QFrame):
 
     _BTN_SIZE = 18  # logical pixels — scaled in __init__
 
-    def __init__(self, tile_id: str, color_hex: str, parent=None):
+    def __init__(self, tile_id: str, color_hex: str, parent=None) -> None:
         super().__init__(parent)
         self.tile_id      = tile_id
         self._color_hex   = color_hex
@@ -975,7 +1017,7 @@ class BaseTile(QFrame):
         self._btn_rn.hide()
         self._btn_rn.clicked.connect(lambda: self.rowbreak_requested.emit(self.tile_id))
 
-    def _style_rn_btn(self):
+    def _style_rn_btn(self) -> None:
         _br = int(9 * _DP_SCALE)
         _fs = font_size(9)
         if self._rowbreak_active:
@@ -996,12 +1038,12 @@ class BaseTile(QFrame):
                 QPushButton:hover {{ background: #2a3a2a; color: #00ff88; }}
             """)
 
-    def set_rowbreak_active(self, active: bool):
+    def set_rowbreak_active(self, active: bool) -> None:
         """Highlight ↵ when a row break is active before this tile."""
         self._rowbreak_active = active
         self._style_rn_btn()
 
-    def _apply_frame_style(self, accent: str, edit: bool):
+    def _apply_frame_style(self, accent: str, edit: bool) -> None:
         border_side = "#3a3a2a" if edit else "#222"
         self.setStyleSheet(f"""
             QFrame {{
@@ -1014,7 +1056,7 @@ class BaseTile(QFrame):
             QPushButton {{ background: transparent; border: none; }}
         """)
 
-    def _build_content(self):
+    def _build_content(self) -> None:
         """Override in subclass to populate the tile layout."""
         pass
 
@@ -1038,8 +1080,12 @@ class BaseTile(QFrame):
         """Override in subclass to update Drive tile."""
         pass
 
+    def update_codec(self, codec: float) -> None:
+        """Override in subclass to update GPU Video Codec Engine tile."""
+        pass
+
     # ── Edit mode ──────────────────────────────────────────────────────────────
-    def set_edit_mode(self, enabled: bool):
+    def set_edit_mode(self, enabled: bool) -> None:
         self._edit_mode = enabled
         self._btn_x.setVisible(enabled)
         self._btn_rn.setVisible(enabled)
@@ -1047,20 +1093,20 @@ class BaseTile(QFrame):
         accent = "#ffdd55" if enabled else self._color_hex
         self._apply_frame_style(accent, edit=enabled)
 
-    def resizeEvent(self, event):                                   # type: ignore
+    def resizeEvent(self, event) -> None:                                   # type: ignore
         super().resizeEvent(event)
         self._btn_x.move(self.width() - dp(self._BTN_SIZE) - 3, 3)
         self._btn_rn.move(3, 3)
 
     # ── Drag source ────────────────────────────────────────────────────────────
-    def mousePressEvent(self, event):                               # type: ignore
+    def mousePressEvent(self, event) -> None:                               # type: ignore
         if self._edit_mode and event.button() == Qt.MouseButton.LeftButton:    # type: ignore
             # event.position() returns QPointF in PyQt6; toPoint() converts to QPoint
             # so that drag.setHotSpot() (which requires QPoint) never gets a QPointF.
             self._drag_pos = event.position().toPoint()
         super().mousePressEvent(event)
 
-    def mouseMoveEvent(self, event):                                # type: ignore
+    def mouseMoveEvent(self, event) -> None:                                # type: ignore
         if not (self._edit_mode and self._drag_pos and
                 event.buttons() & Qt.MouseButton.LeftButton):                  # type: ignore
             return
@@ -1080,7 +1126,7 @@ class BaseTile(QFrame):
         self._drag_pos = None
 
     # ── Drop target ────────────────────────────────────────────────────────────
-    def dragEnterEvent(self, event):                                # type: ignore
+    def dragEnterEvent(self, event) -> None:                                # type: ignore
         if (self._edit_mode and event.mimeData().hasText()
                 and event.mimeData().text() != self.tile_id):
             event.acceptProposedAction()
@@ -1088,7 +1134,7 @@ class BaseTile(QFrame):
             self._drop_before = event.position().x() < self.width() / 2
             self.update()
 
-    def dragMoveEvent(self, event):                                 # type: ignore
+    def dragMoveEvent(self, event) -> None:                                 # type: ignore
         if self._drop_hl:
             new_before = event.position().x() < self.width() / 2
             if new_before != self._drop_before:
@@ -1096,11 +1142,11 @@ class BaseTile(QFrame):
                 self.update()
             event.acceptProposedAction()
 
-    def dragLeaveEvent(self, event):                                # type: ignore
+    def dragLeaveEvent(self, event) -> None:                                # type: ignore
         self._drop_hl = False
         self.update()
 
-    def dropEvent(self, event):                                     # type: ignore
+    def dropEvent(self, event) -> None:                                     # type: ignore
         src = event.mimeData().text()
         if src != self.tile_id:
             insert_before = event.position().x() < self.width() / 2
@@ -1109,7 +1155,7 @@ class BaseTile(QFrame):
         self._drop_hl = False
         self.update()
 
-    def paintEvent(self, event):                                    # type: ignore
+    def paintEvent(self, event) -> None:                                    # type: ignore
         super().paintEvent(event)
         if self._drop_hl:
             p = QPainter(self)
@@ -1128,12 +1174,12 @@ class BaseTile(QFrame):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class MetricTile(BaseTile):
-    def __init__(self, tile_id: str, title: str, color_hex: str, parent=None):
+    def __init__(self, tile_id: str, title: str, color_hex: str, parent=None) -> None:
         self._title     = title
         self._color_hex = color_hex
         super().__init__(tile_id, color_hex, parent)
 
-    def _build_content(self):
+    def _build_content(self) -> None:
         outer = QVBoxLayout(self)
         outer.setContentsMargins(dp(6), dp(5), dp(6), dp(5))
         outer.setSpacing(dp(2))
@@ -1152,11 +1198,11 @@ class MetricTile(BaseTile):
         self._graph = SparklineWidget(self._color_hex)
         outer.addWidget(self._graph)
 
-    def update_val(self, val: float, text: Optional[str] = None):
+    def update_val(self, val: float, text: Optional[str] = None) -> None:
         self._graph.add_value(val)
         self._val_lbl.setText(text if text else f"{int(val)}%")
 
-    def batch_update(self):
+    def batch_update(self) -> None:
         self._graph.batch_update()
 
 
@@ -1173,13 +1219,13 @@ class DriveTile(BaseTile):
     The MB/s axis auto-scales: the peak value slowly decays when load drops,
     so the graph always fills the vertical space meaningfully.
     """
-    def __init__(self, tile_id: str, label: str, parent=None):
+    def __init__(self, tile_id: str, label: str, parent=None) -> None:
         self._label    = label
         self._color_hex = DRIVE_R_COLOR   # primary accent
         self._peak     = 100.0            # auto-scaling peak (MB/s)
         super().__init__(tile_id, DRIVE_R_COLOR, parent)
 
-    def _build_content(self):
+    def _build_content(self) -> None:
         outer = QVBoxLayout(self)
         outer.setContentsMargins(dp(6), dp(5), dp(6), dp(5))
         outer.setSpacing(dp(3))
@@ -1234,7 +1280,7 @@ class DriveTile(BaseTile):
         w_row.addWidget(self._w_val)
         outer.addLayout(w_row)
 
-    def update_drive(self, read_mbps: float, write_mbps: float):
+    def update_drive(self, read_mbps: float, write_mbps: float) -> None:
         # Auto-scale: peak grows immediately, decays at 0.2 % per frame
         peak = max(read_mbps, write_mbps, 1.0)
         self._peak = max(self._peak * 0.998, peak)
@@ -1250,7 +1296,7 @@ class DriveTile(BaseTile):
         self._w_val.setText(_fmt_mbps(write_mbps))
         self._peak_lbl.setText(f"↑{_fmt_mbps(self._peak)}")
 
-    def batch_update(self):
+    def batch_update(self) -> None:
         self._r_graph.batch_update()
         self._w_graph.batch_update()
 
@@ -1274,13 +1320,13 @@ class GPUCopyTile(BaseTile):
     Layout mirrors DriveTile.  palette[1]=Copy0 colour, palette[2]=Copy1 colour.
     """
     def __init__(self, tile_id: str, gpu_name: str,
-                 palette: Tuple[str, str, str, str], parent=None):
+                 palette: Tuple[str, str, str, str], parent=None) -> None:
         self._gpu_name  = gpu_name
         self._palette   = palette
         self._color_hex = palette[1]   # primary accent = Copy0 colour
         super().__init__(tile_id, palette[1], parent)
 
-    def _build_content(self):
+    def _build_content(self) -> None:
         outer = QVBoxLayout(self)
         outer.setContentsMargins(dp(6), dp(5), dp(6), dp(5))
         outer.setSpacing(dp(3))
@@ -1334,15 +1380,75 @@ class GPUCopyTile(BaseTile):
         c1_row.addWidget(self._c1_val)
         outer.addLayout(c1_row)
 
-    def update_copy(self, c0: float, c1: float):
+    def update_copy(self, c0: float, c1: float) -> None:
         self._c0_graph.add_value(c0)
         self._c1_graph.add_value(c1)
         self._c0_val.setText(f"{int(c0)}%")
         self._c1_val.setText(f"{int(c1)}%")
 
-    def batch_update(self):
+    def batch_update(self) -> None:
         self._c0_graph.batch_update()
         self._c1_graph.batch_update()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GPU VIDEO CODEC ENGINE TILE  — single sparkline: Video Codec utilization
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class GPUCodecTile(BaseTile):
+    """
+    Landscape Video Codec Engine tile: single sparkline for codec engine utilization.
+    Layout mirrors other GPU engine tiles.  palette[3] = codec colour.
+    """
+    def __init__(self, tile_id: str, gpu_name: str,
+                 palette: Tuple[str, str, str, str], parent=None) -> None:
+        self._gpu_name  = gpu_name
+        self._palette   = palette
+        self._color_hex = palette[3]
+        super().__init__(tile_id, palette[3], parent)
+
+    def _build_content(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(dp(6), dp(5), dp(6), dp(5))
+        outer.setSpacing(dp(3))
+
+        # ── Header ────────────────────────────────────────────────────────────
+        hdr = QHBoxLayout()
+        icon_lbl = QLabel("🎬")
+        icon_lbl.setStyleSheet(f"font-size: {font_size(13)};")
+        name_lbl = QLabel(f"{self._gpu_name} · Video Codec")
+        name_lbl.setStyleSheet(
+            f"color: {self._palette[3]}; font-size: {font_size(13)}; font-weight: bold;")
+        hdr.addWidget(icon_lbl)
+        hdr.addSpacing(dp(3))
+        hdr.addWidget(name_lbl)
+        hdr.addStretch()
+        outer.addLayout(hdr)
+
+        # ── Codec row ─────────────────────────────────────────────────────────
+        codec_row = QHBoxLayout()
+        codec_row.setSpacing(dp(4))
+        codec_lbl = QLabel("Codec")
+        codec_lbl.setStyleSheet(
+            f"color: {self._palette[3]}; font-size: {font_size(12)}; font-weight: bold;")
+        codec_lbl.setFixedWidth(dp(48))
+        _codec_h = int(24 * _DP_SCALE) if _DP_SCALE > 0 else 24
+        self._codec_graph = SparklineWidget(self._palette[3], min_height=_codec_h)
+        self._codec_val   = QLabel("0%")
+        self._codec_val.setStyleSheet(f"color: {self._palette[3]}; font-size: {font_size(12)};")
+        self._codec_val.setFixedWidth(dp(34))
+        self._codec_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # type: ignore
+        codec_row.addWidget(codec_lbl)
+        codec_row.addWidget(self._codec_graph)
+        codec_row.addWidget(self._codec_val)
+        outer.addLayout(codec_row)
+
+    def update_codec(self, codec: float) -> None:
+        self._codec_graph.add_value(codec)
+        self._codec_val.setText(f"{int(codec)}%")
+
+    def batch_update(self) -> None:
+        self._codec_graph.batch_update()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1356,13 +1462,13 @@ class GPU3DComputeTile(BaseTile):
     Layout mirrors GPUCopyTile / DriveTile.  palette[0] = 3D colour.
     """
     def __init__(self, tile_id: str, gpu_name: str,
-                 palette: Tuple[str, str, str, str], parent=None):
+                 palette: Tuple[str, str, str, str], parent=None) -> None:
         self._gpu_name  = gpu_name
         self._palette   = palette
         self._color_hex = palette[0]
         super().__init__(tile_id, palette[0], parent)
 
-    def _build_content(self):
+    def _build_content(self) -> None:
         outer = QVBoxLayout(self)
         outer.setContentsMargins(dp(6), dp(5), dp(6), dp(5))
         outer.setSpacing(dp(3))
@@ -1416,13 +1522,13 @@ class GPU3DComputeTile(BaseTile):
         cm_row.addWidget(self._cm_val)
         outer.addLayout(cm_row)
 
-    def update_3d_compute(self, d3: float, compute: float):
+    def update_3d_compute(self, d3: float, compute: float) -> None:
         self._d3_graph.add_value(d3)
         self._cm_graph.add_value(compute)
         self._d3_val.setText(f"{int(d3)}%")
         self._cm_val.setText(f"{int(compute)}%")
 
-    def batch_update(self):
+    def batch_update(self) -> None:
         self._d3_graph.batch_update()
         self._cm_graph.batch_update()
 
@@ -1438,7 +1544,7 @@ class RowDropZone(QWidget):
     """
     drop_received = pyqtSignal(str, int)   # (tile_id, row_index)
 
-    def __init__(self, row_idx: int, parent=None):
+    def __init__(self, row_idx: int, parent=None) -> None:
         super().__init__(parent)
         self._row_idx = row_idx
         self._hover   = False
@@ -1447,27 +1553,27 @@ class RowDropZone(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         self.setMinimumHeight(dp(40))
 
-    def dragEnterEvent(self, event):                                # type: ignore
+    def dragEnterEvent(self, event) -> None:                                # type: ignore
         if event.mimeData().hasText():
             event.acceptProposedAction()
             self._hover = True
             self.update()
 
-    def dragMoveEvent(self, event):                                 # type: ignore
+    def dragMoveEvent(self, event) -> None:                                 # type: ignore
         event.acceptProposedAction()
 
-    def dragLeaveEvent(self, event):                                # type: ignore
+    def dragLeaveEvent(self, event) -> None:                                # type: ignore
         self._hover = False
         self.update()
 
-    def dropEvent(self, event):                                     # type: ignore
+    def dropEvent(self, event) -> None:                                     # type: ignore
         tid = event.mimeData().text()
         self.drop_received.emit(tid, self._row_idx)
         event.acceptProposedAction()
         self._hover = False
         self.update()
 
-    def paintEvent(self, event):                                    # type: ignore
+    def paintEvent(self, event) -> None:                                    # type: ignore
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         if self._hover:
@@ -1494,7 +1600,7 @@ class InterRowDropZone(QWidget):
     """
     new_row_requested = pyqtSignal(str, int)
 
-    def __init__(self, after_row_idx: int, parent=None):
+    def __init__(self, after_row_idx: int, parent=None) -> None:
         super().__init__(parent)
         self._after  = after_row_idx
         self._hover  = False
@@ -1502,26 +1608,26 @@ class InterRowDropZone(QWidget):
         self.setFixedHeight(dp(16))
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-    def dragEnterEvent(self, event):                                # type: ignore
+    def dragEnterEvent(self, event) -> None:                                # type: ignore
         if event.mimeData().hasText():
             event.acceptProposedAction()
             self._hover = True
             self.update()
 
-    def dragMoveEvent(self, event):                                 # type: ignore
+    def dragMoveEvent(self, event) -> None:                                 # type: ignore
         event.acceptProposedAction()
 
-    def dragLeaveEvent(self, event):                                # type: ignore
+    def dragLeaveEvent(self, event) -> None:                                # type: ignore
         self._hover = False
         self.update()
 
-    def dropEvent(self, event):                                     # type: ignore
+    def dropEvent(self, event) -> None:                                     # type: ignore
         self.new_row_requested.emit(event.mimeData().text(), self._after)
         event.acceptProposedAction()
         self._hover = False
         self.update()
 
-    def paintEvent(self, event):                                    # type: ignore
+    def paintEvent(self, event) -> None:                                    # type: ignore
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         y = self.height() // 2
@@ -1556,7 +1662,7 @@ class ResponsiveCoreGrid(QWidget):
     distribute height proportionally.
     """
     def __init__(self, columns: List[List[QWidget]],
-                 min_col_w: int = 120, max_cols: int = 0, parent=None):
+                 min_col_w: int = 120, max_cols: int = 0, parent=None) -> None:
         super().__init__(parent)
         self._columns    = columns
         self._min_col_w  = dp(min_col_w)  # scale the logical min width
@@ -1576,7 +1682,7 @@ class ResponsiveCoreGrid(QWidget):
 
     # ── Layout ─────────────────────────────────────────────────────────────────
 
-    def resizeEvent(self, event):                                   # type: ignore
+    def resizeEvent(self, event) -> None:                                   # type: ignore
         super().resizeEvent(event)
         new_cols = max(1, min(self.width() // self._min_col_w, len(self._columns)))
         if self._max_cols:
@@ -1584,7 +1690,7 @@ class ResponsiveCoreGrid(QWidget):
         if new_cols != self._last_cols:
             self._do_layout(new_cols)
 
-    def _do_layout(self, grid_cols: int):
+    def _do_layout(self, grid_cols: int) -> None:
         self._last_cols = grid_cols
 
         # Detach every widget from the grid
@@ -1647,7 +1753,7 @@ class TileGrid(QWidget):
                  tile_names: Dict[str, str],
                  default_order: List[str],
                  cols: int = 5,          # kept for API compat, ignored
-                 parent=None):
+                 parent=None) -> None:
         super().__init__(parent)
         self._tiles      = tiles
         self._tile_names = tile_names
@@ -1698,7 +1804,7 @@ class TileGrid(QWidget):
                 rows[-1].append(tid)
         return [r for r in rows if r]
 
-    def _relayout(self):
+    def _relayout(self) -> None:
         # 1. Reparent all tiles to self so row-widget deletion doesn't kill them
         for tile in self._tiles.values():
             tile.setParent(self)
@@ -1754,11 +1860,11 @@ class TileGrid(QWidget):
 
     # ── Resize / auto-scale ──────────────────────────────────────────────────
 
-    def resizeEvent(self, event):                                    # type: ignore
+    def resizeEvent(self, event) -> None:                                    # type: ignore
         super().resizeEvent(event)
         self._auto_adjust_row_height()
 
-    def _auto_adjust_row_height(self):
+    def _auto_adjust_row_height(self) -> None:
         """Compute an optimal row height from the widget's current height.
 
         Uses a target row height that favours compact layouts for various aspect ratios.
@@ -1791,12 +1897,12 @@ class TileGrid(QWidget):
 
     # ── Edit mode ─────────────────────────────────────────────────────────────
 
-    def set_edit_mode(self, enabled: bool):
+    def set_edit_mode(self, enabled: bool) -> None:
         self._edit_mode = enabled
         self._relayout()   # rebuild to show/hide drop zones
         self._auto_adjust_row_height()
 
-    def set_min_row_h(self, h: int):
+    def set_min_row_h(self, h: int) -> None:
         """Adjust minimum row height — tiles shrink/grow vertically."""
         # Clamp to DPI-scaled bounds
         self._min_row_h = max(int(50 * _DP_SCALE), min(h, int(400 * _DP_SCALE)))
@@ -1814,7 +1920,7 @@ class TileGrid(QWidget):
 
     # ── Tile management ───────────────────────────────────────────────────────
 
-    def _on_move(self, src: str, target: str, insert_before: bool):
+    def _on_move(self, src: str, target: str, insert_before: bool) -> None:
         """Insert src immediately before or after target in _tile_order."""
         if src not in self._tile_order or target not in self._tile_order or src == target:
             return
@@ -1827,7 +1933,7 @@ class TileGrid(QWidget):
         self._relayout()
         self._save_config()
 
-    def _on_drop_to_row(self, tile_id: str, row_idx: int):
+    def _on_drop_to_row(self, tile_id: str, row_idx: int) -> None:
         """Append tile_id to the end of row_idx."""
         rows = self._parse_rows()
         if tile_id not in self._tile_order or row_idx >= len(rows):
@@ -1840,7 +1946,7 @@ class TileGrid(QWidget):
             return
         self._on_move(tile_id, last_tid, insert_before=False)
 
-    def _on_new_row(self, tile_id: str, after_row_idx: int):
+    def _on_new_row(self, tile_id: str, after_row_idx: int) -> None:
         """
         Move tile_id to start a brand-new row.
         after_row_idx == -1  → new row becomes the first row
@@ -1882,7 +1988,7 @@ class TileGrid(QWidget):
         self._relayout()
         self._save_config()
 
-    def _on_rowbreak(self, tile_id: str):
+    def _on_rowbreak(self, tile_id: str) -> None:
         """Toggle a __row__ sentinel immediately before tile_id."""
         if tile_id not in self._tile_order:
             return
@@ -1894,7 +2000,7 @@ class TileGrid(QWidget):
         self._relayout()
         self._save_config()
 
-    def _on_hide(self, tile_id: str):
+    def _on_hide(self, tile_id: str) -> None:
         if tile_id in self._tile_order:
             self._tile_order.remove(tile_id)
             if tile_id not in self._hidden:
@@ -1903,7 +2009,7 @@ class TileGrid(QWidget):
             self._relayout()
             self._save_config()
 
-    def show_tile(self, tile_id: str):
+    def show_tile(self, tile_id: str) -> None:
         if tile_id in self._hidden:
             self._hidden.remove(tile_id)
         if tile_id not in self._tile_order:
@@ -1933,7 +2039,7 @@ class TileGrid(QWidget):
             result.pop()
         self._tile_order = result
 
-    def _update_rowbreak_buttons(self):
+    def _update_rowbreak_buttons(self) -> None:
         for i, tid in enumerate(self._tile_order):
             if tid == '__row__':
                 continue
@@ -1959,7 +2065,7 @@ class TileGrid(QWidget):
             logger.debug("Config load: %s", exc)
             return {}
 
-    def _save_config(self):
+    def _save_config(self) -> None:
         try:
             payload = json.dumps({
                 'version':      '0.8',
@@ -1973,7 +2079,7 @@ class TileGrid(QWidget):
         except Exception as exc:
             logger.warning("Config save failed: %s", exc)
 
-    def reset_layout(self, default_order: List[str]):
+    def reset_layout(self, default_order: List[str]) -> None:
         """Restore factory layout — removes all row breaks."""
         self._tile_order = [tid for tid in default_order if tid in self._tiles]
         self._hidden     = [tid for tid in self._tiles if tid not in self._tile_order]
@@ -1991,7 +2097,7 @@ class AddTilesDialog(QDialog):
     Modal dialog listing all hidden tiles as checkboxes.
     Returns selected IDs on accept().
     """
-    def __init__(self, hidden: List[Tuple[str, str]], parent=None):
+    def __init__(self, hidden: List[Tuple[str, str]], parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Add Tiles")
         self.setMinimumWidth(300)
@@ -2046,7 +2152,7 @@ class CollapsibleSection(QWidget):
     Header is a clickable row with an arrow indicator and an HTML label.
     Used for the CPU topology section.
     """
-    def __init__(self, header_html: str, content: QWidget, parent=None):
+    def __init__(self, header_html: str, content: QWidget, parent=None) -> None:
         super().__init__(parent)
         self._collapsed = False
         self._content   = content
@@ -2081,7 +2187,7 @@ class CollapsibleSection(QWidget):
 
         self._hdr_w.mousePressEvent = lambda _e: self._toggle()     # type: ignore
 
-    def _toggle(self):
+    def _toggle(self) -> None:
         self._collapsed = not self._collapsed
         self._content.setVisible(not self._collapsed)
         self._arrow.setText("▶" if self._collapsed else "▼")
@@ -2092,7 +2198,7 @@ class CollapsibleSection(QWidget):
         else:
             self.setMaximumHeight(16_777_215)   # Qt QWIDGETSIZE_MAX — no limit
 
-    def resizeEvent(self, event):                                    # type: ignore
+    def resizeEvent(self, event) -> None:                                    # type: ignore
         super().resizeEvent(event)
         if not self._collapsed and self._content.isVisible():
             # Ensure content gets the full available height
@@ -2126,7 +2232,7 @@ def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD  v0.9
+# MAIN DASHBOARD  v1.0
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TricorderDashboard(QMainWindow):
@@ -2141,7 +2247,7 @@ class TricorderDashboard(QMainWindow):
         except Exception:
             pass
 
-        self.setWindowTitle("System Tricorder v0.9")
+        self.setWindowTitle("System Tricorder v1.0")
         # Scale minimum size by DPI — 1280×720 is the logical 100% DPI size
         _min_w = int(1280 * _DP_SCALE) if _DP_SCALE > 0 else 1280
         _min_h = int(720 * _DP_SCALE) if _DP_SCALE > 0 else 720
@@ -2243,12 +2349,12 @@ class TricorderDashboard(QMainWindow):
 
     # ── Clock ──────────────────────────────────────────────────────────────────
 
-    def _update_clock(self):
+    def _update_clock(self) -> None:
         self._clock_lbl.setText(datetime.now().strftime("%H:%M:%S     %d.%m.%Y"))
 
     # ── UI setup ───────────────────────────────────────────────────────────────
 
-    def _setup_ui(self):
+    def _setup_ui(self) -> None:
         root_w  = QWidget()
         self.setCentralWidget(root_w)
         root    = QVBoxLayout(root_w)
@@ -2260,7 +2366,7 @@ class TricorderDashboard(QMainWindow):
 
         title = QLabel(
             "📊  System Tricorder  "
-            f"<span style='font-size: {font_size(18)}; color:#00aa55;'>v0.9</span>"
+            f"<span style='font-size: {font_size(18)}; color:#00aa55;'>v1.0</span>"
         )
         title.setStyleSheet(
             f"font-size: {font_size(28)}; font-weight: bold; color: #00ff88; background: transparent;")
@@ -2376,14 +2482,14 @@ class TricorderDashboard(QMainWindow):
         names:         Dict[str, str]       = {}
         default_order: List[str]            = []
 
-        def reg(tile_id: str, tile: BaseTile, display_name: str, in_default: bool = True):
+        def reg(tile_id: str, tile: BaseTile, display_name: str, in_default: bool = True) -> None:
             tiles[tile_id]       = tile
             names[tile_id]       = display_name
             self._tiles[tile_id] = tile
             if in_default:
                 default_order.append(tile_id)
 
-        def row():
+        def row() -> None:
             """Insert a row-break sentinel into the default layout."""
             if default_order and default_order[-1] != '__row__':
                 default_order.append('__row__')
@@ -2403,6 +2509,9 @@ class TricorderDashboard(QMainWindow):
             reg(f"gpu_{gi}_copy",
                 GPUCopyTile(f"gpu_{gi}_copy", sn, pal),
                 f"{sn} · Copy")
+            reg(f"gpu_{gi}_codec",
+                GPUCodecTile(f"gpu_{gi}_codec", sn, pal),
+                f"{sn} · Video Codec")
             reg(f"gpu_{gi}_vram",
                 MetricTile(f"gpu_{gi}_vram", f"{sn} · VRAM", pal[3]),
                 f"{sn} · VRAM")
@@ -2578,6 +2687,9 @@ class TricorderDashboard(QMainWindow):
             w_copy = _t(f"gpu_{i}_copy")
             if w_copy:
                 w_copy.update_copy(gm.gpu_copy0_percent, gm.gpu_copy1_percent)
+            w_codec = _t(f"gpu_{i}_codec")
+            if w_codec:
+                w_codec.update_codec(gm.gpu_codec_percent)
             vp = (gm.gpu_vram_used_gb / gm.gpu_vram_total_gb * 100) if gm.gpu_vram_total_gb else 0
             w_vram = _t(f"gpu_{i}_vram")
             if w_vram:
@@ -2601,7 +2713,7 @@ class TricorderDashboard(QMainWindow):
         for tw in self.thread_widgets.values():
             tw.batch_update()
 
-    def closeEvent(self, event):                                    # type: ignore
+    def closeEvent(self, event) -> None:                                    # type: ignore
         self.hw_thread.stop()
         event.accept()                                              # type: ignore
 
@@ -2613,7 +2725,7 @@ if __name__ == "__main__":
     # disappear silently.  This hook routes them to ~/.tricorder.log instead.
     import traceback as _tb
 
-    def _excepthook(exc_type, exc_value, exc_tb):
+    def _excepthook(exc_type, exc_value, exc_tb) -> None:
         logger.critical(
             "Unhandled exception:\n%s",
             "".join(_tb.format_exception(exc_type, exc_value, exc_tb)),

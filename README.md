@@ -2,7 +2,7 @@
 
 > A real-time hardware monitoring dashboard for Windows — dark mode, 30 FPS, fully customisable free-form layout.
 
-![Version](https://img.shields.io/badge/version-0.9-00ff88?style=flat-square)
+![Version](https://img.shields.io/badge/version-1.0-00ff88?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
@@ -11,7 +11,7 @@
 
 ## 🖥️ Screenshots
 
-![System Tricorder v0.9](image.png)
+![System Tricorder v1.0](image.png)
 
 ---
 
@@ -112,6 +112,7 @@ Your layout, including all row breaks, is saved to `~/.tricorder_layout.json` on
 | NPU | Neural Processing Unit utilisation | WMI GPU counters |
 | GPU N · 3D / Compute | Two sparklines: rasterisation + compute/CUDA separately | WMI GPU counters |
 | GPU N · Copy | Two sparklines: Copy Engine 0 + Copy Engine 1 | WMI GPU counters |
+| GPU N · Video Codec | Video Codec Engine utilisation | WMI GPU counters |
 | GPU N · VRAM | Used / total VRAM | WMI + Registry |
 | Drive X | Two sparklines: Read MB/s + Write MB/s | psutil per-disk I/O |
 
@@ -147,12 +148,12 @@ Values are shown in MB/s and automatically switch to GB/s for drives exceeding 1
 
 ```json
 {
-  "version": "0.8",
+  "version": "1.0",
   "min_row_h": 130,
   "tile_order": [
     "cpu_total", "ram",
     "__row__",
-    "gpu_0_3d", "gpu_0_copy", "gpu_0_vram",
+    "gpu_0_3d", "gpu_0_copy", "gpu_0_codec", "gpu_0_vram",
     "__row__",
     "igpu", "npu",
     "__row__",
@@ -168,7 +169,13 @@ Delete the file to reset to factory defaults.
 
 ## 🗂️ Changelog
 
-### v0.8 *(current)*
+### v1.0
+
+- **Video Codec Engine tile** — neue GPU-Kachel für jede GPU zeigt die Video Codec Engine Auslastung (z.B. für Video-Encoding/Decoding)
+- **AMD iGPU/NPU-Bugfix** — iGPU-Erkennung nun über PNPDeviceID VEN/DEV-Prüfung statt nur Namensmatch; Ryzen 5800X3D und ähnliche CPUs ohne iGPU zeigen keine falschen iGPU/NPU-Einträge mehr
+- **Verbesserte NPU-Erkennung** — zu allgemeiner Marker `'npu'` durch spezifischere Patterns ersetzt (`'npu acceleration'`, `'intel npu'`), verhindert Falschmeldungen auf AMD-Systemen
+
+### v0.8
 
 - **PyQt5 → PyQt6 Migration** — vollständiger Wechsel von PyQt5 zu PyQt6; alle Inkompatibilitäten wurden behoben
   - `QtCore.Signal` → `QtCore.pyqtSignal`, `QtCore.Slot` → `QtCore.pyqtSlot`

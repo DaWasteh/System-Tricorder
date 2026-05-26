@@ -293,7 +293,7 @@ def get_wmi_gpu_list() -> List[Tuple[str, bool, float, str]]:
                     continue
                 nl = name.lower()
                 pnp_lower = pnp_id.lower()
-                
+
                 # AMD iGPU detection via PNPDeviceID VEN/DEV
                 # AMD integrated GPUs have VEN_1002 + specific DEV IDs
                 # Ryzen 5800X3D has NO iGPU — any AMD GPU without known dGPU DEV is NOT an iGPU
@@ -324,7 +324,7 @@ def get_wmi_gpu_list() -> List[Tuple[str, bool, float, str]]:
                         # AMD iGPU: integrated Radeon (Vega/RDNA-integrated, no RX prefix)
                         ('amd' in nl and ('radeon(tm) graphics' in nl or 'vega' in nl) and 'rx ' not in nl)
                     )
-                
+
                 vram = float(c.AdapterRAM or 0) / (1024 ** 3)
                 result.append((name, is_igpu, vram, pnp_id))
             except Exception:
@@ -402,6 +402,39 @@ def build_drive_info() -> List[Tuple[str, str]]:
     except Exception:
         pass
     return result
+
+
+def detect_npu_present() -> bool:
+    """Return True only if a real Neural Processing Unit is present.
+
+    NPUs are enumerated as PnP devices, not as GPU performance counters, so
+    presence must be probed via Win32_PnPEntity.  We match on *specific* device
+    names (Intel "AI Boost", AMD "NPU Compute Accelerator"/"IPU Device",
+    Qualcomm "Hexagon") rather than the bare token "npu" — "%NPU%" would match
+    every "USB Input Device" ("i-NPU-t").  The leading space in "% NPU%" keeps
+    "Intel(R) NPU" matchable while still excluding mid-word hits like "Input".
+
+    Returns False on non-Windows / no WMI, so the NPU tile is simply omitted.
+    """
+    if not WMI_AVAILABLE:
+        return False
+    try:
+        pythoncom.CoInitialize()                                    # type: ignore
+        wmi = win32com.client.GetObject("winmgmts:root\\cimv2")    # type: ignore
+        query = (
+            "SELECT Name FROM Win32_PnPEntity WHERE "
+            "Name LIKE '%AI Boost%' OR "
+            "Name LIKE '%Neural Processor%' OR "
+            "Name LIKE '%NPU Compute%' OR "
+            "Name LIKE '%IPU Device%' OR "
+            "Name LIKE '% NPU%' OR "
+            "Name LIKE '%Hexagon%'"
+        )
+        for _ in wmi.ExecQuery(query):
+            return True
+    except Exception as exc:
+        logger.debug("NPU detection failed: %s", exc)
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -625,7 +658,11 @@ class HardwareMonitorThread(QThread):
                                 _et = 'compute'
                             elif 'copy' in _en:
                                 _et = 'copy'
-                            elif 'video codec' in _en or 'codec' in _en:
+                            elif any(x in _en for x in ('codec', 'decode', 'encode')):
+                                # AMD exposes a single 'VideoCodec' engine, but
+                                # NVIDIA (and Intel) split it into 'VideoDecode'
+                                # and 'VideoEncode'.  Matching all three keeps
+                                # the codec tile populated on every vendor.
                                 _et = 'codec'
                             else:
                                 continue
@@ -2232,7 +2269,7 @@ def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD  v1.0
+# MAIN DASHBOARD  v1.1
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TricorderDashboard(QMainWindow):
@@ -2247,7 +2284,7 @@ class TricorderDashboard(QMainWindow):
         except Exception:
             pass
 
-        self.setWindowTitle("System Tricorder v1.0")
+        self.setWindowTitle("System Tricorder v1.1")
         # Scale minimum size by DPI — 1280×720 is the logical 100% DPI size
         _min_w = int(1280 * _DP_SCALE) if _DP_SCALE > 0 else 1280
         _min_h = int(720 * _DP_SCALE) if _DP_SCALE > 0 else 720
@@ -2331,6 +2368,14 @@ class TricorderDashboard(QMainWindow):
         wmi_gpus  = get_wmi_gpu_list()
         reg_vrams = get_registry_gpu_vrams()
         dgpu_wmi  = [(n, v, p) for n, ig, v, p in wmi_gpus if not ig]
+
+        # iGPU/NPU tiles are only meaningful when the hardware actually exists.
+        # On a desktop AMD CPU (e.g. Ryzen 5800X3D) there is neither, so they
+        # must not be created — otherwise they show up as empty 0% tiles and as
+        # restorable options in the "Add Tile" dialog.
+        self.has_igpu = any(ig for _, ig, _, _ in wmi_gpus)
+        self.has_npu  = detect_npu_present()
+
         self.detected_gpus: List[Tuple[str, float, str]] = []
         for i, (name, wv, pnp_id) in enumerate(dgpu_wmi):
             vram = reg_vrams[i] if i < len(reg_vrams) else (math.ceil(wv) if wv >= 1.0 else 8.0)
@@ -2366,7 +2411,7 @@ class TricorderDashboard(QMainWindow):
 
         title = QLabel(
             "📊  System Tricorder  "
-            f"<span style='font-size: {font_size(18)}; color:#00aa55;'>v1.0</span>"
+            f"<span style='font-size: {font_size(18)}; color:#00aa55;'>v1.1</span>"
         )
         title.setStyleSheet(
             f"font-size: {font_size(28)}; font-weight: bold; color: #00ff88; background: transparent;")
@@ -2518,10 +2563,13 @@ class TricorderDashboard(QMainWindow):
             if gi < len(self.detected_gpus) - 1:
                 row()   # each GPU on its own row if multiple GPUs
 
-        # ── Row 3: iGPU + NPU ─────────────────────────────────────────────────
-        row()
-        reg("igpu", MetricTile("igpu", "iGPU", "#0055ff"), "iGPU")
-        reg("npu",  MetricTile("npu",  "NPU",  "#aa00ff"), "NPU")
+        # ── Row 3: iGPU + NPU (only if the hardware exists) ───────────────────
+        if self.has_igpu or self.has_npu:
+            row()
+        if self.has_igpu:
+            reg("igpu", MetricTile("igpu", "iGPU", "#0055ff"), "iGPU")
+        if self.has_npu:
+            reg("npu",  MetricTile("npu",  "NPU",  "#aa00ff"), "NPU")
 
         # ── Row 4+: Drives (all drives on one row) ────────────────────────────
         row()

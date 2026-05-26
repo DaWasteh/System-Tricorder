@@ -2,7 +2,7 @@
 
 > A real-time hardware monitoring dashboard for Windows — dark mode, 30 FPS, fully customisable free-form layout.
 
-![Version](https://img.shields.io/badge/version-1.0-00ff88?style=flat-square)
+![Version](https://img.shields.io/badge/version-1.1-00ff88?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
@@ -148,7 +148,7 @@ Values are shown in MB/s and automatically switch to GB/s for drives exceeding 1
 
 ```json
 {
-  "version": "1.0",
+  "version": "0.8",
   "min_row_h": 130,
   "tile_order": [
     "cpu_total", "ram",
@@ -168,6 +168,12 @@ Delete the file to reset to factory defaults.
 ---
 
 ## 🗂️ Changelog
+
+### v1.1
+
+- **iGPU/NPU-Kacheln nur bei vorhandener Hardware** — iGPU- und NPU-Kacheln werden jetzt nur noch registriert, wenn die Hardware tatsächlich existiert. Reine Desktop-CPUs ohne iGPU/NPU (z.B. AMD Ryzen 5800X3D) zeigen diese Kacheln nicht mehr an — weder im Dashboard noch im „Add Tile"-Dialog. iGPU-Erkennung über WMI (`is_igpu`), NPU-Erkennung über `Win32_PnPEntity` (gezielte Gerätenamen wie „AI Boost", „NPU Compute", „IPU Device", „Hexagon"; bewusst **kein** nacktes `NPU`-Token, da `%NPU%` sonst jedes „Input Device" treffen würde)
+- **Video Codec auf NVIDIA** — die Codec-Engine-Erkennung matcht jetzt zusätzlich `VideoDecode`/`VideoEncode`. AMD nutzt eine einzelne `VideoCodec`-Engine, NVIDIA (und Intel) splitten sie in getrennte Decode-/Encode-Engines — die Video-Codec-Kachel funktioniert damit auf allen Herstellern
+- **Lint-Fix** — zwei Leerzeilen mit Whitespace (`W293`) im AMD-Erkennungsblock entfernt
 
 ### v1.0
 

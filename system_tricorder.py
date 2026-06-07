@@ -78,7 +78,7 @@ from PyQt6.QtWidgets import (                                       # type: igno
     QLabel, QFrame, QGridLayout, QSizePolicy, QPushButton,
     QScrollArea, QDialog, QCheckBox, QDialogButtonBox,
 )
-from PyQt6.QtCore  import Qt, QTimer, pyqtSignal, QThread, QMimeData, QPoint  # type: ignore
+from PyQt6.QtCore  import Qt, QTimer, pyqtSignal, QThread, QMimeData, QPoint, QByteArray  # type: ignore
 from PyQt6.QtGui   import (                                         # type: ignore
     QColor, QPainter, QPainterPath, QPen, QBrush, QDrag, QPixmap,
 )
@@ -111,8 +111,32 @@ except ImportError:
     winreg = None               # type: ignore
     WINREG_AVAILABLE = False
 
-# ── Layout config ──────────────────────────────────────────────────────────────
+# ── Layout / window config ────────────────────────────────────────────────────
 CONFIG_FILE = Path.home() / ".tricorder_layout.json"
+CONFIG_VERSION = "0.8"
+
+
+def _load_config_file() -> dict:
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
+        if data.get('version') != CONFIG_VERSION:
+            logger.warning(
+                "Config version '%s' differs from '%s' — "
+                "layout/window state will be kept as-is; delete %s to reset.",
+                data.get('version'), CONFIG_VERSION, CONFIG_FILE,
+            )
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        logger.debug("Config load: %s", exc)
+        return {}
+
+
+def _save_config_file(data: dict) -> None:
+    payload = dict(data)
+    payload['version'] = CONFIG_VERSION
+    tmp = CONFIG_FILE.with_suffix('.tmp')
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8')
+    tmp.replace(CONFIG_FILE)          # atomic on same filesystem
 
 # ── GPU colour palettes (up to 4 discrete GPUs) ───────────────────────────────
 GPU_PALETTES = [
@@ -2089,30 +2113,17 @@ class TileGrid(QWidget):
 
     @staticmethod
     def _load_config() -> dict:
-        try:
-            data = json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
-            if data.get('version') != '0.8':
-                logger.warning(
-                    "Config version '%s' differs from '0.8' — "
-                    "layout will be kept as-is; delete %s to reset.",
-                    data.get('version'), CONFIG_FILE,
-                )
-            return data
-        except Exception as exc:
-            logger.debug("Config load: %s", exc)
-            return {}
+        return _load_config_file()
 
     def _save_config(self) -> None:
         try:
-            payload = json.dumps({
-                'version':      '0.8',
+            data = _load_config_file()
+            data.update({
                 'min_row_h':    self._min_row_h,
                 'tile_order':   self._tile_order,
                 'hidden_tiles': self._hidden,
-            }, indent=2, ensure_ascii=False)
-            tmp = CONFIG_FILE.with_suffix('.tmp')
-            tmp.write_text(payload, encoding='utf-8')
-            tmp.replace(CONFIG_FILE)          # atomic on same filesystem
+            })
+            _save_config_file(data)
         except Exception as exc:
             logger.warning("Config save failed: %s", exc)
 
@@ -2761,7 +2772,53 @@ class TricorderDashboard(QMainWindow):
         for tw in self.thread_widgets.values():
             tw.batch_update()
 
+    def _restore_window_placement(self) -> bool:
+        """Restore the last Windows window position/size/mode from config."""
+        try:
+            cfg = _load_config_file()
+            win_cfg = cfg.get('window', {})
+            geometry_b64 = win_cfg.get('geometry')
+            if not isinstance(geometry_b64, str) or not geometry_b64:
+                return False
+
+            geometry = QByteArray.fromBase64(geometry_b64.encode('ascii'))
+            if geometry.isEmpty() or not self.restoreGeometry(geometry):
+                return False
+
+            placement = win_cfg.get('placement', 'normal')
+            if placement == 'fullscreen':
+                self.showFullScreen()
+            elif placement == 'maximized':
+                self.showMaximized()
+            else:
+                self.show()
+            return True
+        except Exception as exc:
+            logger.warning("Window placement restore failed: %s", exc)
+            return False
+
+    def _save_window_placement(self) -> None:
+        """Persist the current Windows window position/size/mode into config."""
+        try:
+            state = self.windowState()
+            if state & Qt.WindowState.WindowFullScreen:              # type: ignore[operator]
+                placement = 'fullscreen'
+            elif state & Qt.WindowState.WindowMaximized:             # type: ignore[operator]
+                placement = 'maximized'
+            else:
+                placement = 'normal'
+
+            data = _load_config_file()
+            data['window'] = {
+                'geometry': bytes(self.saveGeometry().toBase64()).decode('ascii'),
+                'placement': placement,
+            }
+            _save_config_file(data)
+        except Exception as exc:
+            logger.warning("Window placement save failed: %s", exc)
+
     def closeEvent(self, event) -> None:                                    # type: ignore
+        self._save_window_placement()
         self.hw_thread.stop()
         event.accept()                                              # type: ignore
 
@@ -2790,5 +2847,6 @@ if __name__ == "__main__":
     logging.getLogger("tricorder").debug("DPI scale factor: %.2f", _DP_SCALE)
 
     win = TricorderDashboard()
-    win.showMaximized()
+    if not win._restore_window_placement():
+        win.showMaximized()
     sys.exit(app.exec())

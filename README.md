@@ -26,7 +26,7 @@ Every aspect of the layout is yours to control: arrange tiles into any number of
 ## 🚀 Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/system-tricorder.git
+git clone https://github.com/DaWasteh/System-Tricorder.git
 cd system-tricorder
 pip install PyQt6 psutil pywin32
 python system_tricorder.py

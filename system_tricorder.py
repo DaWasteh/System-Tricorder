@@ -6,6 +6,8 @@ import json
 import re
 import platform
 import logging
+import ctypes
+from ctypes import wintypes
 import psutil
 from pathlib import Path
 from collections import deque
@@ -290,6 +292,110 @@ def get_dxgi_adapter_map() -> Dict[str, Tuple[str, float]]:
     return result
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# PDH GPU SAMPLER  (Task-Manager-grade, cache-free engine utilization)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _PdhFmtValue(ctypes.Structure):
+    """PDH_FMT_COUNTERVALUE — CStatus (4) + pad (4) + value union (8)."""
+    _fields_ = [("CStatus", wintypes.DWORD), ("_pad", wintypes.DWORD),
+                ("doubleValue", ctypes.c_double)]
+
+
+class _PdhCounterItem(ctypes.Structure):
+    """PDH_FMT_COUNTERVALUE_ITEM_W — instance name + formatted value."""
+    _fields_ = [("szName", wintypes.LPWSTR), ("FmtValue", _PdhFmtValue)]
+
+
+class _PdhGpuSampler:
+    """Read GPU engine utilization straight from the Windows PDH (Performance
+    Data Helper) API — the same data source Task Manager uses.
+
+    Why not WMI?  ``Win32_PerfFormattedData_...GPUEngine`` is *cached* by the
+    perflib adapter for ~1 second: at 30 FPS the same stale value is returned
+    ~30 times before it jumps.  On bursty workloads (AI/compute on RDNA3/4) the
+    cache window often lands on an idle gap, so the dashboard read "long
+    stretches of 0 %" while Adrenalin reported a sustained load.  PDH returns a
+    freshly computed value on every collect — no cache.
+
+    A single wildcard counter is registered::
+
+        \\GPU Engine(*)\\Utilization Percentage
+
+    PDH maintains the highly-dynamic per-process instance list internally, so
+    we never enumerate instances ourselves.  ``sample()`` returns every live
+    engine as ``(name_lower, util)`` — the exact shape the old WMI rows had —
+    so the aggregation pipeline is reused verbatim.
+
+    The "GPU Engine" / "Utilization Percentage" names are English-only on
+    every locale (absent from all non-009 Perflib language tables), so the
+    English path is universal and safe on German/other-language Windows.
+    """
+
+    _PDH_FMT_DOUBLE = 0x00000200
+    _PATH = "\\GPU Engine(*)\\Utilization Percentage"
+
+    def __init__(self) -> None:
+        self._ok = False
+        self._query:  Optional[ctypes.c_void_p] = None
+        self._counter: Optional[ctypes.c_void_p] = None
+        try:
+            self._pdh = ctypes.WinDLL("pdh")
+            query = ctypes.c_void_p()
+            if self._pdh.PdhOpenQueryW(None, None, ctypes.byref(query)) != 0:
+                return
+            counter = ctypes.c_void_p()
+            if self._pdh.PdhAddCounterW(query, self._PATH, 0, ctypes.byref(counter)) != 0:
+                self._pdh.PdhCloseQuery(query)
+                return
+            self._query = query
+            self._counter = counter
+            self._pdh.PdhCollectQueryData(query)          # prime: ≥2 collects needed for a rate
+            self._ok = True
+        except Exception as exc:
+            logger.debug("PDH GPU sampler init failed: %s", exc)
+            self._ok = False
+
+    @property
+    def ok(self) -> bool:
+        return self._ok
+
+    def sample(self) -> List[Tuple[str, float]]:
+        if not self._ok or self._query is None:
+            return []
+        try:
+            self._pdh.PdhCollectQueryData(self._query)
+            size = wintypes.DWORD(0)
+            count = wintypes.DWORD(0)
+            self._pdh.PdhGetFormattedCounterArrayW(
+                self._counter, self._PDH_FMT_DOUBLE,
+                ctypes.byref(size), ctypes.byref(count), None)
+            if size.value == 0:
+                return []
+            buf = (ctypes.c_ubyte * size.value)()
+            if self._pdh.PdhGetFormattedCounterArrayW(
+                    self._counter, self._PDH_FMT_DOUBLE,
+                    ctypes.byref(size), ctypes.byref(count), buf) != 0:
+                return []
+            arr = (_PdhCounterItem * count.value).from_buffer(buf)
+            return [(str(it.szName).lower(), float(it.FmtValue.doubleValue))
+                    for it in arr
+                    if it.szName and it.FmtValue.CStatus == 0]
+        except Exception as exc:
+            logger.debug("PDH GPU sample failed: %s", exc)
+            return []
+
+    def close(self) -> None:
+        if self._query is not None:
+            try:
+                self._pdh.PdhCloseQuery(self._query)
+            except Exception:
+                pass
+        self._ok = False
+        self._query = None
+        self._counter = None
+
+
 def get_wmi_gpu_list() -> List[Tuple[str, bool, float, str]]:
     """
     Returns (name, is_igpu, vram_gb, pnp_device_id) for all real GPUs via WMI.
@@ -543,6 +649,15 @@ class HardwareMonitorThread(QThread):
         self._luid_vram:  Dict[str, float] = {}
         self._luid_device_id: Dict[str, str] = {}  # Map LUID → device ID for GPU name lookup
 
+        # PDH GPU engine sampler — cache-free, Task-Manager-grade utilization.
+        # Vendor-neutral: reads the same Windows "GPU Engine" counter for
+        # NVIDIA, Intel and AMD, so all three improve equally.
+        self._pdh: _PdhGpuSampler = _PdhGpuSampler()
+        # Per-LUID exponential moving average of engine util — tames the 0↔100
+        # oscillation of bursty AI/compute workloads into a stable, Adrenalin-
+        # like reading while staying responsive.
+        self._gpu_ema: Dict[str, Dict[str, float]] = {}
+
     def run(self) -> None:
         self._running = True
         if WMI_AVAILABLE:
@@ -611,19 +726,29 @@ class HardwareMonitorThread(QThread):
                     _LUID_RE = re.compile(r'luid_(0x[0-9a-f]+_0x[0-9a-f]+)')
                     _ENG_RE  = re.compile(r'_eng_(\d+)_')
 
-                    _engine_rows: list = []
-                    try:
-                        _engine_rows = list(wmi.ExecQuery(
-                            "SELECT Name, UtilizationPercentage "
-                            "FROM Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine"
-                        ))
-                    except Exception as exc:
-                        logger.debug("GPU engine query: %s", exc)
+                    # Engine utilization — prefer PDH (cache-free, fresh every
+                    # frame; the same source Task Manager uses).  WMI's formatted
+                    # counter is cached ~1 s, which made bursty RDNA compute
+                    # workloads read as "long stretches of 0 %".
+                    _engine_rows: list = []      # list of (name_lower, util)
+                    if self._pdh.ok:
+                        _engine_rows = self._pdh.sample()
+                    elif wmi:
+                        try:
+                            _engine_rows = [
+                                (str(r.Name).lower(), float(r.UtilizationPercentage or 0))
+                                for r in wmi.ExecQuery(
+                                    "SELECT Name, UtilizationPercentage "
+                                    "FROM Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine"
+                                )
+                            ]
+                        except Exception as exc:
+                            logger.debug("GPU engine query: %s", exc)
 
                     # ── Step 1: seed luid_data from engine rows ────────────────
                     for _e in _engine_rows:
                         try:
-                            _en = str(_e.Name).lower()
+                            _en = _e[0]
                             if any(x in _en for x in _IGPU_MARKERS):
                                 continue
                             if any(x in _en for x in _NPU_MARKERS):
@@ -658,8 +783,8 @@ class HardwareMonitorThread(QThread):
                     _eng_max: Dict[tuple, tuple] = {}
                     for _e in _engine_rows:
                         try:
-                            _en   = str(_e.Name).lower()
-                            _util = float(_e.UtilizationPercentage or 0)
+                            _en   = _e[0]
+                            _util = _e[1]
                             if _util <= 0:
                                 continue
                             if any(x in _en for x in _IGPU_MARKERS):
@@ -723,6 +848,21 @@ class HardwareMonitorThread(QThread):
                         elif _et3 == 'codec':
                             # Video Codec Engine: take max util per (luid, eng_idx)
                             luid_data[_cl3]['codec'] = max(luid_data[_cl3]['codec'], _eu3)
+
+                    # ── Smooth engine utilization (EMA) ─────────────────────────
+                    # PDH returns a fresh instantaneous sample every frame; bursty
+                    # AI/compute workloads swing 0↔100 between frames.  A short
+                    # exponential moving average (τ ≈ 0.25 s) yields the stable,
+                    # Adrenalin-like reading users expect while staying responsive.
+                    _alpha = 1.0 - math.exp(-dt / 0.25)
+                    for _luid, _d in luid_data.items():
+                        _ema = self._gpu_ema.setdefault(_luid, {})
+                        for _k in ('3d', 'compute', 'c0', 'c1', 'codec'):
+                            _raw = _d.get(_k, 0.0)
+                            _prev = _ema.get(_k, _raw)
+                            _smoothed = _prev + _alpha * (_raw - _prev)
+                            _ema[_k] = _smoothed
+                            _d[_k] = _smoothed
 
                 new: List[str] = sorted(
                     [luid for luid in luid_data if luid not in self._luid_order],
@@ -808,6 +948,7 @@ class HardwareMonitorThread(QThread):
     def stop(self) -> None:
         self._running = False
         self.wait()
+        self._pdh.close()
         if self._com_initialized:
             try:
                 pythoncom.CoUninitialize()                          # type: ignore
@@ -894,14 +1035,40 @@ class SparklineWidget(QWidget):
         self.color   = QColor(color_hex)
         self.history: deque = deque([0.0] * history_len, maxlen=history_len)
         self._dirty  = False
+        # Peak-hold state for the *displayed* percentage number.
+        # Rises instantly to any new peak, then decays slowly — mirrors how
+        # vendor tools (AMD Adrenalin) render bursty AI/compute workloads: the
+        # driver-level activity meter sees every short kernel burst that the
+        # Windows per-frame engine counter underreports, so it reads a stable
+        # high number.  Peak-hold reproduces that: any burst pins the value up,
+        # and only a genuinely idle period lets it fall.  At 30 FPS,
+        # release=0.004/frame keeps a recurring burst train at ~96-99 % while a
+        # truly idle GPU decays to ~0 over a few seconds.
+        self._env = 0.0
+        self._ENV_RELEASE = 0.004
         self._grid_cache: Optional[Tuple[int, int, QPixmap]] = None  # (w, h, pixmap)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumHeight(dp(min_height))
 
     def add_value(self, value: float) -> None:
         self.history.append(value)
+        # Peak-hold envelope for the displayed number: jump instantly to any
+        # new peak (captures short compute bursts AMD-style), decay slowly
+        # afterwards.  Raw values still drive the sparkline graph verbatim.
+        self._env = max(value, self._env * (1.0 - self._ENV_RELEASE))
         # Mark dirty but defer update - parent will batch-call update() once
         self._dirty = True
+
+    def recent_avg(self, count: int = 30) -> float:
+        """Peak-hold display value for the percentage number.
+
+        Despite the name (kept for call-site compatibility) this returns the
+        peak-hold envelope state, not an arithmetic mean.  The sparkline graph
+        still shows the raw, instantly-reacting history; only the number is
+        smoothed so it matches a vendor tool's stable high reading on bursty
+        AI/compute workloads (a single short burst pins it near 100 %, exactly
+        like AMD Adrenalin's activity meter)."""
+        return self._env
 
     def batch_update(self) -> None:
         """Call once per frame after all add_value() calls."""
@@ -1022,7 +1189,7 @@ class MasterMetricBox(QFrame):
 
     def update_val(self, val: float, text: Optional[str] = None) -> None:
         self.graph.add_value(val)
-        self.val_lbl.setText(text if text else f"{int(val)}%")
+        self.val_lbl.setText(text if text else f"{int(self.graph.recent_avg())}%")
 
     def batch_update(self) -> None:
         self.graph.batch_update()
@@ -1261,7 +1428,9 @@ class MetricTile(BaseTile):
 
     def update_val(self, val: float, text: Optional[str] = None) -> None:
         self._graph.add_value(val)
-        self._val_lbl.setText(text if text else f"{int(val)}%")
+        # Use a ~1 s moving average for the number so it stops jittering on
+        # bursty workloads; the sparkline graph still reacts instantly.
+        self._val_lbl.setText(text if text else f"{int(self._graph.recent_avg())}%")
 
     def batch_update(self) -> None:
         self._graph.batch_update()
@@ -1444,7 +1613,8 @@ class GPUCopyTile(BaseTile):
     def update_copy(self, c0: float, c1: float) -> None:
         self._c0_graph.add_value(c0)
         self._c1_graph.add_value(c1)
-        self._c0_val.setText(f"{int(c0)}%")
+        self._c0_val.setText(f"{int(self._c0_graph.recent_avg())}%")
+        self._c1_val.setText(f"{int(self._c1_graph.recent_avg())}%")
         self._c1_val.setText(f"{int(c1)}%")
 
     def batch_update(self) -> None:
@@ -1506,6 +1676,7 @@ class GPUCodecTile(BaseTile):
 
     def update_codec(self, codec: float) -> None:
         self._codec_graph.add_value(codec)
+        self._codec_val.setText(f"{int(self._codec_graph.recent_avg())}%")
         self._codec_val.setText(f"{int(codec)}%")
 
     def batch_update(self) -> None:
@@ -1586,8 +1757,8 @@ class GPU3DComputeTile(BaseTile):
     def update_3d_compute(self, d3: float, compute: float) -> None:
         self._d3_graph.add_value(d3)
         self._cm_graph.add_value(compute)
-        self._d3_val.setText(f"{int(d3)}%")
-        self._cm_val.setText(f"{int(compute)}%")
+        self._d3_val.setText(f"{int(self._d3_graph.recent_avg())}%")
+        self._cm_val.setText(f"{int(self._cm_graph.recent_avg())}%")
 
     def batch_update(self) -> None:
         self._d3_graph.batch_update()
@@ -1810,6 +1981,8 @@ class TileGrid(QWidget):
     section compact on small screens and spacious on large ones.
     """
 
+    layout_changed = pyqtSignal()   # emitted after every _relayout()
+
     def __init__(self, tiles: Dict[str, BaseTile],
                  tile_names: Dict[str, str],
                  default_order: List[str],
@@ -1822,6 +1995,10 @@ class TileGrid(QWidget):
         # Scale row heights by DPI — 75/180 are logical px for 100% DPI
         self._min_row_h  = int(75 * _DP_SCALE) if _DP_SCALE > 0 else 75
         self._max_row_h  = int(180 * _DP_SCALE) if _DP_SCALE > 0 else 180
+        # Hard compression floor — well below the tiles' own readable minimum
+        # (~105 px from the sparkline), so it never clips; it only lets the
+        # layout compress rows when the user shrinks the window.
+        self._ROW_FLOOR  = int(48 * _DP_SCALE) if _DP_SCALE > 0 else 48
         self._row_widgets: List[QWidget] = []
         self._current_row_h = self._min_row_h  # dynamically adjusted
 
@@ -1918,12 +2095,21 @@ class TileGrid(QWidget):
                 self._row_widgets.append(sep)
 
         self._update_rowbreak_buttons()
+        self.layout_changed.emit()
 
     # ── Resize / auto-scale ──────────────────────────────────────────────────
 
     def resizeEvent(self, event) -> None:                                    # type: ignore
         super().resizeEvent(event)
         self._auto_adjust_row_height()
+
+    def _release_row_pins(self) -> None:
+        """Drop the fixed min/max height on every row so the layout may compress
+        the tiles toward their readable minimum when the window is shrunk.
+        Counterpart to the 'ample' branch of _auto_adjust_row_height."""
+        for rw in self._row_widgets:
+            rw.setMinimumHeight(self._ROW_FLOOR)
+            rw.setMaximumHeight(16_777_215)
 
     def _auto_adjust_row_height(self) -> None:
         """Compute an optimal row height from the widget's current height.
@@ -1947,14 +2133,26 @@ class TileGrid(QWidget):
         available -= (n_rows + drop_zones) * dp(6)  # vbox spacing
         available = max(0, available)
         # Target: aim for ~110 px per row (compact for 16:9), DPI-scaled, but allow up to _max_row_h
-        target_h = min(self._max_row_h, int(110 * _DP_SCALE))
-        # Compute ideal height: never exceed what's available per row
-        ideal = max(self._min_row_h, min(target_h, available // n_rows))
-        if ideal != self._current_row_h:
+        target_h = min(self._max_row_h, max(int(110 * _DP_SCALE), self._min_row_h))
+        per_row = available // n_rows
+        if per_row >= self._min_row_h:
+            # Ample space → fix every row at the target height.
+            ideal = min(target_h, per_row)
             self._current_row_h = ideal
             for rw in self._row_widgets:
-                rw.setMinimumHeight(self._current_row_h)
-                rw.setMaximumHeight(self._current_row_h)
+                rw.setMinimumHeight(ideal)
+                rw.setMaximumHeight(ideal)
+        else:
+            # Tight space (user shrank the window) → UNPIN the rows so Qt's
+            # layout engine compresses the tiles down toward their readable
+            # minimum (the sparkline height).  We only cap growth, never force
+            # a height, so tiles shrink gracefully and the scrollbar appears
+            # solely as a last-resort fallback when even the minimums can't fit.
+            ideal = max(self._ROW_FLOOR, per_row)
+            self._current_row_h = ideal
+            for rw in self._row_widgets:
+                rw.setMinimumHeight(self._ROW_FLOOR)
+                rw.setMaximumHeight(16_777_215)   # no cap → layout compresses freely
 
     # ── Edit mode ─────────────────────────────────────────────────────────────
 
@@ -2200,6 +2398,7 @@ class CollapsibleSection(QWidget):
     Header is a clickable row with an arrow indicator and an HTML label.
     Used for the CPU topology section.
     """
+    collapsed_changed = pyqtSignal()   # emitted on every expand/collapse
     def __init__(self, header_html: str, content: QWidget, parent=None) -> None:
         super().__init__(parent)
         self._collapsed = False
@@ -2245,6 +2444,7 @@ class CollapsibleSection(QWidget):
             self.setMaximumHeight(self._hdr_w.sizeHint().height() + 8)
         else:
             self.setMaximumHeight(16_777_215)   # Qt QWIDGETSIZE_MAX — no limit
+        self.collapsed_changed.emit()
 
     def resizeEvent(self, event) -> None:                                    # type: ignore
         super().resizeEvent(event)
@@ -2308,6 +2508,12 @@ class TricorderDashboard(QMainWindow):
         self._tile_names: Dict[str, str]         = {}
         self.thread_widgets: Dict[int, MasterMetricBox] = {}
         self._default_tile_order: List[str] = []
+
+        # Auto-fit state (see _fit_window_to_content / _apply_fill_mode).
+        self._fitting: bool = False
+        self._fit_mode: str = 'auto'      # 'auto' (window tracks content) | 'fill' (user-controlled)
+        self._auto_h: Optional[int] = None
+        self._last_size: Optional[Tuple[int, int]] = None
 
         self._setup_ui()
 
@@ -2480,6 +2686,11 @@ class TricorderDashboard(QMainWindow):
         # ── Scrollable content ────────────────────────────────────────────────
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        # The window auto-fits its content (see _fit_window_to_content), so a
+        # vertical scrollbar is never needed in practice; keep it AsNeeded only
+        # as a safety net for the rare content-exceeds-screen edge case.
+        self._scroll = scroll
+        self._content_w = None   # set below
         scroll.setStyleSheet(
             "QScrollArea { background: transparent; border: none; }"
             f"QScrollBar:vertical {{ background: #111; width: {dp(8)}px; border: none; }}"
@@ -2487,6 +2698,7 @@ class TricorderDashboard(QMainWindow):
         )
         content_w = QWidget()
         content_w.setStyleSheet("background: transparent;")
+        self._content_w = content_w
         content_layout = QVBoxLayout(content_w)
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(0)
@@ -2527,6 +2739,15 @@ class TricorderDashboard(QMainWindow):
         # CPU section gets stretch 1 — fills remaining space but shrinks first
         # when vertical space is tight on narrow aspect ratios
         content_layout.addWidget(cpu_section, 1)
+
+        # Sections collapsing/expanding changes the content's natural height —
+        # re-fit the window so no scrollbar appears.
+        global_section.collapsed_changed.connect(self._fit_window_to_content)
+        cpu_section.collapsed_changed.connect(self._fit_window_to_content)
+        # Tile grid structural changes (add/remove/move/cols/reset) all funnel
+        # through TileGrid._relayout, which emits layout_changed.
+        self._tile_grid.layout_changed.connect(
+            lambda: QTimer.singleShot(0, self._fit_window_to_content))
 
         self._default_tile_order = default_order
 
@@ -2772,6 +2993,124 @@ class TricorderDashboard(QMainWindow):
         for tw in self.thread_widgets.values():
             tw.batch_update()
 
+    # ── Window/content auto-fit ────────────────────────────────────────────────
+    #
+    # Two modes, auto-switched by how the resize originates:
+    #   • 'auto'  — the APP is sizing the window (first show, or a structural
+    #               change like adding/removing a tile or collapsing a section).
+    #               The window grows/shrinks to exactly fit the content.
+    #   • 'fill'  — the USER dragged the window edge.  We stop fighting them:
+    #               instead of growing the window back we cap the scroll content
+    #               to the viewport so the layout compresses the tiles down to
+    #               their readable minimum.  Only when even the minimums can't
+    #               fit does the scrollbar appear as a last-resort fallback.
+    _MAX_WIDGET = 16_777_215   # Qt QWIDGETSIZE_MAX
+
+    def _fit_window_to_content(self) -> None:
+        """AUTO mode: grow the window so it exactly fits all content — no scrollbar.
+
+        Used on first show and after structural changes (add/remove/move tile,
+        column change, section collapse/expand).  Uncaps the content height,
+        then iteratively resizes the window so the viewport matches the content's
+        natural height.  The sparkline tiles keep their target size; only the
+        window adapts.  Skipped for maximised / fullscreen windows.
+        """
+        if getattr(self, '_fitting', False):
+            return
+        if self._content_w is None or self._scroll is None:
+            return
+        st = self.windowState()
+        if st & (Qt.WindowState.WindowMaximized | Qt.WindowState.WindowFullScreen):   # type: ignore[operator]
+            return
+        self._fitting = True
+        self._fit_mode = 'auto'
+        try:
+            self._content_w.setMaximumHeight(self._MAX_WIDGET)          # uncap → tiles use target size
+            for _ in range(12):                                   # bounded — converges fast
+                content = self._content_w
+                need = max(content.minimumSizeHint().height(), content.sizeHint().height())
+                have = self._scroll.viewport().height()
+                delta = need - have
+                if abs(delta) < 3:
+                    break
+                target = max(self.height() + delta, self.minimumHeight())
+                try:
+                    avail = self.screen().availableGeometry().height()       # type: ignore[union-attr]
+                    frame = self.frameGeometry().height() - self.height()
+                    target = min(target, avail - frame)
+                except Exception:
+                    pass
+                if abs(target - self.height()) < 3:
+                    break
+                self.resize(self.width(), target)
+                QApplication.processEvents()      # let row-height / core-grid reflow settle
+            self._auto_h = self.height()         # remember what we set → detect user drag
+        finally:
+            self._fitting = False
+
+    def _apply_fill_mode(self) -> None:
+        """FILL mode: the user resized the window — let tiles compress, no grow.
+
+        We do NOT cap the content or fight the user.  We only release the tile
+        rows' fixed-height pins so Qt's scroll-area widget resizing
+        (``widgetResizable``) can compress the expanding tiles down to their own
+        readable minimum (the sparkline height) Б─■ never below it, so nothing
+        clips.  The window stays at the user-chosen size; the vertical scrollbar
+        appears solely as a last-resort fallback when the tiles' minimums no
+        longer fit ("too many tiles to keep reasonably visible").
+        """
+        if getattr(self, '_fitting', False):
+            return
+        if self._content_w is None or self._scroll is None:
+            return
+        st = self.windowState()
+        if st & (Qt.WindowState.WindowMaximized | Qt.WindowState.WindowFullScreen):   # type: ignore[operator]
+            return
+        self._fitting = True
+        self._fit_mode = 'fill'
+        try:
+            # Release row pins so the content's minimum height drops and the
+            # scroll area can shrink the widget to the viewport (compressing
+            # tiles to their readable minimum instead of scrolling).
+            self._tile_grid._release_row_pins()
+            for _ in range(6):
+                QApplication.processEvents()
+                if not self._scroll.verticalScrollBar().isVisible():
+                    break
+            self._auto_h = None                                 # user owns the height now
+        finally:
+            self._fitting = False
+
+    def resizeEvent(self, event) -> None:                                    # type: ignore
+        super().resizeEvent(event)
+        if getattr(self, '_fitting', False):
+            return
+        st = self.windowState()
+        if st & (Qt.WindowState.WindowMaximized | Qt.WindowState.WindowFullScreen):   # type: ignore[operator]
+            return
+        new_w, new_h = event.size().width(), event.size().height()
+        old = getattr(self, '_last_size', None)
+        self._last_size = (new_w, new_h)
+        if old is None:
+            return
+        dh = new_h - old[1]
+        dw = new_w - old[0]
+        if dh != 0:
+            # Vertical drag → user is taking control: tiles adapt (no grow-back).
+            QTimer.singleShot(0, self._apply_fill_mode)
+        elif dw != 0:
+            # Width-only change → CPU grid reflowed and content height changed.
+            # In auto mode re-grow to the new natural height; in fill mode just
+            # re-cap so the recompressed tiles match the new width.
+            QTimer.singleShot(0, self._fit_window_to_content
+                              if self._fit_mode == 'auto' else self._apply_fill_mode)
+
+    def showEvent(self, event) -> None:                                    # type: ignore
+        super().showEvent(event)
+        # Defer one event-loop tick so the layout has settled before measuring.
+        self._fit_mode = 'auto'
+        QTimer.singleShot(0, self._fit_window_to_content)
+
     def _restore_window_placement(self) -> bool:
         """Restore the last Windows window position/size/mode from config."""
         try:
@@ -2848,5 +3187,8 @@ if __name__ == "__main__":
 
     win = TricorderDashboard()
     if not win._restore_window_placement():
-        win.showMaximized()
+        # No saved geometry: open windowed and auto-fit to content (showEvent
+        # schedules _fit_window_to_content) — guarantees no scrollbar on first
+        # launch.  The user can still maximise manually if preferred.
+        win.show()
     sys.exit(app.exec())

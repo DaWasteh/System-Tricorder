@@ -652,10 +652,6 @@ class HardwareMonitorThread(QThread):
         # Vendor-neutral: reads the same Windows "GPU Engine" counter for
         # NVIDIA, Intel and AMD, so all three improve equally.
         self._pdh: _PdhGpuSampler = _PdhGpuSampler()
-        # Per-LUID exponential moving average of engine util — tames the 0↔100
-        # oscillation of bursty AI/compute workloads into a stable, Adrenalin-
-        # like reading while staying responsive.
-        self._gpu_ema: Dict[str, Dict[str, float]] = {}
 
     def run(self) -> None:
         self._running = True
@@ -848,20 +844,12 @@ class HardwareMonitorThread(QThread):
                             # Video Codec Engine: take max util per (luid, eng_idx)
                             luid_data[_cl3]['codec'] = max(luid_data[_cl3]['codec'], _eu3)
 
-                    # ── Smooth engine utilization (EMA) ─────────────────────────
-                    # PDH returns a fresh instantaneous sample every frame; bursty
-                    # AI/compute workloads swing 0↔100 between frames.  A short
-                    # exponential moving average (τ ≈ 0.25 s) yields the stable,
-                    # Adrenalin-like reading users expect while staying responsive.
-                    _alpha = 1.0 - math.exp(-dt / 0.25)
-                    for _luid, _d in luid_data.items():
-                        _ema = self._gpu_ema.setdefault(_luid, {})
-                        for _k in ('3d', 'compute', 'c0', 'c1', 'codec'):
-                            _raw = _d.get(_k, 0.0)
-                            _prev = _ema.get(_k, _raw)
-                            _smoothed = _prev + _alpha * (_raw - _prev)
-                            _ema[_k] = _smoothed
-                            _d[_k] = _smoothed
+                    # ── Engine utilization: raw, unsmoothed ─────────────────────
+                    # PDH returns a fresh instantaneous sample every frame.  We
+                    # pass the raw reading straight through -- no EMA, no delay.
+                    # The old smoothing made idle cards crawl down to 0 over a
+                    # second (and never reach it), so an idle card now shows a
+                    # clean, instant 0 % the moment the load is gone.
 
                 new: List[str] = sorted(
                     [luid for luid in luid_data if luid not in self._luid_order],
@@ -2479,7 +2467,7 @@ def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD  v1.1
+# MAIN DASHBOARD  v1.4
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TricorderDashboard(QMainWindow):
@@ -2494,7 +2482,7 @@ class TricorderDashboard(QMainWindow):
         except Exception:
             pass
 
-        self.setWindowTitle("System Tricorder v1.1")
+        self.setWindowTitle("System Tricorder v1.4")
         # Scale minimum size by DPI — 1280×720 is the logical 100% DPI size
         _min_w = int(1280 * _DP_SCALE) if _DP_SCALE > 0 else 1280
         _min_h = int(720 * _DP_SCALE) if _DP_SCALE > 0 else 720
@@ -2627,7 +2615,7 @@ class TricorderDashboard(QMainWindow):
 
         title = QLabel(
             "📊  System Tricorder  "
-            f"<span style='font-size: {font_size(18)}; color:#00aa55;'>v1.1</span>"
+            f"<span style='font-size: {font_size(18)}; color:#00aa55;'>v1.4</span>"
         )
         title.setStyleSheet(
             f"font-size: {font_size(28)}; font-weight: bold; color: #00ff88; background: transparent;")

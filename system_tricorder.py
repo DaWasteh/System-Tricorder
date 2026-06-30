@@ -200,22 +200,23 @@ def get_registry_gpu_vrams() -> List[float]:
     return vrams if vrams else [8.0]
 
 
-def get_dxgi_adapter_map() -> Dict[str, Tuple[str, float]]:
+def get_dxgi_adapter_map() -> Dict[str, Tuple[str, float, str]]:
     """
     Enumerate GPU adapters via DXGI and return a mapping:
-        luid_string -> (device_id_hex, dedicated_vram_gb)
+        luid_string -> (device_id_hex, dedicated_vram_gb, description)
 
     The LUID string is formatted to match the LUID that appears verbatim in the
     Windows GPU performance-counter names, e.g. "luid_0x00000000_0x0001c2e3".
     DXGI is the authoritative source here: every adapter's kernel LUID is the
     same one the perf counters use, and DXGI_ADAPTER_DESC also carries the PCI
-    DeviceId — so this lets us bind a perf-counter LUID directly to a physical
-    GPU instead of guessing by VRAM size.
+    DeviceId and the human-readable Description -- so this lets us bind a
+    perf-counter LUID directly to a physical GPU (and tell the iGPU apart from
+    dGPUs by name) instead of guessing by VRAM size.
 
     Returns {} on any failure (non-Windows, no DXGI, etc.); callers degrade
     gracefully when the map is empty.
     """
-    result: Dict[str, Tuple[str, float]] = {}
+    result: Dict[str, Tuple[str, float, str]] = {}
     try:
         import ctypes
         from ctypes import POINTER, byref, c_void_p
@@ -280,7 +281,8 @@ def get_dxgi_adapter_map() -> Dict[str, Tuple[str, float]]:
                     luid_str = f"luid_0x{high:08x}_0x{low:08x}"
                     dev_id   = f"0x{desc.DeviceId:04X}"
                     vram_gb  = desc.DedicatedVideoMemory / (1024 ** 3)
-                    result[luid_str] = (dev_id, vram_gb)
+                    name     = (desc.Description or "").strip()
+                    result[luid_str] = (dev_id, vram_gb, name)
                 adapter_release(adapter)
             except Exception:
                 pass
@@ -533,39 +535,6 @@ def build_drive_info() -> List[Tuple[str, str]]:
     return result
 
 
-def detect_npu_present() -> bool:
-    """Return True only if a real Neural Processing Unit is present.
-
-    NPUs are enumerated as PnP devices, not as GPU performance counters, so
-    presence must be probed via Win32_PnPEntity.  We match on *specific* device
-    names (Intel "AI Boost", AMD "NPU Compute Accelerator"/"IPU Device",
-    Qualcomm "Hexagon") rather than the bare token "npu" — "%NPU%" would match
-    every "USB Input Device" ("i-NPU-t").  The leading space in "% NPU%" keeps
-    "Intel(R) NPU" matchable while still excluding mid-word hits like "Input".
-
-    Returns False on non-Windows / no WMI, so the NPU tile is simply omitted.
-    """
-    if not WMI_AVAILABLE:
-        return False
-    try:
-        pythoncom.CoInitialize()                                    # type: ignore
-        wmi = win32com.client.GetObject("winmgmts:root\\cimv2")    # type: ignore
-        query = (
-            "SELECT Name FROM Win32_PnPEntity WHERE "
-            "Name LIKE '%AI Boost%' OR "
-            "Name LIKE '%Neural Processor%' OR "
-            "Name LIKE '%NPU Compute%' OR "
-            "Name LIKE '%IPU Device%' OR "
-            "Name LIKE '% NPU%' OR "
-            "Name LIKE '%Hexagon%'"
-        )
-        for _ in wmi.ExecQuery(query):
-            return True
-    except Exception as exc:
-        logger.debug("NPU detection failed: %s", exc)
-    return False
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATA CLASSES
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -600,7 +569,6 @@ class SystemMetrics:
     ram_percent:       float
     gpus:              List[GPUMetrics]
     igpu_percent:      float
-    npu_percent:       float
     disk_read_mbps:    float   # aggregate (kept for compat)
     disk_write_mbps:   float   # aggregate
     drives:            List[DriveMetrics]   # per-physical-drive
@@ -642,7 +610,20 @@ class HardwareMonitorThread(QThread):
         # Authoritative LUID → (device_id, vram_gb) map from DXGI.  Static for the
         # lifetime of the process, so we build it once here.  Used to bind each
         # GPU performance-counter LUID to the correct physical GPU.
-        self._luid_device_map: Dict[str, Tuple[str, float]] = get_dxgi_adapter_map()
+        self._luid_device_map: Dict[str, Tuple[str, float, str]] = get_dxgi_adapter_map()
+        # Resolve the iGPU's perf-counter LUID from the DXGI adapter map by
+        # name.  Windows GPU engine counter names never carry the adapter name,
+        # so we cannot match them by string (the old _IGPU_MARKERS path was
+        # therefore dead code).  Instead we identify the iGPU LUID once here and
+        # aggregate its engine utilisation by LUID, exactly like the dGPUs.
+        _igpu_name_markers = ('hd graphics', 'uhd graphics', 'iris',
+                              'intel(r) graphics', 'arc(tm) graphics',
+                              'radeon graphics', 'radeon(tm) graphics')
+        self._igpu_luid: Optional[str] = next(
+            (luid for luid, (_devid, _vram, name) in self._luid_device_map.items()
+             if any(m in name.lower() for m in _igpu_name_markers)),
+            None,
+        )
 
         self._luid_order: List[str]       = []
         self._luid_vram:  Dict[str, float] = {}
@@ -703,7 +684,7 @@ class HardwareMonitorThread(QThread):
                 ram       = psutil.virtual_memory()
 
                 # ── GPU (WMI) ───────────────────────────────────────────────
-                igpu_p = npu_p = 0.0
+                igpu_p = 0.0
                 luid_data: Dict[str, dict] = {}
 
                 if wmi:
@@ -713,11 +694,6 @@ class HardwareMonitorThread(QThread):
                     # We extract the GPU LUID with a regex, aggregate max util
                     # per (luid, eng_idx) across all processes, then sum across
                     # engine indices of the same type to get total GPU utilization.
-                    _IGPU_MARKERS = ('hd graphics', 'uhd graphics', 'iris',
-                                     'intel(r) graphics', 'arc(tm) graphics')
-                    # NPU detection: only specific markers, NOT generic 'npu' which matches AMD engines
-                    _NPU_MARKERS  = ('ai boost', 'npu acceleration', 'intel npu',
-                                     'xe media', 'media engine')
                     _LUID_RE = re.compile(r'luid_(0x[0-9a-f]+_0x[0-9a-f]+)')
                     _ENG_RE  = re.compile(r'_eng_(\d+)_')
 
@@ -744,13 +720,13 @@ class HardwareMonitorThread(QThread):
                     for _e in _engine_rows:
                         try:
                             _en = _e[0]
-                            if any(x in _en for x in _IGPU_MARKERS):
-                                continue
-                            if any(x in _en for x in _NPU_MARKERS):
-                                continue
                             _m = _LUID_RE.search(_en)
                             if _m:
                                 _luid = 'luid_' + _m.group(1)
+                                # Skip the iGPU here; it is handled as a single
+                                # igpu_percent value in Step 3, not as a dGPU.
+                                if _luid == self._igpu_luid:
+                                    continue
                                 luid_data.setdefault(_luid, {'3d': 0.0, 'compute': 0.0,
                                                              'c0': 0.0, 'c1': 0.0, 'codec': 0.0, 'used': 0.0})
                         except Exception:
@@ -782,16 +758,14 @@ class HardwareMonitorThread(QThread):
                             _util = _e[1]
                             if _util <= 0:
                                 continue
-                            if any(x in _en for x in _IGPU_MARKERS):
-                                igpu_p = max(igpu_p, _util)
-                                continue
-                            if any(x in _en for x in _NPU_MARKERS):
-                                npu_p = max(npu_p, _util)
-                                continue
                             _lm = _LUID_RE.search(_en)
                             if not _lm:
                                 continue
                             _cl = 'luid_' + _lm.group(1)
+                            # ── iGPU: aggregate by its resolved LUID ────────────
+                            if _cl == self._igpu_luid:
+                                igpu_p = max(igpu_p, _util)
+                                continue
                             if _cl not in luid_data:
                                 continue
                             _em = _ENG_RE.search(_en)
@@ -922,7 +896,6 @@ class HardwareMonitorThread(QThread):
                     ram_percent=ram.percent,
                     gpus=gpus,
                     igpu_percent=igpu_p,
-                    npu_percent=npu_p,
                     disk_read_mbps=rmb,
                     disk_write_mbps=wmb,
                     drives=drives,
@@ -948,6 +921,22 @@ class HardwareMonitorThread(QThread):
 # CPU TOPOLOGY  (unchanged from v0.2)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _fmt_ranges(indices):
+    """Compress ints to a compact range string, e.g. [0,1,10,11,12,13,22,23] -> '0-1,10-13,22-23'."""
+    idx = sorted(set(int(i) for i in indices))
+    if not idx:
+        return ""
+    out, start, prev = [], idx[0], idx[0]
+    for n in idx[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        out.append(f"{start}-{prev}" if start != prev else f"{start}")
+        start = prev = n
+    out.append(f"{start}-{prev}" if start != prev else f"{start}")
+    return ",".join(out)
+
+
 def _get_cpu_topology() -> Optional[dict]:
     """
     Reads true P/E core topology via GetLogicalProcessorInformationEx.
@@ -965,7 +954,7 @@ def _get_cpu_topology() -> Optional[dict]:
         if not kernel32.GetLogicalProcessorInformationEx(RelationProcessorCore, buf, ctypes.byref(buf_size)):
             return None
 
-        cores: list = []
+        cores: list = []   # (eff, threads, [logical indices...])
         offset = 0
         while offset < buf_size.value:
             rel  = int.from_bytes(buf[offset    : offset + 4], 'little')
@@ -976,12 +965,17 @@ def _get_cpu_topology() -> Optional[dict]:
                 eff         = buf[offset + 9]
                 group_count = int.from_bytes(buf[offset + 30: offset + 32], 'little')
                 threads = 0
+                logical_idx: list = []   # logical CPU indices of THIS physical core
                 gm_off  = offset + 32
                 for _ in range(group_count):
-                    mask     = int.from_bytes(buf[gm_off: gm_off + 8], 'little')
+                    mask = int.from_bytes(buf[gm_off: gm_off + 8], 'little')
+                    grp  = int.from_bytes(buf[gm_off + 8: gm_off + 10], 'little')
                     threads += bin(mask).count('1')
-                    gm_off  += 16
-                cores.append((eff, threads))
+                    for b in range(64):
+                        if mask & (1 << b):
+                            logical_idx.append(grp * 64 + b)
+                    gm_off += 16
+                cores.append((eff, threads, logical_idx))
             offset += size
 
         if not cores:
@@ -989,19 +983,28 @@ def _get_cpu_topology() -> Optional[dict]:
 
         eff_classes = sorted(set(c[0] for c in cores))
         if len(eff_classes) < 2:
-            total_t = sum(t for _, t in cores)
+            total_t = sum(t for _, t, _ in cores)
             return {'is_hybrid': False,
                     'p_cores': len(cores), 'p_threads': total_t,
-                    'e_cores': 0,          'e_threads': 0}
+                    'e_cores': 0,          'e_threads': 0,
+                    'p_logical': [idx for _, _, idx in cores],
+                    'e_logical': []}
 
         max_eff = max(eff_classes)
         min_eff = min(eff_classes)
-        p_group = [(e, t) for e, t in cores if e == max_eff]
-        e_group = [(e, t) for e, t in cores if e == min_eff]
+        p_group = [(e, t, idx) for e, t, idx in cores if e == max_eff]
+        e_group = [(e, t, idx) for e, t, idx in cores if e == min_eff]
         return {
             'is_hybrid': True,
-            'p_cores':   len(p_group), 'p_threads': sum(t for _, t in p_group),
-            'e_cores':   len(e_group), 'e_threads': sum(t for _, t in e_group),
+            'p_cores':   len(p_group), 'p_threads': sum(t for _, t, _ in p_group),
+            'e_cores':   len(e_group), 'e_threads': sum(t for _, t, _ in e_group),
+            # Real logical CPU indices.  On Arrow Lake (e.g. Core Ultra 9 285K)
+            # P and E are INTERLEAVED (P=[0,1,10-13,22,23], E=[2-9,14-21]), so the
+            # old "first N = P" assumption mislabelled ~half the bars.
+            # p_logical is a list of per-core groups (a P-core may have 2 HT
+            # siblings); e_logical is flat (E-cores never have HT).
+            'p_logical': [idx for _, _, idx in p_group],
+            'e_logical': [i for _, _, idx in e_group for i in idx],
         }
     except Exception:
         return None
@@ -1022,40 +1025,26 @@ class SparklineWidget(QWidget):
         self.color   = QColor(color_hex)
         self.history: deque = deque([0.0] * history_len, maxlen=history_len)
         self._dirty  = False
-        # Peak-hold state for the *displayed* percentage number.
-        # Rises instantly to any new peak, then decays slowly — mirrors how
-        # vendor tools (AMD Adrenalin) render bursty AI/compute workloads: the
-        # driver-level activity meter sees every short kernel burst that the
-        # Windows per-frame engine counter underreports, so it reads a stable
-        # high number.  Peak-hold reproduces that: any burst pins the value up,
-        # and only a genuinely idle period lets it fall.  At 30 FPS,
-        # release=0.004/frame keeps a recurring burst train at ~96-99 % while a
-        # truly idle GPU decays to ~0 over a few seconds.
-        self._env = 0.0
-        self._ENV_RELEASE = 0.004
         self._grid_cache: Optional[Tuple[int, int, QPixmap]] = None  # (w, h, pixmap)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumHeight(dp(min_height))
 
     def add_value(self, value: float) -> None:
         self.history.append(value)
-        # Peak-hold envelope for the displayed number: jump instantly to any
-        # new peak (captures short compute bursts AMD-style), decay slowly
-        # afterwards.  Raw values still drive the sparkline graph verbatim.
-        self._env = max(value, self._env * (1.0 - self._ENV_RELEASE))
         # Mark dirty but defer update - parent will batch-call update() once
         self._dirty = True
 
     def recent_avg(self, count: int = 30) -> float:
-        """Peak-hold display value for the percentage number.
+        """Raw, unsmoothed value for the percentage number.
 
         Despite the name (kept for call-site compatibility) this returns the
-        peak-hold envelope state, not an arithmetic mean.  The sparkline graph
-        still shows the raw, instantly-reacting history; only the number is
-        smoothed so it matches a vendor tool's stable high reading on bursty
-        AI/compute workloads (a single short burst pins it near 100 %, exactly
-        like AMD Adrenalin's activity meter)."""
-        return self._env
+        latest instantaneous sample straight through -- no EMA, no peak-hold,
+        no averaging.  The number reacts on the very next frame and drops to
+        0 instantly when a core/engine goes idle.  (Previously this returned a
+        peak-hold envelope with a ~0.4 %/frame release, which took tens of
+        seconds to decay and made every % feel sluggish.)
+        """
+        return self.history[-1] if self.history else 0.0
 
     def batch_update(self) -> None:
         """Call once per frame after all add_value() calls."""
@@ -1385,7 +1374,7 @@ class BaseTile(QFrame):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# METRIC TILE  — single sparkline (CPU total, RAM, GPU, NPU, iGPU …)
+# METRIC TILE  — single sparkline (CPU total, RAM, GPU, iGPU …)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class MetricTile(BaseTile):
@@ -2467,7 +2456,7 @@ def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD  v1.4
+# MAIN DASHBOARD  v1.5
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TricorderDashboard(QMainWindow):
@@ -2482,7 +2471,7 @@ class TricorderDashboard(QMainWindow):
         except Exception:
             pass
 
-        self.setWindowTitle("System Tricorder v1.4")
+        self.setWindowTitle("System Tricorder v1.5")
         # Scale minimum size by DPI — 1280×720 is the logical 100% DPI size
         _min_w = int(1280 * _DP_SCALE) if _DP_SCALE > 0 else 1280
         _min_h = int(720 * _DP_SCALE) if _DP_SCALE > 0 else 720
@@ -2526,6 +2515,12 @@ class TricorderDashboard(QMainWindow):
         self.e_cores    = 0
         self.p_threads  = self.c_logical
         self.e_threads  = 0
+        # Real logical-CPU indices per core (from topology).  Defaults keep the
+        # non-hybrid / fallback paths working; _build_hybrid_cores registers the
+        # per-thread widgets under these TRUE indices so the per-frame update
+        # loop feeds each bar the correct core's load.
+        self.p_logical: List[List[int]] = []
+        self.e_logical: List[int]        = []
 
         topo = _get_cpu_topology()
         if topo and not self.is_amd:
@@ -2534,6 +2529,8 @@ class TricorderDashboard(QMainWindow):
             self.e_cores   = topo['e_cores']
             self.p_threads = topo['p_threads']
             self.e_threads = topo['e_threads']
+            self.p_logical = topo.get('p_logical', [])
+            self.e_logical = topo.get('e_logical', [])
 
         if not self.is_hybrid:
             self.has_ht = (self.c_logical == 2 * self.c_physical)
@@ -2573,12 +2570,11 @@ class TricorderDashboard(QMainWindow):
         reg_vrams = get_registry_gpu_vrams()
         dgpu_wmi  = [(n, v, p) for n, ig, v, p in wmi_gpus if not ig]
 
-        # iGPU/NPU tiles are only meaningful when the hardware actually exists.
-        # On a desktop AMD CPU (e.g. Ryzen 5800X3D) there is neither, so they
-        # must not be created — otherwise they show up as empty 0% tiles and as
+        # iGPU tile is only meaningful when the hardware actually exists.
+        # On a desktop AMD CPU (e.g. Ryzen 5800X3D) there is no iGPU, so it
+        # must not be created — otherwise it shows up as an empty 0% tile and as
         # restorable options in the "Add Tile" dialog.
         self.has_igpu = any(ig for _, ig, _, _ in wmi_gpus)
-        self.has_npu  = detect_npu_present()
 
         self.detected_gpus: List[Tuple[str, float, str]] = []
         for i, (name, wv, pnp_id) in enumerate(dgpu_wmi):
@@ -2615,7 +2611,7 @@ class TricorderDashboard(QMainWindow):
 
         title = QLabel(
             "📊  System Tricorder  "
-            f"<span style='font-size: {font_size(18)}; color:#00aa55;'>v1.4</span>"
+            f"<span style='font-size: {font_size(18)}; color:#00aa55;'>v1.5</span>"
         )
         title.setStyleSheet(
             f"font-size: {font_size(28)}; font-weight: bold; color: #00ff88; background: transparent;")
@@ -2782,13 +2778,10 @@ class TricorderDashboard(QMainWindow):
             if gi < len(self.detected_gpus) - 1:
                 row()   # each GPU on its own row if multiple GPUs
 
-        # ── Row 3: iGPU + NPU (only if the hardware exists) ───────────────────
-        if self.has_igpu or self.has_npu:
-            row()
+        # ── Row 3: iGPU (only if the hardware exists) ─────────────────────
         if self.has_igpu:
+            row()
             reg("igpu", MetricTile("igpu", "iGPU", "#0055ff"), "iGPU")
-        if self.has_npu:
-            reg("npu",  MetricTile("npu",  "NPU",  "#aa00ff"), "NPU")
 
         # ── Row 4+: Drives (all drives on one row) ────────────────────────────
         row()
@@ -2835,26 +2828,23 @@ class TricorderDashboard(QMainWindow):
         P_COLOR  = "#00d4ff"
         HT_COLOR = "#0077aa"
         E_COLOR  = "#ff007f"
-        p_has_ht = (self.p_threads == self.p_cores * 2)
-        rows_p   = 2 if p_has_ht else 1
-
         parent.addWidget(section_label(
             f"<b style='color:{P_COLOR}; font-size:14px;'>⚡ Performance Cores "
             f"({self.p_cores} Cores / {self.p_threads} Threads, "
-            f"Threads 0–{self.p_threads - 1})</b>"
+            f"log. CPUs {_fmt_ranges([i for g in self.p_logical for i in g])})</b>"
         ))
         parent.addSpacing(4)
 
         p_groups: List[List[QWidget]] = []
-        for ci in range(self.p_cores):
-            t0 = ci * rows_p
+        # p_logical is a per-core group of real logical indices; a group of 2
+        # means this P-core has a Hyper-Threading sibling.
+        for ci, pcore_idx in enumerate(self.p_logical):
             w0 = MasterMetricBox(f"P-Core {ci}", P_COLOR, variant='standard')
-            self.thread_widgets[t0] = w0
+            self.thread_widgets[pcore_idx[0]] = w0
             group: List[QWidget] = [w0]
-            if p_has_ht:
-                t1 = t0 + 1
+            if len(pcore_idx) > 1:
                 w1 = MasterMetricBox(f"P-Core {ci}", HT_COLOR, variant='ht')
-                self.thread_widgets[t1] = w1
+                self.thread_widgets[pcore_idx[1]] = w1
                 group.append(w1)
             p_groups.append(group)
         parent.addWidget(ResponsiveCoreGrid(p_groups, min_col_w=100), 1)
@@ -2863,13 +2853,12 @@ class TricorderDashboard(QMainWindow):
         parent.addWidget(section_label(
             f"<b style='color:{E_COLOR}; font-size:12px;'>🔋 Efficiency Cores "
             f"({self.e_cores} Cores / {self.e_threads} Threads, "
-            f"Threads {self.p_threads}–{self.p_threads + self.e_threads - 1})</b>"
+            f"log. CPUs {_fmt_ranges(self.e_logical)})</b>"
         ))
         parent.addSpacing(4)
 
         e_groups: List[List[QWidget]] = []
-        for i in range(self.e_threads):
-            t = self.p_threads + i
+        for i, t in enumerate(self.e_logical):
             w = MasterMetricBox(f"E-Core {i}", E_COLOR, variant='efficiency')
             self.thread_widgets[t] = w
             e_groups.append([w])
@@ -2943,9 +2932,6 @@ class TricorderDashboard(QMainWindow):
         w = _t("igpu")
         if w:
             w.update_val(m.igpu_percent)
-        w = _t("npu")
-        if w:
-            w.update_val(m.npu_percent)
 
         for i, gm in enumerate(m.gpus):
             w_3d = _t(f"gpu_{i}_3d")

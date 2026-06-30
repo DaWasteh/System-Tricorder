@@ -29,10 +29,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python ${{ env.PYTHON_DEFAULT }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_DEFAULT }}
           # Fix: cache requires requirements.txt — now present in repo root
@@ -63,9 +63,9 @@ jobs:
     needs: lint
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_DEFAULT }}
           cache: pip
@@ -108,9 +108,9 @@ jobs:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
           # Do not enable setup-python's pip cache for the Windows test matrix.
@@ -195,9 +195,9 @@ jobs:
     if: github.event_name == 'push'
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_DEFAULT }}
           cache: pip
@@ -225,7 +225,7 @@ jobs:
           Write-Host "✅ SystemTricorder.exe — $([math]::Round($size,1)) MB"
 
       - name: Upload artefact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: SystemTricorder-${{ github.sha }}
           path: dist/SystemTricorder.exe
@@ -244,10 +244,10 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download build artefact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: SystemTricorder-${{ github.sha }}
           path: dist/
@@ -257,7 +257,7 @@ jobs:
         run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: "System Tricorder ${{ steps.version.outputs.VERSION }}"
           body: |

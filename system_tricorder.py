@@ -6,6 +6,7 @@ import json
 import re
 import platform
 import logging
+import contextlib
 import ctypes
 from ctypes import wintypes
 import psutil
@@ -387,10 +388,8 @@ class _PdhGpuSampler:
 
     def close(self) -> None:
         if self._query is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self._pdh.PdhCloseQuery(self._query)
-            except Exception:
-                pass
         self._ok = False
         self._query = None
         self._counter = None

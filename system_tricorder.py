@@ -3206,4 +3206,3 @@ if __name__ == "__main__":
         # launch.  The user can still maximise manually if preferred.
         win.show()
     sys.exit(app.exec())
-    

@@ -81,7 +81,7 @@ from PyQt6.QtWidgets import (                                       # type: igno
     QLabel, QFrame, QGridLayout, QSizePolicy, QPushButton,
     QScrollArea, QDialog, QCheckBox, QDialogButtonBox,
 )
-from PyQt6.QtCore  import Qt, QTimer, pyqtSignal, QThread, QMimeData, QPoint, QByteArray  # type: ignore
+from PyQt6.QtCore  import Qt, QTimer, pyqtSignal, QThread, QMimeData, QPoint, QSize, QByteArray  # type: ignore
 from PyQt6.QtGui   import (                                         # type: ignore
     QColor, QPainter, QPainterPath, QPen, QBrush, QDrag, QPixmap,
 )
@@ -1019,6 +1019,19 @@ class SparklineWidget(QWidget):
     Single horizontal sparkline with filled area.
     Expects values 0–100 (percentage).
     """
+    #: Hard lower bound below which a sparkline stops being readable.  The
+    #: per-instance ``min_height`` parameter is only the PREFERRED height
+    #: (exposed via sizeHint) -- the layout may compress the widget down to
+    #: this floor when the window shrinks, but never below it.  Keeping the
+    #: hard minimum small guarantees the widget is never taller than the
+    #: space its tile can give it, so it is never clipped: 0 % is ALWAYS the
+    #: visible bottom edge and 100 % the visible top edge.  (Previously
+    #: ``min_height`` was enforced as a hard Qt minimum; when the window was
+    #: shrunk the rows compressed below that minimum, the sparkline
+    #: overflowed its tile and the bottom of the graph -- the 0 % baseline
+    #: and every low value -- was silently cut off.)
+    _HARD_MIN_H = 12
+
     def __init__(self, color_hex: str, history_len: int = 90,
                  min_height: int = 70, parent=None) -> None:
         super().__init__(parent)
@@ -1026,8 +1039,15 @@ class SparklineWidget(QWidget):
         self.history: deque = deque([0.0] * history_len, maxlen=history_len)
         self._dirty  = False
         self._grid_cache: Optional[Tuple[int, int, QPixmap]] = None  # (w, h, pixmap)
+        self._pref_h = dp(min_height)   # preferred height, see sizeHint()
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setMinimumHeight(dp(min_height))
+        self.setMinimumHeight(dp(self._HARD_MIN_H))
+
+    def sizeHint(self) -> QSize:                                            # type: ignore
+        """Preferred size.  Qt lays the widget out at this height when space
+        allows and shrinks it toward minimumHeight when the window gets
+        tight -- instead of overflowing (and clipping) the parent tile."""
+        return QSize(dp(120), self._pref_h)
 
     def add_value(self, value: float) -> None:
         self.history.append(value)
@@ -1060,9 +1080,18 @@ class SparklineWidget(QWidget):
         px.fill(QColor(12, 12, 20))
         p = QPainter(px)
         p.setPen(QPen(QColor(40, 40, 52), 1))
-        for x in range(0, w, 25):
+        # Time axis: fixed, DPI-scaled pitch.
+        pitch = dp(25)
+        for x in range(pitch, w, pitch):
             p.drawLine(x, 0, x, h)
-        for y in range(0, h, 15):
+        # Value axis: gridlines at fixed 25 % steps so the bottom edge is
+        # always 0 % and the top edge always 100 %, at ANY tile height.  The
+        # grid rescales with the tile and is identical across the global
+        # tiles and the CPU core boxes (previously a fixed 15 px texture was
+        # tiled from the top, leaving a partial cell at the bottom and a
+        # different line count in every tile).
+        for q in (1, 2, 3):
+            y = round(h * q / 4)
             p.drawLine(0, y, w, y)
         p.end()
         self._grid_cache = (w, h, px)
@@ -2079,12 +2108,23 @@ class TileGrid(QWidget):
         super().resizeEvent(event)
         self._auto_adjust_row_height()
 
+    def _row_min(self, rw: QWidget) -> int:
+        """Lowest height a row wrapper may be pinned to without clipping its
+        tiles: the row floor, but never below the row's own content minimum.
+        (An explicit setMinimumHeight OVERRIDES the layout-derived minimum;
+        pinning rows to the bare _ROW_FLOOR let the outer layout shrink them
+        below their tiles' minimum height, so the tiles overflowed and the
+        bottom of every sparkline -- the 0 % baseline -- was cut off.)"""
+        lay = rw.layout()
+        content_min = lay.minimumSize().height() if lay is not None else 0
+        return max(self._ROW_FLOOR, content_min)
+
     def _release_row_pins(self) -> None:
         """Drop the fixed min/max height on every row so the layout may compress
         the tiles toward their readable minimum when the window is shrunk.
         Counterpart to the 'ample' branch of _auto_adjust_row_height."""
         for rw in self._row_widgets:
-            rw.setMinimumHeight(self._ROW_FLOOR)
+            rw.setMinimumHeight(self._row_min(rw))
             rw.setMaximumHeight(16_777_215)
 
     def _auto_adjust_row_height(self) -> None:
@@ -2116,8 +2156,9 @@ class TileGrid(QWidget):
             ideal = min(target_h, per_row)
             self._current_row_h = ideal
             for rw in self._row_widgets:
-                rw.setMinimumHeight(ideal)
-                rw.setMaximumHeight(ideal)
+                pin = max(ideal, self._row_min(rw))
+                rw.setMinimumHeight(pin)
+                rw.setMaximumHeight(pin)
         else:
             # Tight space (user shrank the window) → UNPIN the rows so Qt's
             # layout engine compresses the tiles down toward their readable
@@ -2127,7 +2168,7 @@ class TileGrid(QWidget):
             ideal = max(self._ROW_FLOOR, per_row)
             self._current_row_h = ideal
             for rw in self._row_widgets:
-                rw.setMinimumHeight(self._ROW_FLOOR)
+                rw.setMinimumHeight(self._row_min(rw))
                 rw.setMaximumHeight(16_777_215)   # no cap → layout compresses freely
 
     # ── Edit mode ─────────────────────────────────────────────────────────────
@@ -2456,7 +2497,7 @@ def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD  v1.5
+# MAIN DASHBOARD  v1.6
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TricorderDashboard(QMainWindow):
@@ -2471,7 +2512,7 @@ class TricorderDashboard(QMainWindow):
         except Exception:
             pass
 
-        self.setWindowTitle("System Tricorder v1.5")
+        self.setWindowTitle("System Tricorder v1.6")
         # Scale minimum size by DPI — 1280×720 is the logical 100% DPI size
         _min_w = int(1280 * _DP_SCALE) if _DP_SCALE > 0 else 1280
         _min_h = int(720 * _DP_SCALE) if _DP_SCALE > 0 else 720
@@ -2611,7 +2652,7 @@ class TricorderDashboard(QMainWindow):
 
         title = QLabel(
             "📊  System Tricorder  "
-            f"<span style='font-size: {font_size(18)}; color:#00aa55;'>v1.5</span>"
+            f"<span style='font-size: {font_size(18)}; color:#00aa55;'>v1.6</span>"
         )
         title.setStyleSheet(
             f"font-size: {font_size(28)}; font-weight: bold; color: #00ff88; background: transparent;")
@@ -3165,3 +3206,4 @@ if __name__ == "__main__":
         # launch.  The user can still maximise manually if preferred.
         win.show()
     sys.exit(app.exec())
+    

@@ -8,7 +8,15 @@ import platform
 import logging
 import contextlib
 import ctypes
-from ctypes import wintypes
+if platform.system() == 'Windows':
+    from ctypes import wintypes
+else:
+    # Define dummy wintypes for Linux to avoid AttributeErrors in type hints
+    class wintypes:
+        DWORD = ctypes.c_uint32
+        LPWSTR = ctypes.c_wchar_p
+        ULONGLONG = ctypes.c_uint64
+
 import psutil
 from pathlib import Path
 from collections import deque

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=System Tricorder
+Comment=System Monitoring Dashboard
+Exec=/l/GitHub/System\ Tricorder/start_linux.sh
+Icon=utilities-system-monitor
+Terminal=false
+Categories=Utility;System;

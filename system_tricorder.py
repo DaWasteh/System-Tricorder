@@ -732,7 +732,7 @@ def build_drive_info() -> List[Tuple[str, str]]:
                     else:
                         m = re.search(r'([a-z]+)', base_dev)
                         if m: base_dev = m.group(1)
-                    
+
                     if base_dev not in linux_disk_map:
                         linux_disk_map[base_dev] = p.mountpoint
             except Exception:
@@ -743,7 +743,7 @@ def build_drive_info() -> List[Tuple[str, str]]:
                 # Skip loop devices
                 if key.startswith('loop'):
                     continue
-                
+
                 # Distinguish base devices from partitions
                 # NVMe base: nvme0n1 | Partition: nvme0n1p1
                 # SATA base: sda | Partition: sda1
@@ -754,12 +754,12 @@ def build_drive_info() -> List[Tuple[str, str]]:
                 else:
                     if re.search(r'\d+$', key):
                         is_partition = True
-                
+
                 if is_partition:
                     continue
 
                 mount = linux_disk_map.get(key, "Unknown")
-                
+
                 # Windows-style mapping for the user's specific system
                 if "Zwischenspeicher" in mount:
                     label = "H: Zwischenspeicher"
@@ -782,7 +782,7 @@ def build_drive_info() -> List[Tuple[str, str]]:
                              .replace('mmcblk', 'SD ')
                              .replace('sd', 'Disk '))
                     label = re.sub(r'\s+', ' ', label).strip()
-            
+
             result.append((key, label))
     except Exception:
         pass
@@ -1028,7 +1028,7 @@ class HardwareMonitorThread(QThread):
                 if self._igpu_info:
                     # Most Intel/AMD iGPUs expose gpu_busy_percent in sysfs
                     igpu_util = _linux_read_amd_gpu_busy(self._igpu_info["card_dir"])
-                
+
                 self.metrics_updated.emit(SystemMetrics(
                     cpu_total_percent=cpu_total,
                     cpu_cores=cpu_cores,
@@ -1289,10 +1289,8 @@ class HardwareMonitorThread(QThread):
                     logger.debug("CoUninitialize: %s", exc)
                 self._com_initialized = False
         if NVML_AVAILABLE:
-            try:
+            with contextlib.suppress(Exception):
                 pynvml.nvmlShutdown()                                  # type: ignore
-            except Exception:
-                pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1345,10 +1343,8 @@ def _linux_get_cpu_topology() -> Optional[dict]:
             for fname in ("cpu_capacity", "cpu_efficiency"):
                 f = cpu_d / fname
                 if f.is_file():
-                    try:
+                    with contextlib.suppress(Exception):
                         capacities[idx] = int(f.read_text().strip())
-                    except Exception:
-                        pass
                     break
 
         # ── No hybrid info → non-hybrid ───────────────────────────────────

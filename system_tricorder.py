@@ -9,6 +9,7 @@ import logging
 import contextlib
 import ctypes
 import subprocess
+import shlex
 try:
     import pynvml                                               # type: ignore
     pynvml.nvmlInit()
@@ -174,9 +175,8 @@ _ARC_DMODEL = ('a310', 'a380', 'a580', 'a750', 'a770', 'b580', 'b770')
 
 # AMD iGPU PCI Device IDs — only these are real integrated GPUs
 # (Ryzen 5800X3D has NO iGPU; Ryzen 7040/8040+ have RDNA2 iGPU)
-_AMD_IGPU_DEV_IDS = ('15d8', '15d9', '164e', '164f', '1681', '1682',  # RDNA2 iGPUs
-                     '1636', '1637', '1638', '1639', '163c', '163d',  # older APU iGPUs
-                     '1002',)  # fallback: VEN_1002 without DEV = not an iGPU
+_AMD_IGPU_DEV_IDS = ('15d8', '15d9', '164e', '164f', '1681', '1682',  # RDNA2/3 iGPUs
+                     '1636', '1637', '1638', '1639', '163c', '163d')  # older APU iGPUs
 
 # Drive tile colours
 DRIVE_R_COLOR = "#00ffcc"   # read  — teal
@@ -187,152 +187,254 @@ DRIVE_W_COLOR = "#ffcc00"   # write — amber
 # LINUX GPU MONITORING  (AMDGPU sysfs + optional NVML)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _linux_lspci_gpu_names() -> Dict[str, str]:
-    """Return ``{pci_slot: human_name}`` for all VGA/3D/Display controllers
-    by parsing ``lspci -mm -nn`` output.  This is the same source nvtop uses
-    and gives accurate names for every GPU vendor without hard-coding a
-    PCI-ID database.
+def _linux_norm_pci_slot(slot: str) -> str:
+    """Normalize Linux PCI addresses for matching lspci, sysfs and NVML.
 
-    Returns an empty dict on any failure (lspci not installed, etc.).
+    lspci usually prints ``04:00.0`` while sysfs/DRM often uses
+    ``0000:04:00.0`` and NVML may return ``00000000:04:00.0``.  Internally we
+    keep the canonical sysfs shape: ``dddd:bb:dd.f``.
     """
-    names: Dict[str, str] = {}
+    s = (slot or "").strip().lower()
+    if not s:
+        return ""
+    m = re.match(r"^([0-9a-f]{8}):([0-9a-f]{2}:[0-9a-f]{2}\.[0-7])$", s)
+    if m:
+        return f"{m.group(1)[-4:]}:{m.group(2)}"
+    if re.match(r"^[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$", s):
+        return f"0000:{s}"
+    if re.match(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$", s):
+        return s
+    return s
+
+
+def _linux_strip_pci_id(text: str) -> str:
+    """Remove a trailing PCI/device id bracket from lspci labels."""
+    return re.sub(r"\s*\[[0-9a-fA-F]{4}(?::[0-9a-fA-F]{4})?\]\s*$", "", text).strip()
+
+
+def _linux_lspci_gpu_records() -> Dict[str, dict]:
+    """Return GPU records keyed by normalized PCI slot from ``lspci -mm -nn``.
+
+    Important: ``lspci -mm`` is shell-quoted, not tab-separated.  The device
+    model is field 3; the last field is often the subsystem device ("Device
+    [2424]"), which produced useless names on Ubuntu before this parser.
+    """
+    records: Dict[str, dict] = {}
     try:
         out = subprocess.check_output(
             ["lspci", "-mm", "-nn"], text=True, timeout=5, stderr=subprocess.DEVNULL,
         )
         for line in out.strip().splitlines():
-            parts = line.split("\t")
-            if len(parts) < 3:
+            try:
+                parts = shlex.split(line)
+            except ValueError:
                 continue
-            slot = parts[0].strip()
-            cls  = parts[1].strip()
-            if not any(kw in cls for kw in ("VGA", "3D", "Display")):
+            if len(parts) < 4:
                 continue
-            raw = parts[-1].strip()
-            # Strip trailing PCI-ID in brackets: "Radeon RX 9070 XT [1002:7480]"
-            name = re.sub(r"\s*\[[0-9a-fA-F]{4}:[0-9a-fA-F]{4}\]\s*$", "", raw).strip()
-            if name:
-                names[slot] = name
+            slot = _linux_norm_pci_slot(parts[0])
+            cls = parts[1]
+            if not cls.startswith(("VGA", "3D", "Display")):
+                continue
+            vendor = _linux_strip_pci_id(parts[2])
+            device = _linux_strip_pci_id(parts[3])
+            vendor_id = ""
+            device_id = ""
+            vm = re.search(r"\[([0-9a-fA-F]{4})\]", parts[2])
+            dm = re.search(r"\[([0-9a-fA-F]{4})\]", parts[3])
+            if vm:
+                vendor_id = "0x" + vm.group(1).lower()
+            if dm:
+                device_id = "0x" + dm.group(1).lower()
+            name = device or vendor or "GPU"
+            records[slot] = {
+                "slot": slot,
+                "class": cls,
+                "vendor": vendor,
+                "vendor_id": vendor_id,
+                "device": device,
+                "device_id": device_id,
+                "name": name,
+            }
     except Exception as exc:
-        logger.debug("lspci GPU name lookup failed: %s", exc)
-    return names
+        logger.debug("lspci GPU lookup failed: %s", exc)
+    return records
+
+
+def _linux_lspci_gpu_names() -> Dict[str, str]:
+    """Return ``{pci_slot: human_name}`` for all VGA/3D/Display controllers."""
+    return {slot: rec.get("name", "GPU") for slot, rec in _linux_lspci_gpu_records().items()}
 
 
 def _linux_detect_gpus() -> List[dict]:
-    """Detect GPUs on Linux via ``/sys/class/drm``.
-
-    For each ``cardN`` directory we check the vendor file:
-      - ``0x1002`` (AMD):  if ``mem_info_vram_total`` exists and > 0, it's a dGPU.
-                           otherwise, it's an iGPU.
-      - ``0x10de`` (NVIDIA): dGPU; VRAM filled later via NVML.
-      - ``0x8086`` (Intel):  iGPU.
+    """Detect GPUs on Linux via DRM sysfs, with lspci as naming/fallback.
 
     Returns a list of dicts:
         ``{name, card_dir, vram_total_gb, vendor, pci_slot, is_igpu}``
+
+    ``card_dir`` is empty for a PCI GPU that lspci sees but DRM/sysfs does not
+    expose to the current session; the UI still gets a tile, but utilisation is
+    reported as 0 until the driver exposes counters.
     """
-    gpu_names = _linux_lspci_gpu_names()
+    lspci_records = _linux_lspci_gpu_records()
     gpus: List[dict] = []
     drm = Path("/sys/class/drm")
-    if not drm.is_dir():
-        return gpus
-
     seen_slots: set = set()
 
-    for card in sorted(drm.glob("card[0-9]*")):
-        if "-" in card.name:          # skip card0-DP-1 etc.
-            continue
-        dev = card / "device"
-        if not dev.is_dir():
-            continue
+    def _name_for(slot: str, fallback: str) -> str:
+        rec = lspci_records.get(_linux_norm_pci_slot(slot))
+        return str(rec.get("name") or fallback) if rec else fallback
 
-        # ── Read vendor ───────────────────────────────────────────────────
-        vendor_file = dev / "vendor"
-        if not vendor_file.is_file():
-            continue
-        try:
-            vendor_hex = vendor_file.read_text().strip()
-        except Exception:
-            continue
+    def _amd_is_igpu(name: str, device_id: str, vram_gb: float) -> bool:
+        nl = name.lower()
+        dev = device_id.lower().replace("0x", "")
+        if vram_gb > 0:
+            return False
+        if dev in _AMD_IGPU_DEV_IDS:
+            return True
+        # Discrete AMD cards are usually RX/Pro/Navi/Instinct/FirePro and may
+        # lack mem_info_vram_total on some kernels.  Do not hide them as iGPUs.
+        if any(m in nl for m in (" radeon rx", "radeon rx", "radeon pro", "ai pro",
+                                 "navi", "instinct", "firepro", "w6", "w7", "w8", "w9")):
+            return False
+        return any(m in nl for m in ("radeon graphics", "radeon(tm) graphics", "vega"))
 
-        # ── Read PCI slot name from uevent ────────────────────────────────
-        pci_slot = ""
-        try:
-            uevent = (dev / "uevent").read_text()
-            m = re.search(r"PCI_SLOT_NAME=([0-9a-fA-F:.]+)", uevent)
-            if m:
-                pci_slot = m.group(1)
-        except Exception:
-            pass
+    if drm.is_dir():
+        for card in sorted(drm.glob("card[0-9]*")):
+            if "-" in card.name:          # skip card0-DP-1 etc.
+                continue
+            dev = card / "device"
+            if not dev.is_dir():
+                continue
 
-        if pci_slot in seen_slots:
-            continue                    # renderD duplicate
-        if pci_slot:
-            seen_slots.add(pci_slot)
+            vendor_file = dev / "vendor"
+            if not vendor_file.is_file():
+                continue
+            try:
+                vendor_hex = vendor_file.read_text().strip().lower()
+            except Exception:
+                continue
 
-        # ── AMD ───────────────────────────────────────────────────────────
-        if vendor_hex == "0x1002":
-            vram_file = dev / "mem_info_vram_total"
-            is_igpu = True
-            vram_gb = 0.0
-            if vram_file.is_file():
-                try:
-                    vram_bytes = int(vram_file.read_text().strip())
-                    if vram_bytes > 0:
-                        is_igpu = False
-                        vram_gb = vram_bytes / (1024 ** 3)
-                except Exception:
-                    pass
+            pci_slot = ""
+            device_id = ""
+            try:
+                uevent = (dev / "uevent").read_text()
+                m = re.search(r"PCI_SLOT_NAME=([0-9a-fA-F:.]+)", uevent)
+                if m:
+                    pci_slot = _linux_norm_pci_slot(m.group(1))
+                dm = re.search(r"PCI_ID=[0-9a-fA-F]{4}:([0-9a-fA-F]{4})", uevent)
+                if dm:
+                    device_id = "0x" + dm.group(1).lower()
+            except Exception:
+                pass
+            if not pci_slot:
+                with contextlib.suppress(Exception):
+                    pci_slot = _linux_norm_pci_slot(dev.resolve().name)
 
-            # Verify the busy_percent file is readable (permissions check)
-            busy_file = dev / "gpu_busy_percent"
-            if not busy_file.is_file():
-                logger.warning(
-                    "AMDGPU gpu_busy_percent not found at %s — "
-                    "your amdgpu driver may be too old or the sysfs layout "
-                    "differs.", busy_file,
-                )
-            else:
-                try:
-                    busy_file.read_text()
-                except PermissionError:
+            if pci_slot in seen_slots:
+                continue
+            if pci_slot:
+                seen_slots.add(pci_slot)
+
+            rec = lspci_records.get(pci_slot, {})
+            if not device_id:
+                device_id = str(rec.get("device_id", ""))
+
+            # ── AMD ───────────────────────────────────────────────────────
+            if vendor_hex == "0x1002":
+                vram_file = dev / "mem_info_vram_total"
+                vram_gb = 0.0
+                if vram_file.is_file():
+                    try:
+                        vram_bytes = int(vram_file.read_text().strip())
+                        if vram_bytes > 0:
+                            vram_gb = vram_bytes / (1024 ** 3)
+                    except Exception:
+                        pass
+
+                name = _name_for(pci_slot, "AMD GPU")
+                is_igpu = _amd_is_igpu(name, device_id, vram_gb)
+
+                busy_file = dev / "gpu_busy_percent"
+                if not busy_file.is_file() and not is_igpu:
                     logger.warning(
-                        "Cannot read %s — add your user to the 'video' group "
-                        "and re-login:  sudo usermod -aG video $USER",
-                        busy_file,
+                        "AMDGPU gpu_busy_percent not found at %s — falling back "
+                        "to DRM fdinfo counters when available.", busy_file,
                     )
+                elif busy_file.is_file():
+                    try:
+                        busy_file.read_text()
+                    except PermissionError:
+                        logger.warning(
+                            "Cannot read %s — add your user to the 'video' group "
+                            "and re-login:  sudo usermod -aG video $USER",
+                            busy_file,
+                        )
 
-            gpus.append({
-                "name": gpu_names.get(pci_slot, "AMD GPU"),
-                "card_dir": str(card),
-                "vram_total_gb": vram_gb,
-                "vendor": "amd",
-                "pci_slot": pci_slot,
-                "is_igpu": is_igpu,
-            })
+                gpus.append({
+                    "name": name,
+                    "card_dir": str(card),
+                    "vram_total_gb": vram_gb,
+                    "vendor": "amd",
+                    "pci_slot": pci_slot,
+                    "device_id": device_id,
+                    "is_igpu": is_igpu,
+                })
 
-        # ── NVIDIA ────────────────────────────────────────────────────────
-        elif vendor_hex == "0x10de":
-            gpus.append({
-                "name": gpu_names.get(pci_slot, "NVIDIA GPU"),
-                "card_dir": str(card),
-                "vram_total_gb": 0.0,   # filled by NVML in _init_linux()
-                "vendor": "nvidia",
-                "pci_slot": pci_slot,
-                "is_igpu": False,
-            })
+            # ── NVIDIA ────────────────────────────────────────────────────
+            elif vendor_hex == "0x10de":
+                gpus.append({
+                    "name": _name_for(pci_slot, "NVIDIA GPU"),
+                    "card_dir": str(card),
+                    "vram_total_gb": 0.0,   # filled by NVML in _init_linux()
+                    "vendor": "nvidia",
+                    "pci_slot": pci_slot,
+                    "device_id": device_id,
+                    "is_igpu": False,
+                })
 
-        # ── Intel ─────────────────────────────────────────────────────────
-        elif vendor_hex == "0x8086":
-            gpus.append({
-                "name": gpu_names.get(pci_slot, "Intel GPU"),
-                "card_dir": str(card),
-                "vram_total_gb": 0.0,
-                "vendor": "intel",
-                "pci_slot": pci_slot,
-                "is_igpu": True,
-            })
+            # ── Intel ─────────────────────────────────────────────────────
+            elif vendor_hex == "0x8086":
+                name = _name_for(pci_slot, "Intel GPU")
+                is_arc_dgpu = any(m in name.lower() for m in _ARC_DMODEL)
+                gpus.append({
+                    "name": name,
+                    "card_dir": str(card),
+                    "vram_total_gb": 0.0,
+                    "vendor": "intel",
+                    "pci_slot": pci_slot,
+                    "device_id": device_id,
+                    "is_igpu": not is_arc_dgpu,
+                })
 
-    gpus.sort(key=lambda g: (g.get("is_igpu", False), -g["vram_total_gb"]))
+    # lspci fallback: make every PCI GPU visible even if DRM/sysfs is missing.
+    for slot, rec in lspci_records.items():
+        if slot in seen_slots:
+            continue
+        vendor_id = str(rec.get("vendor_id", "")).lower()
+        name = str(rec.get("name") or "GPU")
+        if vendor_id == "0x1002":
+            vendor = "amd"
+            is_igpu = _amd_is_igpu(name, str(rec.get("device_id", "")), 0.0)
+        elif vendor_id == "0x10de":
+            vendor = "nvidia"
+            is_igpu = False
+        elif vendor_id == "0x8086":
+            vendor = "intel"
+            is_igpu = not any(m in name.lower() for m in _ARC_DMODEL)
+        else:
+            vendor = "gpu"
+            is_igpu = False
+        gpus.append({
+            "name": name,
+            "card_dir": "",
+            "vram_total_gb": 0.0,
+            "vendor": vendor,
+            "pci_slot": slot,
+            "device_id": str(rec.get("device_id", "")),
+            "is_igpu": is_igpu,
+        })
+
+    gpus.sort(key=lambda g: (g.get("is_igpu", False), -float(g.get("vram_total_gb") or 0.0), g.get("pci_slot", "")))
     return gpus
 
 
@@ -365,6 +467,106 @@ def _linux_read_nvidia_gpu(handle) -> Tuple[float, float, float]:
         return (float(util.gpu), mem.used / (1024 ** 3), mem.total / (1024 ** 3))
     except Exception:
         return (0.0, 0.0, 0.0)
+
+
+class _LinuxDrmFdinfoSampler:
+    """Best-effort Linux GPU engine sampler using DRM fdinfo counters.
+
+    nvtop uses DRM-facing sources instead of Ubuntu's generic monitor.  Modern
+    AMD/Intel drivers expose per-client cumulative engine busy time in
+    ``/proc/*/fdinfo/*``.  Sampling deltas gives engine utilisation without
+    depending on a vendor GUI.  Missing permissions/counters simply return 0.
+    """
+
+    def __init__(self) -> None:
+        self._prev_totals: Dict[Tuple[str, str], int] = {}
+        self._prev_t: Optional[float] = None
+        self._cache: Dict[str, dict] = {}
+        self._cache_t: float = 0.0
+
+    @staticmethod
+    def _mem_to_gb(value: str, unit: str) -> float:
+        n = float(value)
+        u = (unit or "").lower()
+        if u in ("kb", "kib"):
+            n *= 1024
+        elif u in ("mb", "mib"):
+            n *= 1024 ** 2
+        elif u in ("gb", "gib"):
+            n *= 1024 ** 3
+        return n / (1024 ** 3)
+
+    @staticmethod
+    def _engine_bucket(engine: str) -> Optional[str]:
+        e = engine.lower()
+        if any(x in e for x in ("render", "gfx", "3d")):
+            return "3d"
+        if "compute" in e or "cuda" in e:
+            return "compute"
+        if any(x in e for x in ("copy", "dma", "sdma", "blt")):
+            return "c0"
+        if any(x in e for x in ("video", "vcn", "uvd", "vce", "jpeg", "codec", "enc", "dec")):
+            return "codec"
+        return None
+
+    def sample(self, min_interval: float = 0.20) -> Dict[str, dict]:
+        now = time.time()
+        if now - self._cache_t < min_interval:
+            return self._cache
+
+        totals: Dict[Tuple[str, str], int] = {}
+        vram_used: Dict[str, float] = {}
+        seen_clients: set = set()
+
+        try:
+            proc = Path("/proc")
+            for pid_dir in proc.glob("[0-9]*"):
+                fdinfo_dir = pid_dir / "fdinfo"
+                if not fdinfo_dir.is_dir():
+                    continue
+                for fdinfo in fdinfo_dir.glob("[0-9]*"):
+                    try:
+                        text = fdinfo.read_text(errors="ignore")
+                    except Exception:
+                        continue
+                    pm = re.search(r"^drm-pdev:\s*([^\s]+)", text, re.M)
+                    if not pm:
+                        continue
+                    slot = _linux_norm_pci_slot(pm.group(1))
+                    cm = re.search(r"^drm-client-id:\s*(\S+)", text, re.M)
+                    client = cm.group(1) if cm else fdinfo.name
+                    uniq = (slot, pid_dir.name, client)
+                    if uniq in seen_clients:
+                        continue
+                    seen_clients.add(uniq)
+
+                    for em in re.finditer(r"^drm-engine-([^:]+):\s*(\d+)\s*ns\b", text, re.M):
+                        bucket = self._engine_bucket(em.group(1))
+                        if bucket:
+                            totals[(slot, bucket)] = totals.get((slot, bucket), 0) + int(em.group(2))
+                    mm = re.search(r"^drm-memory-vram:\s*(\d+)\s*([KMGT]i?B|[KMGT]?B)?", text, re.M | re.I)
+                    if mm:
+                        vram_used[slot] = vram_used.get(slot, 0.0) + self._mem_to_gb(mm.group(1), mm.group(2) or "")
+        except Exception as exc:
+            logger.debug("DRM fdinfo sample failed: %s", exc)
+
+        out: Dict[str, dict] = {}
+        if self._prev_t is not None:
+            dt = max(now - self._prev_t, 0.001)
+            for (slot, bucket), total_ns in totals.items():
+                prev = self._prev_totals.get((slot, bucket), total_ns)
+                util = max(0.0, (total_ns - prev) / (dt * 1_000_000_000.0) * 100.0)
+                d = out.setdefault(slot, {"3d": 0.0, "compute": 0.0, "c0": 0.0, "c1": 0.0, "codec": 0.0, "vram_used_gb": 0.0})
+                d[bucket] = min(d.get(bucket, 0.0) + util, 100.0)
+        for slot, used in vram_used.items():
+            d = out.setdefault(slot, {"3d": 0.0, "compute": 0.0, "c0": 0.0, "c1": 0.0, "codec": 0.0, "vram_used_gb": 0.0})
+            d["vram_used_gb"] = max(d.get("vram_used_gb", 0.0), used)
+
+        self._prev_totals = totals
+        self._prev_t = now
+        self._cache = out
+        self._cache_t = now
+        return out
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HARDWARE DETECTION HELPERS
@@ -667,25 +869,142 @@ def get_wmi_gpu_list() -> List[Tuple[str, bool, float, str]]:
 
 def short_gpu_name(name: str) -> str:
     """Shortens a GPU name to ~22 chars for compact display."""
-    for kw in ('RTX', 'RX ', 'GTX', 'RX', 'Arc', 'Radeon', 'NVIDIA', 'AMD'):
+    for kw in ('RTX', 'RX ', 'GTX', 'RX', 'Arc', 'Radeon', 'NVIDIA', 'AMD', 'Intel'):
         idx = name.find(kw)
         if idx != -1:
             return name[idx:idx + 22].strip()
     return name[:22].strip()
 
 
+def _linux_base_block_name(name: str) -> str:
+    """Return the physical block-device name for a Linux disk or partition."""
+    n = Path(name).name
+    for pat in (r"^(nvme\d+n\d+)", r"^(mmcblk\d+)", r"^(vd[a-z]+)", r"^(xvd[a-z]+)", r"^(sd[a-z]+)", r"^(hd[a-z]+)"):
+        m = re.match(pat, n)
+        if m:
+            return m.group(1)
+    return n
+
+
+def _linux_is_partition_key(key: str) -> bool:
+    """True if a psutil disk key is a partition, false for whole disks."""
+    if key.startswith(("loop", "ram", "zram", "sr")):
+        return True
+    sys_part = Path("/sys/class/block") / key / "partition"
+    if sys_part.exists():
+        return True
+    return bool(re.search(r"(?:nvme\d+n\d+p\d+|mmcblk\d+p\d+|[svxh]d[a-z]+\d+)$", key))
+
+
+def _fmt_linux_size(num_bytes: int) -> str:
+    try:
+        tb = num_bytes / (1000 ** 4)
+        if tb >= 0.95:
+            return f"{tb:.1f} TB"
+        gb = num_bytes / (1000 ** 3)
+        if gb >= 1:
+            return f"{gb:.0f} GB"
+    except Exception:
+        pass
+    return ""
+
+
+def _clean_linux_model(model: str) -> str:
+    s = re.sub(r"\s+", " ", (model or "").strip())
+    s = re.sub(r"\b(NVMe SSD Controller|Non-Volatile memory controller|Device)\b", "", s, flags=re.I)
+    s = re.sub(r"\s+", " ", s).strip(" -_")
+    return s[:28].strip() or "Disk"
+
+
+def _linux_lsblk_disks() -> Dict[str, dict]:
+    """Return lsblk metadata for physical disks keyed by KNAME/NAME."""
+    disks: Dict[str, dict] = {}
+    try:
+        out = subprocess.check_output(
+            ["lsblk", "-J", "-b", "-o", "NAME,KNAME,TYPE,PKNAME,MOUNTPOINTS,LABEL,MODEL,SIZE,ROTA,TRAN,FSTYPE"],
+            text=True, timeout=5, stderr=subprocess.DEVNULL,
+        )
+        data = json.loads(out)
+
+        def _mounts(v) -> List[str]:
+            if not v:
+                return []
+            if isinstance(v, list):
+                return [str(x) for x in v if x]
+            return [x for x in str(v).splitlines() if x]
+
+        def _walk(node: dict) -> Tuple[List[str], List[str]]:
+            labels: List[str] = []
+            mounts = _mounts(node.get("mountpoints"))
+            lab = str(node.get("label") or "").strip()
+            if lab:
+                labels.append(lab)
+            for ch in node.get("children") or []:
+                cl, cm = _walk(ch)
+                labels.extend(cl)
+                mounts.extend(cm)
+            # keep order but remove duplicates
+            labels = list(dict.fromkeys(labels))
+            mounts = list(dict.fromkeys(mounts))
+            return labels, mounts
+
+        for node in data.get("blockdevices") or []:
+            if node.get("type") != "disk":
+                continue
+            kname = str(node.get("kname") or node.get("name") or "").strip()
+            name = str(node.get("name") or kname).strip()
+            if not kname:
+                continue
+            labels, mounts = _walk(node)
+            info = dict(node)
+            info["labels"] = labels
+            info["mounts"] = mounts
+            disks[kname] = info
+            disks[name] = info
+    except Exception as exc:
+        logger.debug("lsblk disk lookup failed: %s", exc)
+    return disks
+
+
+def _linux_drive_label(key: str, info: Optional[dict], fallback_mount: str, data_letter_ord: int) -> str:
+    mounts = list(info.get("mounts") or []) if info else ([fallback_mount] if fallback_mount else [])
+    labels = [str(x).strip() for x in (info.get("labels") or []) if str(x).strip()] if info else []
+    is_system = any(m in ("/", "/usr", "/home", "/home/dawasteh", "/etc", "/bin", "/sbin", "/lib", "/lib64")
+                    or m.startswith("/home/") for m in mounts)
+    if is_system:
+        return "C: Ubuntu"
+
+    media_label = ""
+    for m in mounts:
+        parts = Path(m).parts
+        if len(parts) >= 4 and parts[1] == "run" and parts[2] == "media":
+            media_label = parts[4] if len(parts) >= 5 else Path(m).name
+            break
+        if len(parts) >= 3 and parts[1] == "media":
+            media_label = parts[3] if len(parts) >= 4 else Path(m).name
+            break
+    label = labels[0] if labels else media_label
+    if label:
+        letter = chr(data_letter_ord)
+        return f"{letter}: {label[:24]}"
+
+    model = _clean_linux_model(str(info.get("model") or "")) if info else ""
+    size = _fmt_linux_size(int(info.get("size") or 0)) if info else ""
+    if model and size:
+        return f"{model} {size}"
+    if model:
+        return model
+    return (key.replace('nvme', 'NVMe ').replace('mmcblk', 'SD ').replace('sd', 'Disk ')).strip()
+
+
 def build_drive_info() -> List[Tuple[str, str]]:
     """
     Returns [(psutil_disk_key, display_label), ...] for all physical drives.
 
-    Strategy
-    --------
-    1. Enumerate psutil.disk_io_counters(perdisk=True) keys.
-    2. On Windows + WMI: map PhysicalDriveN → drive-letter(s) via
-       Win32_LogicalDiskToPartition.
-    3. On Linux: filter out partitions, identify base disks, and map
-       mountpoints to Windows-style labels (C:, L: etc.).
-    4. Fall back to friendly key renaming.
+    Windows keeps the original WMI drive-letter mapping.  Linux now uses lsblk
+    and sysfs-style partition checks so only whole physical disks become tiles;
+    labels/mounts are converted to compact Windows-like names (``C: Ubuntu``,
+    ``D: DataLabel``) instead of ambiguous per-partition names.
     """
     result: List[Tuple[str, str]] = []
     try:
@@ -717,60 +1036,30 @@ def build_drive_info() -> List[Tuple[str, str]]:
             except Exception:
                 pass
 
-        # ── Linux mountpoint mapping ──────────────────────────────────────────
-        linux_disk_map: Dict[str, str] = {}
+        linux_disk_mount: Dict[str, str] = {}
+        linux_lsblk = _linux_lsblk_disks() if platform.system() == 'Linux' else {}
         if platform.system() == 'Linux':
             try:
-                for p in psutil.disk_partitions():
-                    dev_path = p.device
-                    # Extract base device (e.g. /dev/sda1 -> sda, /dev/nvme0n1p1 -> nvme0n1)
-                    # We use the device name from Path().name
-                    base_dev = Path(dev_path).name
-                    if 'nvme' in base_dev:
-                        m = re.search(r'(nvme\d+n\d+)', base_dev)
-                        if m: base_dev = m.group(1)
-                    else:
-                        m = re.search(r'([a-z]+)', base_dev)
-                        if m: base_dev = m.group(1)
-
-                    if base_dev not in linux_disk_map:
-                        linux_disk_map[base_dev] = p.mountpoint
+                for p in psutil.disk_partitions(all=False):
+                    base_dev = _linux_base_block_name(p.device)
+                    linux_disk_mount.setdefault(base_dev, p.mountpoint)
             except Exception:
                 pass
 
+        next_data_letter = ord('D')
         for key in sorted(io.keys()):
             if platform.system() == 'Linux':
-                # Skip loop devices
-                if key.startswith('loop'):
+                if _linux_is_partition_key(key):
                     continue
-
-                # Distinguish base devices from partitions
-                # NVMe base: nvme0n1 | Partition: nvme0n1p1
-                # SATA base: sda | Partition: sda1
-                is_partition = False
-                if 'nvme' in key:
-                    if re.search(r'p\d+$', key):
-                        is_partition = True
-                else:
-                    if re.search(r'\d+$', key):
-                        is_partition = True
-
-                if is_partition:
+                if linux_lsblk and key not in linux_lsblk:
+                    # psutil can expose device-mapper/loop/partition counters;
+                    # keep only real lsblk disks when metadata is available.
                     continue
-
-                mount = linux_disk_map.get(key, "Unknown")
-
-                # Windows-style mapping for the user's specific system
-                if "Zwischenspeicher" in mount:
-                    label = "H: Zwischenspeicher"
-                elif mount in ("/", "/home", "/usr") or any(m in mount for m in ("/home", "/usr")):
-                    label = "C: System"
-                else:
-                    # Fallback: cleaner name
-                    label = (key
-                             .replace('nvme', 'NVMe ')
-                             .replace('sd', 'Disk ')
-                             .strip())
+                label = _linux_drive_label(
+                    key, linux_lsblk.get(key), linux_disk_mount.get(key, ""), next_data_letter,
+                )
+                if not label.startswith("C:"):
+                    next_data_letter += 1
             else:
                 # Windows path (original logic)
                 if key in letter_map:
@@ -855,6 +1144,7 @@ class HardwareMonitorThread(QThread):
         # Linux-specific fields
         self._linux_gpus:     List[dict] = []
         self._nvml_handles:   Dict[str, any] = {}
+        self._linux_fdinfo:   Optional[_LinuxDrmFdinfoSampler] = None
 
         if self._is_linux:
             self._init_linux()
@@ -864,19 +1154,33 @@ class HardwareMonitorThread(QThread):
     # ── Linux init ─────────────────────────────────────────────────────────
     def _init_linux(self) -> None:
         self._linux_gpus = _linux_detect_gpus()
+        self._linux_fdinfo = _LinuxDrmFdinfoSampler()
 
-        # Fill NVIDIA VRAM via NVML if available
+        # Fill NVIDIA VRAM via NVML if available.  Match by PCI bus-id first;
+        # handle index order is not guaranteed to match DRM card order.
         if NVML_AVAILABLE:
             try:
+                by_slot: Dict[str, any] = {}
+                dev_count = pynvml.nvmlDeviceGetCount()          # type: ignore
+                for idx in range(dev_count):
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(idx)  # type: ignore
+                    with contextlib.suppress(Exception):
+                        pci = pynvml.nvmlDeviceGetPciInfo(handle)    # type: ignore
+                        bus_id = pci.busId.decode() if isinstance(pci.busId, bytes) else str(pci.busId)
+                        by_slot[_linux_norm_pci_slot(bus_id)] = handle
                 nvidia_idx = 0
-                dev_count  = pynvml.nvmlDeviceGetCount()          # type: ignore
                 for gpu in self._linux_gpus:
-                    if gpu["vendor"] == "nvidia" and nvidia_idx < dev_count:
+                    if gpu["vendor"] != "nvidia":
+                        continue
+                    handle = by_slot.get(_linux_norm_pci_slot(gpu.get("pci_slot", "")))
+                    if handle is None and nvidia_idx < dev_count:
                         handle = pynvml.nvmlDeviceGetHandleByIndex(nvidia_idx)  # type: ignore
-                        self._nvml_handles[gpu["card_dir"]] = handle
+                    nvidia_idx += 1
+                    if handle is not None:
+                        handle_key = gpu.get("card_dir") or gpu.get("pci_slot") or str(nvidia_idx)
+                        self._nvml_handles[handle_key] = handle
                         mem = pynvml.nvmlDeviceGetMemoryInfo(handle)            # type: ignore
                         gpu["vram_total_gb"] = mem.total / (1024 ** 3)
-                        nvidia_idx += 1
             except Exception as exc:
                 logger.debug("NVML init: %s", exc)
 
@@ -889,13 +1193,16 @@ class HardwareMonitorThread(QThread):
                 if self._igpu_info is None:
                     self._igpu_info = gpu
             else:
+                vram = float(gpu.get("vram_total_gb") or 0.0)
+                if vram <= 0 and gpu.get("vendor") in ("amd", "nvidia"):
+                    vram = 8.0
                 self._dgpu_info.append((
                     gpu["name"],
-                    gpu["vram_total_gb"],
+                    vram,
                     gpu.get("pci_slot", ""),
                 ))
 
-        if not self._dgpu_info:
+        if not self._dgpu_info and not self._igpu_info:
             self._dgpu_info = [("GPU", 8.0, "")]
 
     # ── Windows init (original code, untouched logic) ──────────────────────
@@ -973,9 +1280,14 @@ class HardwareMonitorThread(QThread):
                 ram       = psutil.virtual_memory()
 
                 # ── GPU (Linux-specific) ───────────────────────────────────
+                fdinfo = self._linux_fdinfo.sample() if self._linux_fdinfo is not None else {}
                 gpus: List[GPUMetrics] = []
                 for name, vram_total, dev_id in self._dgpu_info:
                     gpu_util  = 0.0
+                    compute_util = 0.0
+                    copy0_util = 0.0
+                    copy1_util = 0.0
+                    codec_util = 0.0
                     vram_used = 0.0
 
                     # Find matching Linux GPU entry
@@ -993,31 +1305,46 @@ class HardwareMonitorThread(QThread):
                             linux_gpu = dgpus_only[idx]
 
                     if linux_gpu is not None:
+                        slot = _linux_norm_pci_slot(linux_gpu.get("pci_slot", ""))
+                        fd = fdinfo.get(slot, {}) if slot else {}
+                        compute_util = float(fd.get("compute", 0.0))
+                        copy0_util = float(fd.get("c0", 0.0))
+                        copy1_util = float(fd.get("c1", 0.0))
+                        codec_util = float(fd.get("codec", 0.0))
                         if linux_gpu["vendor"] == "amd":
-                            gpu_util  = _linux_read_amd_gpu_busy(linux_gpu["card_dir"])
-                            vram_used, vram_total_actual = _linux_read_amd_vram(linux_gpu["card_dir"])
+                            gpu_util  = _linux_read_amd_gpu_busy(linux_gpu.get("card_dir", ""))
+                            if gpu_util <= 0:
+                                gpu_util = float(fd.get("3d", 0.0))
+                            vram_used, vram_total_actual = _linux_read_amd_vram(linux_gpu.get("card_dir", ""))
+                            if vram_used <= 0:
+                                vram_used = float(fd.get("vram_used_gb", 0.0))
                             if vram_total_actual > 0:
                                 vram_total = vram_total_actual
                         elif linux_gpu["vendor"] == "nvidia":
-                            handle = self._nvml_handles.get(linux_gpu["card_dir"])
+                            handle = self._nvml_handles.get(linux_gpu.get("card_dir") or "")
+                            if handle is None:
+                                handle = self._nvml_handles.get(linux_gpu.get("pci_slot") or "")
                             if handle is not None:
                                 gpu_util, vram_used, vram_total_nv = _linux_read_nvidia_gpu(handle)
                                 if vram_total_nv > 0:
                                     vram_total = vram_total_nv
+                        elif linux_gpu["vendor"] == "intel":
+                            gpu_util = float(fd.get("3d", 0.0))
+                            vram_used = float(fd.get("vram_used_gb", 0.0))
 
                     gpus.append(GPUMetrics(
                         name=name,
                         luid="",
                         gpu_3d_percent=gpu_util,
-                        gpu_compute_percent=0.0,
-                        gpu_copy0_percent=0.0,
-                        gpu_copy1_percent=0.0,
-                        gpu_codec_percent=0.0,
+                        gpu_compute_percent=compute_util,
+                        gpu_copy0_percent=copy0_util,
+                        gpu_copy1_percent=copy1_util,
+                        gpu_codec_percent=codec_util,
                         gpu_vram_used_gb=min(vram_used, vram_total),
                         gpu_vram_total_gb=vram_total,
                     ))
 
-                if not gpus:
+                if not gpus and self._dgpu_info:
                     gpus = [GPUMetrics(
                         name=self._dgpu_info[0][0], luid="",
                         gpu_vram_total_gb=self._dgpu_info[0][1],
@@ -1026,8 +1353,14 @@ class HardwareMonitorThread(QThread):
                 # ── iGPU Utilization ─────────────────────────────────────────
                 igpu_util = 0.0
                 if self._igpu_info:
-                    # Most Intel/AMD iGPUs expose gpu_busy_percent in sysfs
-                    igpu_util = _linux_read_amd_gpu_busy(self._igpu_info["card_dir"])
+                    slot = _linux_norm_pci_slot(self._igpu_info.get("pci_slot", ""))
+                    fd = fdinfo.get(slot, {}) if slot else {}
+                    # AMD/Xe may expose gpu_busy_percent; Intel i915 usually
+                    # needs DRM fdinfo.  Use the hottest engine as the single
+                    # iGPU tile value.
+                    igpu_util = _linux_read_amd_gpu_busy(self._igpu_info.get("card_dir", ""))
+                    igpu_util = max(igpu_util, float(fd.get("3d", 0.0)), float(fd.get("compute", 0.0)),
+                                    float(fd.get("c0", 0.0)), float(fd.get("codec", 0.0)))
 
                 self.metrics_updated.emit(SystemMetrics(
                     cpu_total_percent=cpu_total,
@@ -2961,7 +3294,7 @@ def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD  v1.6
+# MAIN DASHBOARD  v1.8
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TricorderDashboard(QMainWindow):
@@ -2976,7 +3309,7 @@ class TricorderDashboard(QMainWindow):
         except Exception:
             pass
 
-        self.setWindowTitle("System Tricorder v1.6")
+        self.setWindowTitle("System Tricorder v1.8")
         # Scale minimum size by DPI — 1280×720 is the logical 100% DPI size
         _min_w = int(1280 * _DP_SCALE) if _DP_SCALE > 0 else 1280
         _min_h = int(720 * _DP_SCALE) if _DP_SCALE > 0 else 720
@@ -3012,7 +3345,14 @@ class TricorderDashboard(QMainWindow):
     def _analyze_hardware(self) -> None:
         self.c_physical = psutil.cpu_count(logical=False) or 4
         self.c_logical  = psutil.cpu_count(logical=True)  or 4
-        self.is_amd     = "AMD" in platform.processor()
+        cpu_brand = platform.processor()
+        if platform.system() == 'Linux':
+            with contextlib.suppress(Exception):
+                txt = Path('/proc/cpuinfo').read_text(errors='ignore')
+                m = re.search(r'^(?:model name|Hardware|Processor|vendor_id)\s*:\s*(.+)$', txt, re.M)
+                if m:
+                    cpu_brand = m.group(1)
+        self.is_amd     = "AMD" in cpu_brand or "AuthenticAMD" in cpu_brand
 
         self.is_hybrid  = False
         self.has_ht     = False
@@ -3071,27 +3411,49 @@ class TricorderDashboard(QMainWindow):
             except Exception:
                 pass
 
-        wmi_gpus  = get_wmi_gpu_list()
-        reg_vrams = get_registry_gpu_vrams()
-        dgpu_wmi  = [(n, v, p) for n, ig, v, p in wmi_gpus if not ig]
-
-        # iGPU tile is only meaningful when the hardware actually exists.
-        # On a desktop AMD CPU (e.g. Ryzen 5800X3D) there is no iGPU, so it
-        # must not be created — otherwise it shows up as an empty 0% tile and as
-        # restorable options in the "Add Tile" dialog.
-        self.has_igpu = any(ig for _, ig, _, _ in wmi_gpus)
-
         self.detected_gpus: List[Tuple[str, float, str]] = []
-        for i, (name, wv, pnp_id) in enumerate(dgpu_wmi):
-            vram = reg_vrams[i] if i < len(reg_vrams) else (math.ceil(wv) if wv >= 1.0 else 8.0)
-            # Extract device ID from PNPDeviceID
-            dev_id = ""
-            dev_match = re.search(r'DEV_([0-9A-Fa-f]{4})', pnp_id)
-            if dev_match:
-                dev_id = "0x" + dev_match.group(1).upper()
-            self.detected_gpus.append((name, float(vram), dev_id))
-        if not self.detected_gpus:
-            self.detected_gpus = [("GPU", reg_vrams[0], "")]
+        if platform.system() == 'Linux':
+            linux_gpus = _linux_detect_gpus()
+            self.has_igpu = any(g.get("is_igpu", False) for g in linux_gpus)
+            for g in linux_gpus:
+                if g.get("is_igpu", False):
+                    continue
+                vram = float(g.get("vram_total_gb") or 0.0)
+                # Keep a sane display total until NVML/sysfs fills the real value.
+                if vram <= 0 and g.get("vendor") in ("amd", "nvidia"):
+                    vram = 8.0
+                self.detected_gpus.append((
+                    str(g.get("name") or "GPU"),
+                    vram,
+                    str(g.get("pci_slot") or g.get("device_id") or ""),
+                ))
+            # If the machine really has no separately detected dGPU, do not add
+            # a fake Linux dGPU tile beside the real iGPU tile.  If GPU
+            # detection failed entirely, keep the old fallback so the UI still
+            # has a GPU section instead of crashing.
+            if not self.detected_gpus and not self.has_igpu:
+                self.detected_gpus = [("GPU", 8.0, "")]
+        else:
+            wmi_gpus  = get_wmi_gpu_list()
+            reg_vrams = get_registry_gpu_vrams()
+            dgpu_wmi  = [(n, v, p) for n, ig, v, p in wmi_gpus if not ig]
+
+            # iGPU tile is only meaningful when the hardware actually exists.
+            # On a desktop AMD CPU (e.g. Ryzen 5800X3D) there is no iGPU, so it
+            # must not be created — otherwise it shows up as an empty 0% tile and as
+            # restorable options in the "Add Tile" dialog.
+            self.has_igpu = any(ig for _, ig, _, _ in wmi_gpus)
+
+            for i, (name, wv, pnp_id) in enumerate(dgpu_wmi):
+                vram = reg_vrams[i] if i < len(reg_vrams) else (math.ceil(wv) if wv >= 1.0 else 8.0)
+                # Extract device ID from PNPDeviceID
+                dev_id = ""
+                dev_match = re.search(r'DEV_([0-9A-Fa-f]{4})', pnp_id)
+                if dev_match:
+                    dev_id = "0x" + dev_match.group(1).upper()
+                self.detected_gpus.append((name, float(vram), dev_id))
+            if not self.detected_gpus:
+                self.detected_gpus = [("GPU", reg_vrams[0], "")]
 
         self._drive_info: List[Tuple[str, str]] = build_drive_info()
         if not self._drive_info:
@@ -3116,7 +3478,7 @@ class TricorderDashboard(QMainWindow):
 
         title = QLabel(
             "📊  System Tricorder  "
-            f"<span style='font-size: {font_size(18)}; color:#00aa55;'>v1.6</span>"
+            f"<span style='font-size: {font_size(18)}; color:#00aa55;'>v1.8</span>"
         )
         title.setStyleSheet(
             f"font-size: {font_size(28)}; font-weight: bold; color: #00ff88; background: transparent;")

@@ -1,10 +1,10 @@
 # 📊 System Tricorder
 
-> A real-time hardware monitoring dashboard for Windows — dark mode, 30 FPS, fully customisable free-form layout.
+> A real-time hardware monitoring dashboard for Windows and Ubuntu/Linux — dark mode, 30 FPS, fully customisable free-form layout.
 
-![Version](https://img.shields.io/badge/version-1.1-00ff88?style=flat-square)
+![Version](https://img.shields.io/badge/version-1.8-00ff88?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square)
-![Platform](https://img.shields.io/badge/platform-Windows-lightgrey?style=flat-square)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Ubuntu-lightgrey?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 
 ---
@@ -31,7 +31,7 @@ pip install PyQt6 psutil pywin32
 python system_tricorder.py
 ```
 
-> ⚠️ Windows only. GPU utilisation, VRAM, and RAM-type detection rely on WMI and the Windows Registry.
+> ℹ️ Windows uses WMI/Registry/PDH for hardware counters. Ubuntu/Linux uses psutil, lspci, DRM sysfs/fdinfo and optional NVML for GPU counters.
 
 ---
 
@@ -167,6 +167,13 @@ Delete the file to reset to factory defaults.
 ---
 
 ## 🗂️ Changelog
+
+### v1.8
+
+- **Ubuntu/Linux GPU parity** — Linux now enumerates GPUs through DRM/sysfs with `lspci` fallback, so multiple AMD/NVIDIA dGPUs plus Intel iGPU are visible like on Windows.
+- **nvtop-style Linux utilisation sources** — AMD uses `gpu_busy_percent` with DRM `fdinfo` fallback; Intel iGPU and engine tiles use DRM `fdinfo`; NVIDIA is matched through NVML by PCI bus id.
+- **Linux drive tiles fixed** — Ubuntu no longer creates one tile per partition; tiles are filtered to whole physical disks and get compact labels like `C: Ubuntu` / `H: Zwischenspeicher`.
+- **Windows behavior preserved** — Windows WMI/Registry/PDH code paths remain isolated and unchanged.
 
 ### v1.1
 

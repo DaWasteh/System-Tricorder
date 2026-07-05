@@ -3292,6 +3292,87 @@ def _short_sha(sha: str) -> str:
     return sha[:7] if sha else "unknown"
 
 
+def _build_rebuild_bat(repo_root: Path, exe_path: Path, pid: int, log_path: Path) -> str:
+    """Build the Windows .bat that rebuilds the noconsole EXE and relaunches it.
+
+    The helper waits for `pid` (the currently running Tricorder process) to
+    exit so the .exe file lock is released, ensures a `.venv` exists (creating
+    one in the repo folder if necessary), refreshes requirements + PyInstaller,
+    rebuilds the `--noconsole --onefile` EXE as documented in the README,
+    relaunches it, logs everything to `log_path`, and finally self-deletes.
+
+    Only invoked on Windows when running from a frozen PyInstaller build.
+    """
+    lines = [
+        "@echo off",
+        "setlocal enableextensions",
+        f'set "REPO={repo_root}"',
+        f'set "PID={pid}"',
+        f'set "EXE={exe_path}"',
+        f'set "LOG={log_path}"',
+        'set "PYEXE=%REPO%\\.venv\\Scripts\\python.exe"',
+        'echo [%date% %time%] tricorder rebuild helper started >> "%LOG%"',
+        "",
+        "REM --- Wait for the running Tricorder process to exit (max ~90s, then force-kill) ---",
+        "set /a WAIT_N=0",
+        ":waitloop",
+        'tasklist /FI "PID eq %PID%" 2>NUL | find "%PID%" >NUL',
+        "if errorlevel 1 goto procgone",
+        "set /a WAIT_N+=1",
+        "if %WAIT_N% GEQ 90 goto forcekill",
+        "ping 127.0.0.1 -n 2 >NUL",
+        "goto waitloop",
+        ":forcekill",
+        'echo [%date% %time%] force-killing PID %PID% >> "%LOG%"',
+        "taskkill /PID %PID% /F >NUL 2>&1",
+        ":procgone",
+        'echo [%date% %time%] process gone, starting build >> "%LOG%"',
+        "",
+        "REM --- Ensure .venv exists (create one in the repo folder if missing) ---",
+        'if not exist "%PYEXE%" (',
+        '    echo [%date% %time%] creating .venv >> "%LOG%"',
+        '    py -3 -m venv "%REPO%\\.venv" >> "%LOG%" 2>&1',
+        "    if errorlevel 1 (",
+        '        echo [%date% %time%] py launcher failed, trying python >> "%LOG%"',
+        '        python -m venv "%REPO%\\.venv" >> "%LOG%" 2>&1',
+        "    )",
+        ")",
+        'if not exist "%PYEXE%" (',
+        '    echo [%date% %time%] ERROR: no .venv python found, aborting rebuild >> "%LOG%"',
+        "    goto cleanup",
+        ")",
+        "",
+        "REM --- Refresh deps + PyInstaller (requirements may have changed upstream) ---",
+        'echo [%date% %time%] installing requirements + pyinstaller >> "%LOG%"',
+        '"%PYEXE%" -m pip install --upgrade pip >> "%LOG%" 2>&1',
+        '"%PYEXE%" -m pip install -r "%REPO%\\requirements.txt" pyinstaller >> "%LOG%" 2>&1',
+        "",
+        "REM --- Build the noconsole onefile EXE (matches README) ---",
+        'echo [%date% %time%] building EXE >> "%LOG%"',
+        'pushd "%REPO%"',
+        '"%PYEXE%" -m PyInstaller --noconsole --onefile system_tricorder.py >> "%LOG%" 2>&1',
+        'set "BUILDRC=%errorlevel%"',
+        "popd",
+        'if not "%BUILDRC%"=="0" (',
+        '    echo [%date% %time%] ERROR: PyInstaller failed (rc=%BUILDRC%) >> "%LOG%"',
+        "    goto cleanup",
+        ")",
+        "",
+        "REM --- Relaunch the EXE if it exists ---",
+        'if exist "%EXE%" (',
+        '    echo [%date% %time%] relaunching %EXE% >> "%LOG%"',
+        '    start "" "%EXE%"',
+        ") else (",
+        '    echo [%date% %time%] WARNING: %EXE% missing after build >> "%LOG%"',
+        ")",
+        "",
+        ":cleanup",
+        'echo [%date% %time%] helper done, self-deleting >> "%LOG%"',
+        '(goto) 2>NUL & del "%~f0"',
+    ]
+    return "\r\n".join(lines) + "\r\n"
+
+
 class UpdateWorker(QThread):
     """Checks GitHub and fast-forward-updates the local git checkout.
 
@@ -3301,8 +3382,12 @@ class UpdateWorker(QThread):
     """
 
     update_finished = pyqtSignal(bool, str)
+    # Set by _check_and_install() when a git pull changed Python source files.
+    # The dashboard reads this to decide whether to trigger an EXE rebuild.
+    rebuild_needed: bool = False
 
     def run(self) -> None:                                                # type: ignore[override]
+        self.rebuild_needed = False
         try:
             ok, message = self._check_and_install()
         except Exception as exc:
@@ -3374,13 +3459,34 @@ class UpdateWorker(QThread):
 
         self._run_git(repo_root, ["pull", "--ff-only", "--autostash", GITHUB_REPO_URL, remote_branch], timeout=180)
         new_sha = self._run_git(repo_root, ["rev-parse", "HEAD"])
+        py_changed = self._python_files_changed(repo_root, current_sha, new_sha)
+        self.rebuild_needed = py_changed
+        if py_changed:
+            extra = " Python-Code hat sich geaendert - die EXE wird nach dem Neustart automatisch neu gebaut."
+        else:
+            extra = " Keine .py-Aenderungen - kein EXE-Rebuild noetig."
         return (
             True,
             "Update installiert: "
-            f"{_short_sha(current_sha)} → {_short_sha(new_sha)}. "
-            f"Lokale Settings wurden nicht verändert ({CONFIG_FILE}). "
-            "Bitte System Tricorder neu starten, damit der neue Code läuft.",
+            f"{_short_sha(current_sha)} -> {_short_sha(new_sha)}. "
+            f"Lokale Settings wurden nicht veraendert ({CONFIG_FILE})."
+            + extra,
         )
+
+    def _python_files_changed(self, repo_root: Path, old_sha: str, new_sha: str) -> bool:
+        """Return True if any .py file changed between old_sha and new_sha.
+
+        Used to decide whether an (expensive) EXE rebuild is necessary after
+        a fast-forward pull.  Non-code changes (README, docs, images) return
+        False so we skip the 1-3 minute PyInstaller build.
+        """
+        if not old_sha or not new_sha or old_sha == new_sha:
+            return False
+        try:
+            out = self._run_git(repo_root, ["diff", "--name-only", old_sha, new_sha], timeout=30)
+        except Exception:
+            return True  # if the diff fails, assume a rebuild is safer
+        return any(line.strip().lower().endswith(".py") for line in out.splitlines())
 
 
 def section_label(html: str) -> QLabel:
@@ -3788,13 +3894,70 @@ class TricorderDashboard(QMainWindow):
         self._btn_update.setEnabled(True)
         self._btn_update.setText("⬇  Update")
         worker = self._update_worker
+        rebuild_needed = bool(worker is not None and getattr(worker, "rebuild_needed", False))
         self._update_worker = None
         if worker is not None:
             worker.deleteLater()
-        if ok:
-            QMessageBox.information(self, "System Tricorder Update", message)
-        else:
+        if not ok:
             QMessageBox.warning(self, "System Tricorder Update", message)
+            return
+        # Successful update.  If we're running from a frozen EXE and the pull
+        # changed Python source, trigger a hands-off rebuild: spawn a detached
+        # helper .bat that waits for us to exit, rebuilds via PyInstaller, and
+        # relaunches the new EXE.
+        if rebuild_needed and getattr(sys, "frozen", False):
+            QMessageBox.information(
+                self, "System Tricorder Update",
+                message + "\n\nDer EXE-Rebuild startet jetzt: diese App schliesst "
+                "sich, baut die neue system_tricorder.exe (ca. 1-3 Min) und "
+                "startet sie danach automatisch neu. Details stehen in der "
+                "Datei tricorder_rebuild_<pid>.log im TEMP-Ordner.",
+            )
+            if self._spawn_rebuild_and_restart():
+                self.close()  # releases the .exe lock so PyInstaller can overwrite it
+            else:
+                QMessageBox.warning(
+                    self, "System Tricorder Update",
+                    "Der automatische Rebuild konnte nicht gestartet werden. "
+                    "Bitte System Tricorder manuell schliessen und neu bauen:\n"
+                    ".venv\\Scripts\\python.exe -m PyInstaller --noconsole "
+                    "--onefile system_tricorder.py",
+                )
+        else:
+            QMessageBox.information(self, "System Tricorder Update", message)
+
+    def _spawn_rebuild_and_restart(self) -> bool:
+        """Spawn a detached helper .bat (Windows) that rebuilds the noconsole
+        EXE after this process exits and relaunches it.  Returns True on
+        successful launch of the helper."""
+        try:
+            repo_root = _find_git_checkout(_app_start_dir())
+            if repo_root is None:
+                return False
+            exe_path = Path(sys.executable).resolve()
+            pid = os.getpid()
+            tmp_dir = Path(os.environ.get("TEMP", str(repo_root)))
+            bat_path = tmp_dir / f"tricorder_rebuild_{pid}.bat"
+            log_path = tmp_dir / f"tricorder_rebuild_{pid}.log"
+            bat_text = _build_rebuild_bat(repo_root, exe_path, pid, log_path)
+            bat_path.write_text(bat_text)  # default locale encoding; repo paths are ASCII here
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            CREATE_NO_WINDOW = 0x08000000
+            subprocess.Popen(
+                ["cmd.exe", "/c", str(bat_path)],
+                cwd=str(repo_root),
+                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+                close_fds=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            logger.info("Rebuild helper spawned (log: %s)", log_path)
+            return True
+        except Exception as exc:
+            logger.warning("Rebuild helper spawn failed: %s", exc)
+            return False
 
     def _on_edit_toggled(self, active: bool) -> None:
         self._tile_grid.set_edit_mode(active)

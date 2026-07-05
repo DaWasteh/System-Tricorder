@@ -2,7 +2,7 @@
 
 > A real-time hardware monitoring dashboard for Windows and Ubuntu/Linux — dark mode, 30 FPS, fully customisable free-form layout.
 
-![Version](https://img.shields.io/badge/version-1.8-00ff88?style=flat-square)
+![Version](https://img.shields.io/badge/version-1.9-00ff88?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Ubuntu-lightgrey?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
@@ -48,6 +48,8 @@ pyinstaller --noconsole --onefile system_tricorder.py
 
 Press **✏ Edit Layout** in the toolbar to enter edit mode. All tiles highlight with a yellow accent border and gain two overlay buttons.
 
+Press **⬇ Update** to check GitHub for a newer version and install it via a fast-forward `git pull`. Your local layout/settings file (`~/.tricorder_layout.json`) is stored outside the repo and is not overwritten.
+
 ### Controls on each tile
 
 | Button | Position | Action |
@@ -63,6 +65,12 @@ Press **✏ Edit Layout** in the toolbar to enter edit mode. All tiles highlight
 | **‹ / ›** | Decrease / increase the minimum row height |
 | **↺ Reset** | Restores the factory default layout and clears all row breaks |
 | **✔ Fertig** | Leave edit mode — layout is saved automatically |
+
+### Update control
+
+| Button | Action |
+|--------|--------|
+| **⬇ Update** | Checks `DaWasteh/System-Tricorder` on GitHub and installs available updates without touching `~/.tricorder_layout.json` |
 
 ### Arranging tiles freely
 
@@ -168,6 +176,12 @@ Delete the file to reset to factory defaults.
 
 ## 🗂️ Changelog
 
+### v1.9
+
+- **Update button** — new toolbar button checks GitHub for newer commits and installs them with a safe fast-forward `git pull`.
+- **Settings stay local** — the updater never writes or resets `~/.tricorder_layout.json`, so layouts/window settings survive updates.
+- **Idea credit** — thanks to [nextscript](https://github.com/nextscript) for the update-button idea.
+
 ### v1.8
 
 - **Ubuntu/Linux GPU parity** — Linux now enumerates GPUs through DRM/sysfs with `lspci` fallback, so multiple AMD/NVIDIA dGPUs plus Intel iGPU are visible like on Windows.
@@ -257,6 +271,12 @@ Delete the file to reset to factory defaults.
 ### v0.1 *(initial release)*
 
 - Basic 2×5 global metrics grid, per-thread CPU graphs, single GPU, dark mode 20 FPS
+
+---
+
+## 🙏 Thanks
+
+Thanks to [nextscript](https://github.com/nextscript) for the update-button idea.
 
 ---
 

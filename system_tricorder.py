@@ -96,7 +96,7 @@ def set_font_size(label: "QLabel", pt: float, **kwargs) -> None:
 from PyQt6.QtWidgets import (                                       # type: ignore
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QFrame, QGridLayout, QSizePolicy, QPushButton,
-    QScrollArea, QDialog, QCheckBox, QDialogButtonBox,
+    QScrollArea, QDialog, QCheckBox, QDialogButtonBox, QMessageBox,
 )
 from PyQt6.QtCore  import Qt, QTimer, pyqtSignal, QThread, QMimeData, QPoint, QSize, QByteArray  # type: ignore
 from PyQt6.QtGui   import (                                         # type: ignore
@@ -134,6 +134,8 @@ except ImportError:
 # ── Layout / window config ────────────────────────────────────────────────────
 CONFIG_FILE = Path.home() / ".tricorder_layout.json"
 CONFIG_VERSION = "0.8"
+APP_VERSION = "1.9"
+GITHUB_REPO_URL = "https://github.com/DaWasteh/System-Tricorder.git"
 
 
 def _load_config_file() -> dict:
@@ -3271,6 +3273,118 @@ class CollapsibleSection(QWidget):
 # HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _app_start_dir() -> Path:
+    """Return the directory the app was launched from (source or frozen exe)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _find_git_checkout(start: Path) -> Optional[Path]:
+    """Find the nearest parent directory that is a git checkout."""
+    for candidate in (start, *start.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def _short_sha(sha: str) -> str:
+    return sha[:7] if sha else "unknown"
+
+
+class UpdateWorker(QThread):
+    """Checks GitHub and fast-forward-updates the local git checkout.
+
+    User settings live in CONFIG_FILE under the home directory and are never
+    touched by this updater.  We intentionally use a fast-forward git pull
+    instead of reset/checkout so local source changes are not overwritten.
+    """
+
+    update_finished = pyqtSignal(bool, str)
+
+    def run(self) -> None:                                                # type: ignore[override]
+        try:
+            ok, message = self._check_and_install()
+        except Exception as exc:
+            ok = False
+            message = f"Update fehlgeschlagen: {exc}"
+        self.update_finished.emit(ok, message)
+
+    def _run_git(self, repo_root: Path, args: List[str], timeout: int = 60) -> str:
+        cmd = ["git", "-C", str(repo_root), *args]
+        proc = subprocess.run(
+            cmd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        if proc.returncode != 0:
+            raise RuntimeError(err or out or f"git {' '.join(args)} returned {proc.returncode}")
+        return out
+
+    def _remote_sha_for_branch(self, branch: str) -> Tuple[str, str]:
+        refs = [f"refs/heads/{branch}"] if branch else []
+        if branch != "main":
+            refs.append("refs/heads/main")
+        refs.append("HEAD")
+
+        last_error = ""
+        for ref in refs:
+            proc = subprocess.run(
+                ["git", "ls-remote", GITHUB_REPO_URL, ref],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+                check=False,
+            )
+            if proc.returncode != 0:
+                last_error = (proc.stderr or proc.stdout or "").strip()
+                continue
+            line = (proc.stdout or "").strip().splitlines()
+            if not line:
+                continue
+            sha = line[0].split()[0].strip()
+            resolved_branch = branch if ref == f"refs/heads/{branch}" else "main"
+            return sha, resolved_branch
+        raise RuntimeError(last_error or "GitHub-Remote konnte nicht gelesen werden")
+
+    def _check_and_install(self) -> Tuple[bool, str]:
+        repo_root = _find_git_checkout(_app_start_dir())
+        if repo_root is None:
+            return (
+                False,
+                "Kein lokaler Git-Checkout gefunden. Der Update-Button kann "
+                "nur Installationen aktualisieren, die aus dem GitHub-Repo "
+                "geklont wurden. Deine lokalen Settings bleiben unverändert.",
+            )
+
+        branch = self._run_git(repo_root, ["branch", "--show-current"]) or "main"
+        current_sha = self._run_git(repo_root, ["rev-parse", "HEAD"])
+        remote_sha, remote_branch = self._remote_sha_for_branch(branch)
+
+        if current_sha == remote_sha:
+            return (
+                True,
+                f"System Tricorder ist aktuell ({_short_sha(current_sha)}). "
+                f"Lokale Settings bleiben in {CONFIG_FILE}.",
+            )
+
+        self._run_git(repo_root, ["pull", "--ff-only", "--autostash", GITHUB_REPO_URL, remote_branch], timeout=180)
+        new_sha = self._run_git(repo_root, ["rev-parse", "HEAD"])
+        return (
+            True,
+            "Update installiert: "
+            f"{_short_sha(current_sha)} → {_short_sha(new_sha)}. "
+            f"Lokale Settings wurden nicht verändert ({CONFIG_FILE}). "
+            "Bitte System Tricorder neu starten, damit der neue Code läuft.",
+        )
+
+
 def section_label(html: str) -> QLabel:
     lbl = QLabel(html)
     lbl.setStyleSheet("background: transparent; padding: 2px 0;")
@@ -3294,7 +3408,7 @@ def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD  v1.8
+# MAIN DASHBOARD  v1.9
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TricorderDashboard(QMainWindow):
@@ -3309,7 +3423,7 @@ class TricorderDashboard(QMainWindow):
         except Exception:
             pass
 
-        self.setWindowTitle("System Tricorder v1.8")
+        self.setWindowTitle(f"System Tricorder v{APP_VERSION}")
         # Scale minimum size by DPI — 1280×720 is the logical 100% DPI size
         _min_w = int(1280 * _DP_SCALE) if _DP_SCALE > 0 else 1280
         _min_h = int(720 * _DP_SCALE) if _DP_SCALE > 0 else 720
@@ -3478,7 +3592,7 @@ class TricorderDashboard(QMainWindow):
 
         title = QLabel(
             "📊  System Tricorder  "
-            f"<span style='font-size: {font_size(18)}; color:#00aa55;'>v1.8</span>"
+            f"<span style='font-size: {font_size(18)}; color:#00aa55;'>v{APP_VERSION}</span>"
         )
         title.setStyleSheet(
             f"font-size: {font_size(28)}; font-weight: bold; color: #00ff88; background: transparent;")
@@ -3499,6 +3613,7 @@ class TricorderDashboard(QMainWindow):
         hdr.addStretch()
 
         # ── Edit-mode toolbar ─────────────────────────────────────────────────
+        self._btn_update = _toolbar_btn("⬇  Update")
         self._btn_edit  = _toolbar_btn("✏  Edit Layout", checkable=True)
         self._btn_add   = _toolbar_btn("＋  Add Tile")
         self._btn_minus = _toolbar_btn("‹")
@@ -3513,13 +3628,15 @@ class TricorderDashboard(QMainWindow):
         self._cols_lbl.hide()
         self._btn_reset.hide()
 
+        self._update_worker: Optional[UpdateWorker] = None
+        self._btn_update.clicked.connect(self._on_update_clicked)
         self._btn_edit.toggled.connect(self._on_edit_toggled)
         self._btn_add.clicked.connect(self._on_add_tiles)
         self._btn_minus.clicked.connect(lambda: self._change_cols(-1))
         self._btn_plus.clicked.connect(lambda: self._change_cols(+1))
         self._btn_reset.clicked.connect(self._on_reset_layout)
 
-        for w in (self._btn_edit, self._btn_add,
+        for w in (self._btn_update, self._btn_edit, self._btn_add,
                   self._btn_minus, self._cols_lbl, self._btn_plus,
                   self._btn_reset):
             hdr.addWidget(w)
@@ -3659,6 +3776,27 @@ class TricorderDashboard(QMainWindow):
         return tiles, names, default_order
 
     # ── Edit-mode toolbar logic ────────────────────────────────────────────────
+
+    def _on_update_clicked(self) -> None:
+        if self._update_worker is not None and self._update_worker.isRunning():
+            return
+        self._btn_update.setEnabled(False)
+        self._btn_update.setText("⏳  Update...")
+        self._update_worker = UpdateWorker(self)
+        self._update_worker.update_finished.connect(self._on_update_finished)
+        self._update_worker.start()
+
+    def _on_update_finished(self, ok: bool, message: str) -> None:
+        self._btn_update.setEnabled(True)
+        self._btn_update.setText("⬇  Update")
+        worker = self._update_worker
+        self._update_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        if ok:
+            QMessageBox.information(self, "System Tricorder Update", message)
+        else:
+            QMessageBox.warning(self, "System Tricorder Update", message)
 
     def _on_edit_toggled(self, active: bool) -> None:
         self._tile_grid.set_edit_mode(active)

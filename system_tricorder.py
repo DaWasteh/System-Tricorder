@@ -3315,8 +3315,7 @@ class UpdateWorker(QThread):
         proc = subprocess.run(
             cmd,
             text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             timeout=timeout,
             check=False,
         )
@@ -3337,8 +3336,7 @@ class UpdateWorker(QThread):
             proc = subprocess.run(
                 ["git", "ls-remote", GITHUB_REPO_URL, ref],
                 text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 timeout=30,
                 check=False,
             )

@@ -37,10 +37,12 @@ python system_tricorder.py
 
 ## 📦 Building an Executable (.exe)
 
-```bash
+```powershell
 pip install pyinstaller
-pyinstaller --noconsole --onefile system_tricorder.py
+pyinstaller --noconsole --onefile --icon "assets\SystemTricorder.ico" --add-data "assets\SystemTricorder.png;assets" system_tricorder.py
 ```
+
+The bundled executable and its running window use `assets/SystemTricorder.png`; the Windows `.exe` resource uses the generated `assets/SystemTricorder.ico`.
 
 ---
 

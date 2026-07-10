@@ -100,7 +100,7 @@ from PyQt6.QtWidgets import (                                       # type: igno
 )
 from PyQt6.QtCore  import Qt, QTimer, pyqtSignal, QThread, QMimeData, QPoint, QSize, QByteArray  # type: ignore
 from PyQt6.QtGui   import (                                         # type: ignore
-    QColor, QPainter, QPainterPath, QPen, QBrush, QDrag, QPixmap,
+    QColor, QPainter, QPainterPath, QPen, QBrush, QDrag, QPixmap, QIcon,
 )
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -136,6 +136,17 @@ CONFIG_FILE = Path.home() / ".tricorder_layout.json"
 CONFIG_VERSION = "0.8"
 APP_VERSION = "1.9"
 GITHUB_REPO_URL = "https://github.com/DaWasteh/System-Tricorder.git"
+
+
+def _resource_path(relative_path: str) -> Path:
+    """Return the asset location in a source checkout or PyInstaller bundle."""
+    base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base_path / relative_path
+
+
+def _app_icon() -> QIcon:
+    """Load the app icon for the active platform's window manager."""
+    return QIcon(str(_resource_path("assets/SystemTricorder.png")))
 
 
 def _load_config_file() -> dict:
@@ -3350,7 +3361,7 @@ def _build_rebuild_bat(repo_root: Path, exe_path: Path, pid: int, log_path: Path
         "REM --- Build the noconsole onefile EXE (matches README) ---",
         'echo [%date% %time%] building EXE >> "%LOG%"',
         'pushd "%REPO%"',
-        '"%PYEXE%" -m PyInstaller --noconsole --onefile system_tricorder.py >> "%LOG%" 2>&1',
+        '"%PYEXE%" -m PyInstaller --noconsole --onefile --icon "assets\\SystemTricorder.ico" --add-data "assets\\SystemTricorder.png;assets" system_tricorder.py >> "%LOG%" 2>&1',
         'set "BUILDRC=%errorlevel%"',
         "popd",
         'if not "%BUILDRC%"=="0" (',
@@ -3528,6 +3539,7 @@ class TricorderDashboard(QMainWindow):
             pass
 
         self.setWindowTitle(f"System Tricorder v{APP_VERSION}")
+        self.setWindowIcon(_app_icon())
         # Scale minimum size by DPI — 1280×720 is the logical 100% DPI size
         _min_w = int(1280 * _DP_SCALE) if _DP_SCALE > 0 else 1280
         _min_h = int(720 * _DP_SCALE) if _DP_SCALE > 0 else 720
@@ -3920,8 +3932,9 @@ class TricorderDashboard(QMainWindow):
                     self, "System Tricorder Update",
                     "Der automatische Rebuild konnte nicht gestartet werden. "
                     "Bitte System Tricorder manuell schliessen und neu bauen:\n"
-                    ".venv\\Scripts\\python.exe -m PyInstaller --noconsole "
-                    "--onefile system_tricorder.py",
+                    ".venv\\Scripts\\python.exe -m PyInstaller --noconsole --onefile "
+                    "--icon assets\\SystemTricorder.ico "
+                    "--add-data assets\\SystemTricorder.png;assets system_tricorder.py",
                 )
         else:
             QMessageBox.information(self, "System Tricorder Update", message)
@@ -4318,6 +4331,7 @@ if __name__ == "__main__":
 
     app = QApplication(sys.argv)
     app.setApplicationName("System Tricorder")
+    app.setWindowIcon(_app_icon())
     app.setStyle("Fusion")
 
     # Compute DPI scale factor AFTER creating QApplication (Qt-native)

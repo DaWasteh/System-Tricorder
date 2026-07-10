@@ -214,6 +214,8 @@ jobs:
             --noconsole `
             --onefile `
             --name "SystemTricorder" `
+            --icon "assets\SystemTricorder.ico" `
+            --add-data "assets\SystemTricorder.png;assets" `
             system_tricorder.py
 
       - name: Verify .exe

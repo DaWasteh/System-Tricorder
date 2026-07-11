@@ -183,9 +183,16 @@ GPU_PALETTES = [
 _VIRTUAL_NAMES = ('microsoft basic', 'remote desktop', 'parsec', 'virtual',
                   'citrix', 'vmware', 'indirect')
 
-# Discrete Intel Arc model numbers — anything NOT in this list is the iGPU
-# (Arrow Lake / Meteor Lake have an iGPU called "Intel Arc Graphics" with no model number)
-_ARC_DMODEL = ('a310', 'a380', 'a580', 'a750', 'a770', 'b580', 'b770')
+# Discrete Intel Arc model numbers — an Intel GPU without one of these is
+# assumed to be the iGPU (Arrow Lake / Meteor Lake have an iGPU called
+# "Intel Arc Graphics" with no model number).  On Windows this list is only
+# the FALLBACK signal: get_wmi_gpu_list() primarily classifies Intel GPUs by
+# dedicated VRAM from DXGI, which also covers future models.  Includes
+# desktop (A3xx-A7xx, B5xx), mobile (M-suffixed models match their base
+# number) and Arc Pro variants.
+_ARC_DMODEL = ('a310', 'a350', 'a370', 'a380', 'a530', 'a550', 'a570',
+               'a580', 'a730', 'a750', 'a770', 'b570', 'b580', 'b770',
+               'pro a40', 'pro a50', 'pro a60', 'pro b50', 'pro b60')
 
 # AMD iGPU PCI Device IDs — only these are real integrated GPUs
 # (Ryzen 5800X3D has NO iGPU; Ryzen 7040/8040+ have RDNA2 iGPU)
@@ -473,8 +480,12 @@ def _linux_read_amd_vram(card_dir: str) -> Tuple[float, float]:
         return (0.0, 0.0)
 
 
-def _linux_read_nvidia_gpu(handle) -> Tuple[float, float, float]:
-    """Return ``(gpu_util, vram_used_gb, vram_total_gb)`` via NVML."""
+def _read_nvml_gpu(handle) -> Tuple[float, float, float]:
+    """Return ``(gpu_util, vram_used_gb, vram_total_gb)`` via NVML.
+
+    Platform-neutral: used on Linux for every NVIDIA card and on Windows for
+    TCC-mode cards that the WDDM perf counters cannot see.
+    """
     try:
         util = pynvml.nvmlDeviceGetUtilizationRates(handle)       # type: ignore
         mem  = pynvml.nvmlDeviceGetMemoryInfo(handle)             # type: ignore
@@ -772,7 +783,9 @@ class _PdhGpuSampler:
             self._pdh.PdhCollectQueryData(query)          # prime: ≥2 collects needed for a rate
             self._ok = True
         except Exception as exc:
-            logger.debug("PDH GPU sampler init failed: %s", exc)
+            # One-time event with real consequences (falls back to cached
+            # WMI counters) — belongs in the log file, not on debug level.
+            logger.warning("PDH GPU sampler init failed: %s", exc)
             self._ok = False
 
     @property
@@ -829,15 +842,23 @@ def get_wmi_gpu_list() -> List[Tuple[str, bool, float, str]]:
 
     iGPU detection rules
     --------------------
-    Intel: any Intel GPU whose name does NOT contain a discrete Arc model number
-           (e.g. A770, B580) is treated as iGPU.  This correctly classifies
-           "Intel(R) Arc(TM) Graphics" (Arrow Lake / Meteor Lake integrated)
-           as iGPU while keeping Arc A/B dGPUs as dGPU.
+    Intel: primary signal is dedicated VRAM from DXGI (matched via PCI DEV id):
+           >= 2 GB dedicated VRAM = discrete Arc.  iGPUs only carve out
+           ~128 MB dedicated memory, every Arc dGPU ships with >= 4 GB, and the
+           VRAM check keeps working for model numbers that postdate this code.
+           The _ARC_DMODEL name list remains as fallback when DXGI is
+           unavailable.  This classifies "Intel(R) Arc(TM) Graphics"
+           (Arrow Lake / Meteor Lake integrated) as iGPU.
     AMD:   traditional integrated markers (Radeon(TM) Graphics, Vega) without RX.
     """
     result: List[Tuple[str, bool, float, str]] = []
     if not WMI_AVAILABLE:
         return result
+    # Dedicated VRAM per PCI device id (lower-case hex, no 0x) from DXGI.
+    dxgi_vram_by_dev: Dict[str, float] = {}
+    for _devid, _vram, _ in get_dxgi_adapter_map().values():
+        _key = _devid.lower().replace("0x", "")
+        dxgi_vram_by_dev[_key] = max(dxgi_vram_by_dev.get(_key, 0.0), _vram)
     try:
         pythoncom.CoInitialize()                                    # type: ignore
         wmi = win32com.client.GetObject("winmgmts:root\\cimv2")    # type: ignore
@@ -874,9 +895,15 @@ def get_wmi_gpu_list() -> List[Tuple[str, bool, float, str]]:
                         # else: known dGPU DEV → not iGPU
                     # else: no DEV in PNPID → not an iGPU (fallback: assume dGPU or virtual)
                 else:
+                    is_intel_dgpu = False
+                    if 'intel' in nl:
+                        dev_match = re.search(r'dev_([0-9a-f]{4})', pnp_lower)
+                        ded_vram = dxgi_vram_by_dev.get(dev_match.group(1), 0.0) if dev_match else 0.0
+                        # >= 2 GB dedicated VRAM = discrete Arc (model-number
+                        # list only as fallback when DXGI gave no data).
+                        is_intel_dgpu = ded_vram >= 2.0 or any(m in nl for m in _ARC_DMODEL)
                     is_igpu = (
-                        # Intel iGPU: any Intel GPU without a known discrete Arc model number
-                        ('intel' in nl and not any(m in nl for m in _ARC_DMODEL)) or
+                        ('intel' in nl and not is_intel_dgpu) or
                         # AMD iGPU: integrated Radeon (Vega/RDNA-integrated, no RX prefix)
                         ('amd' in nl and ('radeon(tm) graphics' in nl or 'vega' in nl) and 'rx ' not in nl)
                     )
@@ -889,6 +916,66 @@ def get_wmi_gpu_list() -> List[Tuple[str, bool, float, str]]:
         pass
     result.sort(key=lambda x: (int(x[1]), -x[2]))
     return result
+
+
+def _nvml_tcc_gpus() -> List[Tuple[str, float, str]]:
+    """Return (name, vram_gb, "nvml:<index>") for NVIDIA GPUs in TCC mode.
+
+    Compute/render servers often run their GPUs in TCC instead of WDDM.  TCC
+    devices are invisible to DXGI and to the "GPU Engine" performance
+    counters (both WDDM-only), so the regular Windows pipeline never sees
+    them — NVML is the only data source.  The "nvml:<index>" device key tells
+    the monitor loop to read these GPUs via NVML instead of LUID binding.
+    """
+    result: List[Tuple[str, float, str]] = []
+    if not NVML_AVAILABLE:
+        return result
+    tcc_model = getattr(pynvml, "NVML_DRIVER_WDM", 1)   # WDM == TCC in NVML terms
+    try:
+        for i in range(pynvml.nvmlDeviceGetCount()):                # type: ignore
+            try:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(i)       # type: ignore
+                if pynvml.nvmlDeviceGetCurrentDriverModel(handle) != tcc_model:  # type: ignore
+                    continue
+                raw = pynvml.nvmlDeviceGetName(handle)              # type: ignore
+                name = raw.decode() if isinstance(raw, bytes) else str(raw)
+                vram = pynvml.nvmlDeviceGetMemoryInfo(handle).total / (1024 ** 3)  # type: ignore
+                result.append((name or "NVIDIA GPU", float(math.ceil(vram)), f"nvml:{i}"))
+            except Exception:
+                continue
+    except Exception as exc:
+        logger.debug("NVML TCC enumeration failed: %s", exc)
+    return result
+
+
+def _windows_detect_dgpus() -> Tuple[List[Tuple[str, float, str]], bool]:
+    """Single source of truth for the Windows dGPU list.
+
+    Returns ``(dgpus, has_igpu)`` where each dGPU is ``(name, vram_gb,
+    dev_key)``; ``dev_key`` is either a PCI device id ("0x1E02", bound to a
+    perf-counter LUID at runtime) or "nvml:<index>" for TCC-mode NVIDIA GPUs.
+    Used by BOTH the tile builder (_analyze_hardware) and the monitor thread
+    (_init_windows) so the tiles and the metrics stream always agree.
+    """
+    reg_vrams = get_registry_gpu_vrams()
+    wmi_gpus  = get_wmi_gpu_list()
+    dgpu_wmi  = [(n, v, p) for n, ig, v, p in wmi_gpus if not ig]
+    has_igpu  = any(ig for _, ig, _, _ in wmi_gpus)
+
+    dgpus: List[Tuple[str, float, str]] = []
+    for i, (name, wv, pnp_id) in enumerate(dgpu_wmi):
+        vram = reg_vrams[i] if i < len(reg_vrams) else (math.ceil(wv) if wv >= 1.0 else 8.0)
+        dev_id = ""
+        dev_match = re.search(r'DEV_([0-9A-Fa-f]{4})', pnp_id)
+        if dev_match:
+            dev_id = "0x" + dev_match.group(1).upper()
+        dgpus.append((name, float(vram), dev_id))
+
+    dgpus.extend(_nvml_tcc_gpus())
+
+    if not dgpus:
+        dgpus = [("GPU", reg_vrams[0], "")]
+    return dgpus, has_igpu
 
 
 def short_gpu_name(name: str) -> str:
@@ -1158,6 +1245,11 @@ class HardwareMonitorThread(QThread):
         self._running         = False
         self._latest:      Optional[SystemMetrics] = None
         self._latest_lock = threading.Lock()
+        # Diagnostics: consecutive loop failures / empty GPU samples.  Logged
+        # as (throttled) WARNINGs so field reports actually contain evidence
+        # in ~/.tricorder.log instead of silent debug-level drops.
+        self._loop_err_count   = 0
+        self._empty_rows_count = 0
         self._com_initialized = False
         self._drive_info      = drive_info
         self._is_linux        = platform.system() == "Linux"
@@ -1235,22 +1327,17 @@ class HardwareMonitorThread(QThread):
         if not self._dgpu_info and not self._igpu_info:
             self._dgpu_info = [("GPU", 8.0, "")]
 
-    # ── Windows init (original code, untouched logic) ──────────────────────
+    # ── Windows init ────────────────────────────────────────────────────────
     def _init_windows(self) -> None:
-        reg_vrams = get_registry_gpu_vrams()
-        wmi_gpus  = get_wmi_gpu_list()
-        dgpu_wmi  = [(n, v, p) for n, ig, v, p in wmi_gpus if not ig]
+        self._dgpu_info, _ = _windows_detect_dgpus()
 
-        self._dgpu_info: List[Tuple[str, float, str]] = []
-        for i, (name, wv, pnp_id) in enumerate(dgpu_wmi):
-            vram = reg_vrams[i] if i < len(reg_vrams) else (math.ceil(wv) if wv >= 1.0 else 8.0)
-            dev_id = ""
-            dev_match = re.search(r'DEV_([0-9A-Fa-f]{4})', pnp_id)
-            if dev_match:
-                dev_id = "0x" + dev_match.group(1).upper()
-            self._dgpu_info.append((name, float(vram), dev_id))
-        if not self._dgpu_info:
-            self._dgpu_info = [("GPU", reg_vrams[0], "")]
+        # NVML handles for TCC-mode GPUs, keyed by their "nvml:<index>" dev key.
+        self._nvml_win_handles: Dict[str, any] = {}
+        for _, _, dev_key in self._dgpu_info:
+            if dev_key.startswith("nvml:"):
+                with contextlib.suppress(Exception):
+                    self._nvml_win_handles[dev_key] = pynvml.nvmlDeviceGetHandleByIndex(  # type: ignore
+                        int(dev_key.split(":", 1)[1]))
 
         self._luid_device_map = get_dxgi_adapter_map()
         self._last_dxgi_refresh = time.time()
@@ -1265,6 +1352,21 @@ class HardwareMonitorThread(QThread):
             None,
         )
         self._pdh = _PdhGpuSampler()
+
+    def _log_loop_error(self, prefix: str, exc: Exception) -> None:
+        """Log monitor-loop failures visibly, but throttled.
+
+        A single hiccup is normal; a persistent streak means the dashboard
+        is frozen and the user needs evidence in ~/.tricorder.log.  Warn on
+        the 1st failure of a streak, again when it persists (~10 s at
+        30 FPS), then roughly every 5 minutes.
+        """
+        self._loop_err_count += 1
+        n = self._loop_err_count
+        if n == 1 or n == 300 or n % 9000 == 0:
+            logger.warning("%s (streak of %d): %s", prefix, n, exc)
+        else:
+            logger.debug("%s: %s", prefix, exc)
 
     # ── Latest-value hand-over ─────────────────────────────────────────────
     def _publish(self, m: SystemMetrics) -> None:
@@ -1370,7 +1472,7 @@ class HardwareMonitorThread(QThread):
                             if handle is None:
                                 handle = self._nvml_handles.get(linux_gpu.get("pci_slot") or "")
                             if handle is not None:
-                                gpu_util, vram_used, vram_total_nv = _linux_read_nvidia_gpu(handle)
+                                gpu_util, vram_used, vram_total_nv = _read_nvml_gpu(handle)
                                 if vram_total_nv > 0:
                                     vram_total = vram_total_nv
                         elif linux_gpu["vendor"] == "intel":
@@ -1420,12 +1522,39 @@ class HardwareMonitorThread(QThread):
                     drives=drives,
                     timestamp=datetime.now(),
                 ))
+                self._loop_err_count = 0
             except Exception as exc:
-                logger.debug("Linux monitor loop error: %s", exc)
+                self._log_loop_error("Linux monitor loop error", exc)
             time.sleep(1.0 / 30.0)
 
+    def _read_nvml_win_gpu(self, name: str, vram_total: float, dev_key: str) -> GPUMetrics:
+        """Build GPUMetrics for a TCC-mode NVIDIA GPU via NVML.
+
+        TCC cards have no 3D engine exposed — overall utilization is CUDA
+        work, so it feeds the Compute row of the 3D/Compute tile; the codec
+        row comes from NVML's encoder/decoder utilization.
+        """
+        util = vram_used = 0.0
+        codec = 0.0
+        handle = self._nvml_win_handles.get(dev_key)
+        if handle is not None:
+            util, vram_used, vram_total_nv = _read_nvml_gpu(handle)
+            if vram_total_nv > 0:
+                vram_total = vram_total_nv
+            with contextlib.suppress(Exception):
+                enc, _ = pynvml.nvmlDeviceGetEncoderUtilization(handle)   # type: ignore
+                dec, _ = pynvml.nvmlDeviceGetDecoderUtilization(handle)   # type: ignore
+                codec = float(max(enc, dec))
+        return GPUMetrics(
+            name=name, luid=dev_key,
+            gpu_compute_percent=util,
+            gpu_codec_percent=codec,
+            gpu_vram_used_gb=min(vram_used, vram_total) if vram_total else vram_used,
+            gpu_vram_total_gb=vram_total,
+        )
+
     # ══════════════════════════════════════════════════════════════════════
-    # WINDOWS MONITORING LOOP  (100 % original logic, just moved into method)
+    # WINDOWS MONITORING LOOP
     # ══════════════════════════════════════════════════════════════════════
     def _run_windows(self) -> None:
         if WMI_AVAILABLE:
@@ -1434,11 +1563,13 @@ class HardwareMonitorThread(QThread):
                 self._com_initialized = True
             except Exception as exc:
                 logger.warning("CoInitialize failed: %s", exc)
-        try:
-            wmi = win32com.client.GetObject("winmgmts:root\\cimv2") if WMI_AVAILABLE else None  # type: ignore
-        except Exception as exc:
-            logger.warning("WMI connect failed: %s", exc)
-            wmi = None
+
+        # WMI is connected lazily at the END of a loop iteration (see below):
+        # GetObject("winmgmts:...") can block for seconds when the WMI service
+        # is busy, and doing that before the loop meant the dashboard showed
+        # NO data at all (not even CPU/RAM) until WMI answered.
+        wmi = None
+        wmi_next_try = 0.0
 
         self._last_io      = psutil.disk_io_counters()
         self._last_io_per  = psutil.disk_io_counters(perdisk=True) or {}
@@ -1475,11 +1606,11 @@ class HardwareMonitorThread(QThread):
                 cpu_cores = {i: float(v) for i, v in enumerate(psutil.cpu_percent(percpu=True))}
                 ram       = psutil.virtual_memory()
 
-                # ── GPU (WMI) ───────────────────────────────────────────────
+                # ── GPU (PDH, WMI only for VRAM usage / as fallback) ────────
                 igpu_p = 0.0
                 luid_data: Dict[str, dict] = {}
 
-                if wmi:
+                if (self._pdh and self._pdh.ok) or wmi:
                     _LUID_RE = re.compile(r'luid_(0x[0-9a-f]+_0x[0-9a-f]+)')
                     _ENG_RE  = re.compile(r'_eng_(\d+)_')
 
@@ -1497,6 +1628,19 @@ class HardwareMonitorThread(QThread):
                             ]
                         except Exception as exc:
                             logger.debug("GPU engine query: %s", exc)
+
+                    # Persistent empty samples are the "tiles frozen at 0"
+                    # symptom (e.g. after a driver reset) — leave evidence.
+                    if _engine_rows:
+                        self._empty_rows_count = 0
+                    else:
+                        self._empty_rows_count += 1
+                        if self._empty_rows_count == 300 or self._empty_rows_count % 9000 == 0:
+                            logger.warning(
+                                "GPU engine sampler returned no data %d times in a row "
+                                "— GPU tiles stuck at 0 (driver reset / counters gone?)",
+                                self._empty_rows_count,
+                            )
 
                     # ── Step 1: seed luid_data from engine rows ────────────────
                     for _e in _engine_rows:
@@ -1516,7 +1660,7 @@ class HardwareMonitorThread(QThread):
                     # The WMI/perflib round-trip is far too expensive for 30 Hz
                     # and VRAM usage moves slowly — query at 1 Hz and re-apply
                     # the cached per-LUID values on the frames in between.
-                    if now - self._last_vram_query >= 1.0:
+                    if wmi is not None and now - self._last_vram_query >= 1.0:
                         self._last_vram_query = now
                         try:
                             vram_cache: Dict[str, float] = {}
@@ -1623,13 +1767,20 @@ class HardwareMonitorThread(QThread):
                 for _luid, _dev in luid_to_device_id.items():
                     self._luid_device_id[_luid] = _dev
 
-                device_to_luid: Dict[str, str] = {}
-                for luid in luid_data:
+                # Per-device LUID *lists*: identical GPUs (e.g. 8× the same
+                # card in a render server) share one PCI device id, so a
+                # single dev→luid entry would bind every tile to GPU 0.  Each
+                # tile pops its own LUID instead.  Iterating _luid_order keeps
+                # the tile↔LUID assignment stable across frames.
+                device_to_luids: Dict[str, List[str]] = {}
+                for luid in self._luid_order:
+                    if luid not in luid_data:
+                        continue
                     dev = luid_to_device_id.get(luid) or self._luid_device_id.get(luid, "")
-                    if dev and dev not in device_to_luid:
-                        device_to_luid[dev] = luid
+                    if dev:
+                        device_to_luids.setdefault(dev, []).append(luid)
 
-                bound = set(device_to_luid.values())
+                bound = {luid for luids in device_to_luids.values() for luid in luids}
                 # Only LUIDs alive in THIS sample are usable fallbacks: after a
                 # driver reset the dead LUID stays in _luid_order forever, and
                 # popping it here would permanently bind a tile to no data.
@@ -1638,7 +1789,14 @@ class HardwareMonitorThread(QThread):
 
                 gpus: List[GPUMetrics] = []
                 for name, vram_total, dev_id in self._dgpu_info:
-                    luid = device_to_luid.get(dev_id, "")
+                    # TCC-mode NVIDIA GPUs: invisible to DXGI/perf counters —
+                    # read utilization and VRAM directly via NVML.
+                    if dev_id.startswith("nvml:"):
+                        gpus.append(self._read_nvml_win_gpu(name, vram_total, dev_id))
+                        continue
+
+                    candidates = device_to_luids.get(dev_id)
+                    luid = candidates.pop(0) if candidates else ""
                     if not luid and leftover:
                         luid = leftover.pop(0)
                     d = luid_data.get(luid, {}) if luid else {}
@@ -1674,8 +1832,22 @@ class HardwareMonitorThread(QThread):
                     drives=drives,
                     timestamp=datetime.now(),
                 ))
+                self._loop_err_count = 0
+
+                # Lazy WMI connect AFTER publishing, so a slow/blocked WMI
+                # service can never hold back CPU/RAM/disk/PDH data.
+                if wmi is None and WMI_AVAILABLE and time.time() >= wmi_next_try:
+                    wmi_next_try = time.time() + 5.0
+                    _t0 = time.time()
+                    try:
+                        wmi = win32com.client.GetObject("winmgmts:root\\cimv2")  # type: ignore
+                    except Exception as exc:
+                        logger.warning("WMI connect failed — VRAM usage unavailable, "
+                                       "retrying in 5 s: %s", exc)
+                    if wmi is not None and time.time() - _t0 > 2.0:
+                        logger.warning("WMI connect took %.1f s", time.time() - _t0)
             except Exception as exc:
-                logger.debug("Monitor loop error: %s", exc)
+                self._log_loop_error("Monitor loop error", exc)
             time.sleep(1.0 / 30.0)
 
     def stop(self) -> None:
@@ -3726,26 +3898,13 @@ class TricorderDashboard(QMainWindow):
             if not self.detected_gpus and not self.has_igpu:
                 self.detected_gpus = [("GPU", 8.0, "")]
         else:
-            wmi_gpus  = get_wmi_gpu_list()
-            reg_vrams = get_registry_gpu_vrams()
-            dgpu_wmi  = [(n, v, p) for n, ig, v, p in wmi_gpus if not ig]
-
-            # iGPU tile is only meaningful when the hardware actually exists.
-            # On a desktop AMD CPU (e.g. Ryzen 5800X3D) there is no iGPU, so it
-            # must not be created — otherwise it shows up as an empty 0% tile and as
-            # restorable options in the "Add Tile" dialog.
-            self.has_igpu = any(ig for _, ig, _, _ in wmi_gpus)
-
-            for i, (name, wv, pnp_id) in enumerate(dgpu_wmi):
-                vram = reg_vrams[i] if i < len(reg_vrams) else (math.ceil(wv) if wv >= 1.0 else 8.0)
-                # Extract device ID from PNPDeviceID
-                dev_id = ""
-                dev_match = re.search(r'DEV_([0-9A-Fa-f]{4})', pnp_id)
-                if dev_match:
-                    dev_id = "0x" + dev_match.group(1).upper()
-                self.detected_gpus.append((name, float(vram), dev_id))
-            if not self.detected_gpus:
-                self.detected_gpus = [("GPU", reg_vrams[0], "")]
+            # Shared detection with HardwareMonitorThread._init_windows so the
+            # tiles and the metrics stream always describe the same GPU list
+            # (incl. TCC-mode NVIDIA cards that only NVML can see).
+            # has_igpu: the iGPU tile is only meaningful when the hardware
+            # actually exists — a desktop AMD CPU (e.g. Ryzen 5800X3D) has
+            # none, and a fake tile would sit at 0% forever.
+            self.detected_gpus, self.has_igpu = _windows_detect_dgpus()
 
         self._drive_info: List[Tuple[str, str]] = build_drive_info()
         if not self._drive_info:

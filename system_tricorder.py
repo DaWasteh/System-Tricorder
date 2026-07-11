@@ -3927,8 +3927,14 @@ class TricorderDashboard(QMainWindow):
         # ── Header ────────────────────────────────────────────────────────────
         hdr = QHBoxLayout()
 
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(_app_icon().pixmap(dp(36), dp(36)))
+        icon_lbl.setStyleSheet("background: transparent;")
+        hdr.addWidget(icon_lbl)
+        hdr.addSpacing(dp(10))
+
         title = QLabel(
-            "📊  System Tricorder  "
+            "System Tricorder  "
             f"<span style='font-size: {font_size(18)}; color:#00aa55;'>v{APP_VERSION}</span>"
         )
         title.setStyleSheet(

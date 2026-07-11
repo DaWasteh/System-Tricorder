@@ -11,7 +11,8 @@
 
 ## 🖥️ Screenshots
 
-![v1.5](image-1.png)
+![v2.1](image.png)
+
 ---
 
 ## ✨ What it does

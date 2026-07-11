@@ -2,6 +2,7 @@
 import sys
 import time
 import math
+import threading
 import json
 import re
 import platform
@@ -750,6 +751,7 @@ class _PdhGpuSampler:
     """
 
     _PDH_FMT_DOUBLE = 0x00000200
+    _PDH_MORE_DATA  = 0x800007D2
     _PATH = "\\GPU Engine(*)\\Utilization Percentage"
 
     def __init__(self) -> None:
@@ -787,17 +789,26 @@ class _PdhGpuSampler:
             self._pdh.PdhGetFormattedCounterArrayW(
                 self._counter, self._PDH_FMT_DOUBLE,
                 ctypes.byref(size), ctypes.byref(count), None)
-            if size.value == 0:
-                return []
-            buf = (ctypes.c_ubyte * size.value)()
-            if self._pdh.PdhGetFormattedCounterArrayW(
+            # The per-process instance list can grow between the size call and
+            # the data call (spawning processes = new GPU engine instances);
+            # PDH then fails with PDH_MORE_DATA and an updated required size.
+            # Retry instead of dropping the whole sample.
+            for _ in range(3):
+                if size.value == 0:
+                    return []
+                buf = (ctypes.c_ubyte * size.value)()
+                count = wintypes.DWORD(0)
+                status = self._pdh.PdhGetFormattedCounterArrayW(
                     self._counter, self._PDH_FMT_DOUBLE,
-                    ctypes.byref(size), ctypes.byref(count), buf) != 0:
-                return []
-            arr = (_PdhCounterItem * count.value).from_buffer(buf)
-            return [(str(it.szName).lower(), float(it.FmtValue.doubleValue))
-                    for it in arr
-                    if it.szName and it.FmtValue.CStatus == 0]
+                    ctypes.byref(size), ctypes.byref(count), buf) & 0xFFFFFFFF
+                if status == 0:
+                    arr = (_PdhCounterItem * count.value).from_buffer(buf)
+                    return [(str(it.szName).lower(), float(it.FmtValue.doubleValue))
+                            for it in arr
+                            if it.szName and it.FmtValue.CStatus == 0]
+                if status != self._PDH_MORE_DATA:
+                    return []
+            return []
         except Exception as exc:
             logger.debug("PDH GPU sample failed: %s", exc)
             return []
@@ -1136,11 +1147,17 @@ class SystemMetrics:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class HardwareMonitorThread(QThread):
-    metrics_updated = pyqtSignal(SystemMetrics)
+    # Metrics are handed to the UI via a lock-protected latest-value slot
+    # instead of a queued pyqtSignal: with a queued signal, every frame the UI
+    # thread can't process within 33 ms piles up in the event queue, so on
+    # load spikes the dashboard falls behind and replays stale frames
+    # (visible stutter).  With the slot, a slow UI simply skips frames.
 
     def __init__(self, drive_info: List[Tuple[str, str]], parent=None) -> None:
         super().__init__(parent)
         self._running         = False
+        self._latest:      Optional[SystemMetrics] = None
+        self._latest_lock = threading.Lock()
         self._com_initialized = False
         self._drive_info      = drive_info
         self._is_linux        = platform.system() == "Linux"
@@ -1236,6 +1253,9 @@ class HardwareMonitorThread(QThread):
             self._dgpu_info = [("GPU", reg_vrams[0], "")]
 
         self._luid_device_map = get_dxgi_adapter_map()
+        self._last_dxgi_refresh = time.time()
+        self._last_vram_query = 0.0                 # 0 → query on the first frame
+        self._vram_cache: Dict[str, float] = {}     # luid → dedicated usage (GB)
         _igpu_name_markers = ('hd graphics', 'uhd graphics', 'iris',
                               'intel(r) graphics', 'arc(tm) graphics',
                               'radeon graphics', 'radeon(tm) graphics')
@@ -1245,6 +1265,18 @@ class HardwareMonitorThread(QThread):
             None,
         )
         self._pdh = _PdhGpuSampler()
+
+    # ── Latest-value hand-over ─────────────────────────────────────────────
+    def _publish(self, m: SystemMetrics) -> None:
+        with self._latest_lock:
+            self._latest = m
+
+    def take_latest(self) -> Optional[SystemMetrics]:
+        """Return the newest metrics frame (or None) and clear the slot."""
+        with self._latest_lock:
+            m = self._latest
+            self._latest = None
+            return m
 
     # ── run() dispatcher ───────────────────────────────────────────────────
     def run(self) -> None:
@@ -1375,7 +1407,7 @@ class HardwareMonitorThread(QThread):
                     igpu_util = max(igpu_util, float(fd.get("3d", 0.0)), float(fd.get("compute", 0.0)),
                                     float(fd.get("c0", 0.0)), float(fd.get("codec", 0.0)))
 
-                self.metrics_updated.emit(SystemMetrics(
+                self._publish(SystemMetrics(
                     cpu_total_percent=cpu_total,
                     cpu_cores=cpu_cores,
                     ram_total_gb=ram.total / (1024 ** 3),
@@ -1481,21 +1513,30 @@ class HardwareMonitorThread(QThread):
                             pass
 
                     # ── Step 2: fill VRAM usage from memory query ──────────────
-                    try:
-                        for a in wmi.ExecQuery(
-                            "SELECT Name, DedicatedUsage "
-                            "FROM Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory"
-                        ):
-                            try:
-                                luid = str(a.Name).lower().split('_phys')[0]
-                                used = float(a.DedicatedUsage or 0) / (1024 ** 3)
-                                ld = luid_data.setdefault(luid, {'3d': 0.0, 'compute': 0.0,
-                                                                 'c0': 0.0, 'c1': 0.0, 'codec': 0.0, 'used': 0.0})
-                                ld['used'] = max(ld['used'], used)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
+                    # The WMI/perflib round-trip is far too expensive for 30 Hz
+                    # and VRAM usage moves slowly — query at 1 Hz and re-apply
+                    # the cached per-LUID values on the frames in between.
+                    if now - self._last_vram_query >= 1.0:
+                        self._last_vram_query = now
+                        try:
+                            vram_cache: Dict[str, float] = {}
+                            for a in wmi.ExecQuery(
+                                "SELECT Name, DedicatedUsage "
+                                "FROM Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory"
+                            ):
+                                try:
+                                    luid = str(a.Name).lower().split('_phys')[0]
+                                    used = float(a.DedicatedUsage or 0) / (1024 ** 3)
+                                    vram_cache[luid] = max(vram_cache.get(luid, 0.0), used)
+                                except Exception:
+                                    pass
+                            self._vram_cache = vram_cache
+                        except Exception:
+                            pass
+                    for luid, used in self._vram_cache.items():
+                        ld = luid_data.setdefault(luid, {'3d': 0.0, 'compute': 0.0,
+                                                         'c0': 0.0, 'c1': 0.0, 'codec': 0.0, 'used': 0.0})
+                        ld['used'] = max(ld['used'], used)
 
                     # ── Step 3: aggregate engine utilization ───────────────────
                     _eng_max: Dict[tuple, tuple] = {}
@@ -1563,6 +1604,17 @@ class HardwareMonitorThread(QThread):
                 )
                 self._luid_order.extend(new)
 
+                # After a driver reset/TDR the adapter re-enumerates with a NEW
+                # LUID that the init-time DXGI map has never seen — refresh the
+                # map (throttled) so the device-id binding below can re-attach
+                # instead of leaving the GPU tile stuck at 0.
+                if (any(luid not in self._luid_device_map for luid in new)
+                        and now - self._last_dxgi_refresh >= 5.0):
+                    self._last_dxgi_refresh = now
+                    refreshed = get_dxgi_adapter_map()
+                    if refreshed:
+                        self._luid_device_map.update(refreshed)
+
                 luid_to_device_id: Dict[str, str] = {
                     luid: self._luid_device_map[luid][0]
                     for luid in luid_data
@@ -1578,7 +1630,11 @@ class HardwareMonitorThread(QThread):
                         device_to_luid[dev] = luid
 
                 bound = set(device_to_luid.values())
-                leftover = [luid for luid in self._luid_order if luid not in bound]
+                # Only LUIDs alive in THIS sample are usable fallbacks: after a
+                # driver reset the dead LUID stays in _luid_order forever, and
+                # popping it here would permanently bind a tile to no data.
+                leftover = [luid for luid in self._luid_order
+                            if luid not in bound and luid in luid_data]
 
                 gpus: List[GPUMetrics] = []
                 for name, vram_total, dev_id in self._dgpu_info:
@@ -1605,7 +1661,7 @@ class HardwareMonitorThread(QThread):
                     gpus = [GPUMetrics(name=self._dgpu_info[0][0], luid='',
                                        gpu_vram_total_gb=self._dgpu_info[0][1])]
 
-                self.metrics_updated.emit(SystemMetrics(
+                self._publish(SystemMetrics(
                     cpu_total_percent=cpu_total,
                     cpu_cores=cpu_cores,
                     ram_total_gb=ram.total / (1024 ** 3),
@@ -3567,8 +3623,14 @@ class TricorderDashboard(QMainWindow):
         self._update_clock()
 
         self.hw_thread = HardwareMonitorThread(drive_info=self._drive_info)
-        self.hw_thread.metrics_updated.connect(self._update_ui)
         self.hw_thread.start()
+
+        # Poll the monitor thread's latest-value slot at ~30 FPS.  If a UI
+        # update overruns the interval, the next tick simply picks up the
+        # newest frame — no event-queue backlog, no replayed stale frames.
+        self._metrics_timer = QTimer(self)
+        self._metrics_timer.timeout.connect(self._poll_metrics)
+        self._metrics_timer.start(33)
 
     # ── Hardware analysis ──────────────────────────────────────────────────────
 
@@ -4095,6 +4157,11 @@ class TricorderDashboard(QMainWindow):
         parent.addWidget(ResponsiveCoreGrid(col_groups, min_col_w=120), 1)
 
     # ── UI update  (30 FPS) ────────────────────────────────────────────────────
+
+    def _poll_metrics(self) -> None:
+        m = self.hw_thread.take_latest()
+        if m is not None:
+            self._update_ui(m)
 
     def _update_ui(self, m: SystemMetrics) -> None:
         _t = self._tiles.get

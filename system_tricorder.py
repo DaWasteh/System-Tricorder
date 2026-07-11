@@ -135,7 +135,7 @@ except ImportError:
 # ── Layout / window config ────────────────────────────────────────────────────
 CONFIG_FILE = Path.home() / ".tricorder_layout.json"
 CONFIG_VERSION = "0.8"
-APP_VERSION = "1.9"
+APP_VERSION = "2.1"
 GITHUB_REPO_URL = "https://github.com/DaWasteh/System-Tricorder.git"
 
 
@@ -3751,7 +3751,7 @@ def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD  v1.9
+# MAIN DASHBOARD  v2.1
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TricorderDashboard(QMainWindow):

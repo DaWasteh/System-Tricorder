@@ -2,7 +2,7 @@
 
 > A real-time hardware monitoring dashboard for Windows and Ubuntu/Linux — dark mode, 30 FPS, fully customisable free-form layout.
 
-![Version](https://img.shields.io/badge/version-1.9-00ff88?style=flat-square)
+![Version](https://img.shields.io/badge/version-2.1-00ff88?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Ubuntu-lightgrey?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
@@ -177,6 +177,22 @@ Delete the file to reset to factory defaults.
 ---
 
 ## 🗂️ Changelog
+
+### v2.1
+
+- **GPU-Kacheln frieren nicht mehr ein (Treiber-Reset/TDR)** — nach einem GPU-Treiber-Reset bekommt der Adapter eine neue LUID; die DXGI-Zuordnung wird jetzt automatisch aufgefrischt und tote LUIDs werden nie mehr als Fallback gewählt. Betraf u.a. Intel-Arc-Systeme, die „sporadisch keine Daten mehr" zeigten
+- **PDH-Retry** — wächst die GPU-Engine-Instanzliste zwischen Größen- und Datenabruf (`PDH_MORE_DATA`), wird der Abruf wiederholt statt das komplette Sample zu verwerfen
+- **Kein Ruckeln mehr bei Lastspitzen** — die teure WMI-VRAM-Abfrage läuft mit 1 Hz statt 30 Hz, und Metriken werden über einen Latest-Value-Slot an die UI übergeben statt über eine Signal-Queue: ein ausgelasteter UI-Thread überspringt Frames, statt einen Event-Rückstau abzuarbeiten
+- **Multi-GPU mit baugleichen Karten** — identische GPUs (gleiche PCI-Device-ID, z.B. 8× dieselbe Karte im Renderserver) werden über Per-Device-LUID-Listen an getrennte Kacheln gebunden statt alle an GPU 0
+- **NVIDIA TCC-Modus** — Karten im TCC-Modus (Compute-/Renderserver) sind für DXGI/WDDM-Counter unsichtbar und werden jetzt per NVML erkannt und ausgelesen (Auslastung, VRAM, Encoder/Decoder)
+- **Robuste Intel-Arc-Erkennung** — dGPU-Klassifizierung primär über dediziertes DXGI-VRAM (≥ 2 GB = diskret) statt Modellnummern-Liste; Fallback-Liste um B570, Mobile-A-Serie und Arc Pro erweitert
+- **WMI blockiert den Start nicht mehr** — der WMI-Connect passiert lazy in der Monitor-Schleife (Retry alle 5 s); ein hängender WMI-Dienst verzögert CPU/RAM/Disk/GPU-Engine-Daten nicht mehr
+- **Sichtbare Diagnose** — Monitor-Loop-Fehler, dauerhaft leere GPU-Samples, langsame WMI-Connects und PDH-Init-Fehler landen als gedrosselte Warnungen in `~/.tricorder.log`
+
+### v2.0
+
+- **App-Icon** — eigenes Icon für Fenster, Taskbar und die Windows-exe
+- **Windows-exe** — vorgebauter Einzeldatei-Build unter `dist/system_tricorder.exe`
 
 ### v1.9
 

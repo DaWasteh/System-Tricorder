@@ -17,7 +17,7 @@ install_apt_dependencies() {
         glib_package="libglib2.0-0t64"
     fi
     apt-get install -y --no-install-recommends \
-        binutils ca-certificates fontconfig python3 python3-pip python3-venv \
+        binutils ca-certificates fontconfig libpython3 python3 python3-pip python3-venv \
         libdbus-1-3 libegl1 libgl1 "$glib_package" \
         libxkbcommon-x11-0 libxcb-cursor0
     rm -rf /var/lib/apt/lists/*

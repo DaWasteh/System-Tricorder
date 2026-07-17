@@ -13,21 +13,21 @@ install_apt_dependencies() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
     apt-get install -y --no-install-recommends \
-        ca-certificates python3 python3-pip python3-venv \
+        binutils ca-certificates fontconfig python3 python3-pip python3-venv \
         libdbus-1-3 libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0
     rm -rf /var/lib/apt/lists/*
 }
 
 install_dnf_dependencies() {
     dnf install -y \
-        ca-certificates python3 python3-pip \
+        binutils ca-certificates fontconfig python3 python3-pip \
         dbus-libs libglvnd-egl libglvnd-glx libxkbcommon-x11 xcb-util-cursor
     dnf clean all
 }
 
 install_pacman_dependencies() {
     pacman -Syu --noconfirm --needed \
-        ca-certificates python python-pip \
+        binutils ca-certificates fontconfig python python-pip \
         dbus libglvnd libxkbcommon-x11 xcb-util-cursor
     pacman -Scc --noconfirm
 }

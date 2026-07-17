@@ -21,7 +21,7 @@ except Exception:
 if platform.system() == 'Windows':
     from ctypes import wintypes
 else:
-    # Define dummy wintypes for Linux to avoid AttributeErrors in type hints
+    # Define dummy wintypes on non-Windows platforms for ctypes structures.
     class wintypes:
         DWORD = ctypes.c_uint32
         LPWSTR = ctypes.c_wchar_p
@@ -1252,7 +1252,9 @@ class HardwareMonitorThread(QThread):
         self._empty_rows_count = 0
         self._com_initialized = False
         self._drive_info      = drive_info
-        self._is_linux        = platform.system() == "Linux"
+        self._platform        = platform.system()
+        self._is_linux        = self._platform == "Linux"
+        self._is_windows      = self._platform == "Windows"
 
         # Shared fields (both platforms)
         self._dgpu_info:      List[Tuple[str, float, str]] = []
@@ -1270,8 +1272,10 @@ class HardwareMonitorThread(QThread):
 
         if self._is_linux:
             self._init_linux()
-        else:
+        elif self._is_windows:
             self._init_windows()
+        else:
+            self._init_generic()
 
     # ── Linux init ─────────────────────────────────────────────────────────
     def _init_linux(self) -> None:
@@ -1326,6 +1330,12 @@ class HardwareMonitorThread(QThread):
 
         if not self._dgpu_info and not self._igpu_info:
             self._dgpu_info = [("GPU", 8.0, "")]
+
+    # ── Generic Unix init (currently macOS) ────────────────────────────────
+    def _init_generic(self) -> None:
+        """Use portable psutil metrics without probing Windows/Linux GPU APIs."""
+        self._dgpu_info = []
+        self._igpu_info = None
 
     # ── Windows init ────────────────────────────────────────────────────────
     def _init_windows(self) -> None:
@@ -1383,10 +1393,12 @@ class HardwareMonitorThread(QThread):
     # ── run() dispatcher ───────────────────────────────────────────────────
     def run(self) -> None:
         self._running = True
-        if self._is_linux:
-            self._run_linux()
-        else:
+        if self._is_windows:
             self._run_windows()
+        else:
+            # The Linux loop's CPU, RAM, and disk sampling is psutil-based.
+            # Generic Unix platforms use it with Linux-only GPU probes disabled.
+            self._run_linux()
 
     # ══════════════════════════════════════════════════════════════════════
     # LINUX MONITORING LOOP
@@ -1974,8 +1986,11 @@ def _linux_get_cpu_topology() -> Optional[dict]:
         return None
 
 def _get_cpu_topology() -> Optional[dict]:
-    if platform.system() == "Linux":
+    current_platform = platform.system()
+    if current_platform == "Linux":
         return _linux_get_cpu_topology()
+    if current_platform != "Windows":
+        return None
     """
     Reads true P/E core topology via GetLogicalProcessorInformationEx.
     Returns dict with p_cores, p_threads, e_cores, e_threads, is_hybrid,
@@ -3700,10 +3715,12 @@ class UpdateWorker(QThread):
         new_sha = self._run_git(repo_root, ["rev-parse", "HEAD"])
         py_changed = self._python_files_changed(repo_root, current_sha, new_sha)
         self.rebuild_needed = py_changed
-        if py_changed:
+        if py_changed and platform.system() == "Windows" and getattr(sys, "frozen", False):
             extra = " Python-Code hat sich geaendert - die EXE wird nach dem Neustart automatisch neu gebaut."
+        elif py_changed:
+            extra = " Python-Code hat sich geaendert - bitte die App neu starten bzw. das native Paket neu bauen."
         else:
-            extra = " Keine .py-Aenderungen - kein EXE-Rebuild noetig."
+            extra = " Keine .py-Aenderungen - kein Paket-Rebuild noetig."
         return (
             True,
             "Update installiert: "
@@ -3876,7 +3893,8 @@ class TricorderDashboard(QMainWindow):
                 pass
 
         self.detected_gpus: List[Tuple[str, float, str]] = []
-        if platform.system() == 'Linux':
+        current_platform = platform.system()
+        if current_platform == 'Linux':
             linux_gpus = _linux_detect_gpus()
             self.has_igpu = any(g.get("is_igpu", False) for g in linux_gpus)
             for g in linux_gpus:
@@ -3897,7 +3915,7 @@ class TricorderDashboard(QMainWindow):
             # has a GPU section instead of crashing.
             if not self.detected_gpus and not self.has_igpu:
                 self.detected_gpus = [("GPU", 8.0, "")]
-        else:
+        elif current_platform == 'Windows':
             # Shared detection with HardwareMonitorThread._init_windows so the
             # tiles and the metrics stream always describe the same GPU list
             # (incl. TCC-mode NVIDIA cards that only NVML can see).
@@ -3905,6 +3923,10 @@ class TricorderDashboard(QMainWindow):
             # actually exists — a desktop AMD CPU (e.g. Ryzen 5800X3D) has
             # none, and a fake tile would sit at 0% forever.
             self.detected_gpus, self.has_igpu = _windows_detect_dgpus()
+        else:
+            # macOS has no DRM/PDH equivalent here yet. Keep CPU, RAM and disk
+            # monitoring available without presenting a permanently fake GPU.
+            self.has_igpu = False
 
         self._drive_info: List[Tuple[str, str]] = build_drive_info()
         if not self._drive_info:
@@ -4144,7 +4166,8 @@ class TricorderDashboard(QMainWindow):
         # changed Python source, trigger a hands-off rebuild: spawn a detached
         # helper .bat that waits for us to exit, rebuilds via PyInstaller, and
         # relaunches the new EXE.
-        if rebuild_needed and getattr(sys, "frozen", False):
+        if (rebuild_needed and getattr(sys, "frozen", False)
+                and platform.system() == "Windows"):
             QMessageBox.information(
                 self, "System Tricorder Update",
                 message + "\n\nDer EXE-Rebuild startet jetzt: diese App schliesst "

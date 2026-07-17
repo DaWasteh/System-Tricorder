@@ -1,10 +1,10 @@
 # 📊 System Tricorder
 
-> A real-time hardware monitoring dashboard for Windows and Ubuntu/Linux — dark mode, 30 FPS, fully customisable free-form layout.
+> A real-time hardware monitoring dashboard for Windows, macOS, and Linux — dark mode, 30 FPS, fully customisable free-form layout.
 
 ![Version](https://img.shields.io/badge/version-2.1-00ff88?style=flat-square)
-![Python](https://img.shields.io/badge/python-3.8%2B-blue?style=flat-square)
-![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Ubuntu-lightgrey?style=flat-square)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 
 ---
@@ -25,25 +25,34 @@ Every aspect of the layout is yours to control: arrange tiles into any number of
 
 ## 🚀 Installation
 
+The [GitHub Releases](https://github.com/DaWasteh/System-Tricorder/releases) contain native packages for Windows, macOS, Ubuntu, Fedora, Arch Linux, Linux Mint, CachyOS, Kali Linux, and Debian. Extract `.tar.gz` packages before starting `SystemTricorder`.
+
+To run from source:
+
 ```bash
 git clone https://github.com/DaWasteh/System-Tricorder.git
-cd system-tricorder
-pip install PyQt6 psutil pywin32
+cd System-Tricorder
+python3 -m venv .venv
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+# macOS/Linux:       source .venv/bin/activate
+python -m pip install -r requirements.txt
 python system_tricorder.py
 ```
 
-> ℹ️ Windows uses WMI/Registry/PDH for hardware counters. Ubuntu/Linux uses psutil, lspci, DRM sysfs/fdinfo and optional NVML for GPU counters.
+Linux users can alternatively run `./start_linux.sh`. On macOS, install Python with Homebrew (`brew install python`) if the system Python has no working Qt support. Unsigned macOS downloads may require **right-click → Open** once.
+
+> ℹ️ Windows uses WMI/Registry/PDH for hardware counters. Linux uses psutil, lspci, DRM sysfs/fdinfo and optional NVML. macOS currently provides portable CPU, RAM, and disk metrics through psutil; platform-specific GPU metrics are not yet available.
 
 ---
 
-## 📦 Building an Executable (.exe)
+## 📦 Building a Native Package
 
-```powershell
-pip install pyinstaller
-pyinstaller --noconsole --onefile --icon "assets\SystemTricorder.ico" --add-data "assets\SystemTricorder.png;assets" system_tricorder.py
+```bash
+python -m pip install -r requirements.txt pyinstaller
+python .github/scripts/build_release.py --slug local
 ```
 
-The bundled executable and its running window use `assets/SystemTricorder.png`; the Windows `.exe` resource uses the generated `assets/SystemTricorder.ico`.
+The package is written to `release/`. The bundled application uses `assets/SystemTricorder.png`; Windows additionally uses `assets/SystemTricorder.ico` as the executable resource.
 
 ---
 

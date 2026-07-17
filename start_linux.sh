@@ -39,7 +39,15 @@ fi
 # 2. Ensure venv is installed
 if ! "$PYTHON_BIN" -m venv --help &>/dev/null; then
     echo "⚠️  Python venv module not found."
-    echo "Please run: sudo apt update && sudo apt install python3-venv python3-pip"
+    if command -v apt-get &>/dev/null; then
+        echo "Please run: sudo apt update && sudo apt install python3-venv python3-pip"
+    elif command -v dnf &>/dev/null; then
+        echo "Please run: sudo dnf install python3 python3-pip"
+    elif command -v pacman &>/dev/null; then
+        echo "Please run: sudo pacman -Syu python python-pip"
+    else
+        echo "Please install Python 3 with its venv and pip modules."
+    fi
     exit 1
 fi
 
@@ -54,11 +62,10 @@ fi
 source "$VENV_DIR/bin/activate"
 
 echo "⚙️  Installing dependencies..."
-# Filter out pywin32 for Linux
-REQUIREMENTS_LINUX="$LOG_DIR/requirements_linux.txt"
-grep -v "pywin32" requirements.txt > "$REQUIREMENTS_LINUX"
-pip install --upgrade pip
-pip install -r "$REQUIREMENTS_LINUX"
+# requirements.txt uses an environment marker so Windows-only pywin32 is
+# skipped automatically on every Linux distribution.
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 
 # 5. Run the application
 echo "🌟 Launching $APP_NAME..."

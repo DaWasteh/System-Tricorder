@@ -431,6 +431,8 @@ def test_frozen_windows_update_defers_pull_until_exe_exits(
     monkeypatch.setattr(worker, "_remote_sha_for_branch", lambda _branch: (new_sha, "main"))
     monkeypatch.setattr(tricorder.platform, "system", lambda: "Windows")
     monkeypatch.setattr(tricorder.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(
+        tricorder, "_find_git_checkout", lambda _start: Path(".").resolve())
 
     ok, message = worker._check_and_install()
     assert ok

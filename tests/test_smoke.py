@@ -1,3 +1,4 @@
+import json
 import os
 from datetime import datetime
 from pathlib import Path
@@ -65,11 +66,24 @@ def test_metric_defaults() -> None:
 
 
 def test_release_versions_are_synchronized() -> None:
-    assert tricorder.APP_VERSION == "2.7"
-    version_info = (Path(tricorder.__file__).parent / "assets" / "version_info.txt").read_text(
+    assert tricorder.APP_VERSION == "2.7.1"
+    assert tricorder.CONFIG_VERSION == "1.0"
+    root = Path(tricorder.__file__).parent
+    version_info = (root / "assets" / "version_info.txt").read_text(encoding="utf-8")
+    for expected in (
+        "filevers=(2, 7, 1, 0)",
+        "prodvers=(2, 7, 1, 0)",
+        "FileVersion', '2.7.1.0'",
+        "ProductVersion', '2.7.1.0'",
+    ):
+        assert expected in version_info
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    assert "version-2.7.1-00ff88" in readme
+    assert "### v2.7.1" in readme
+    release_builder = (root / ".github" / "scripts" / "build_release.py").read_text(
         encoding="utf-8")
-    assert "filevers=(2, 7, 0, 0)" in version_info
-    assert "ProductVersion', '2.7.0.0'" in version_info
+    assert 'generated_spec_dir = build_dir / "generated-spec"' in release_builder
+    assert '"--specpath"' in release_builder
 
 
 def test_gpu_palettes() -> None:
@@ -92,31 +106,32 @@ def test_cpu_package_power_uses_pkg_without_double_counting() -> None:
     ]) is None
 
 
-def test_layout_migration_inserts_power_tiles_idempotently() -> None:
+def test_layout_migration_places_total_and_power_tiles_idempotently() -> None:
     order = [
-        "gpu_0_vram", "gpu_1_vram", "__row__",
-        "cpu_total", "igpu",
+        "gpu_0_3d", "gpu_0_vram", "gpu_1_vram", "__row__",
+        "cpu_power", "igpu",
     ]
-    hidden = ["gpu_2_vram"]
+    hidden = ["gpu_1_3d"]
     tile_ids = [
-        "gpu_0_vram", "gpu_1_vram", "gpu_2_vram",
-        "cpu_total", "igpu", "gpu_0_power", "gpu_1_power",
-        "gpu_2_power", "cpu_power", "optional_tile",
+        "gpu_0_3d", "gpu_0_vram", "gpu_1_vram", "gpu_1_3d",
+        "cpu_total", "igpu", "gpu_0_total", "gpu_1_total",
+        "gpu_0_power", "gpu_1_power", "cpu_power", "optional_tile",
     ]
     default_order = [
         "cpu_total", "cpu_power", "__row__",
-        "gpu_0_vram", "gpu_0_power", "gpu_1_vram", "gpu_1_power",
-        "gpu_2_vram", "gpu_2_power",
+        "gpu_0_total", "gpu_0_3d", "gpu_0_vram", "gpu_0_power",
+        "gpu_1_total", "gpu_1_3d", "gpu_1_vram", "gpu_1_power",
     ]
 
     migrated_order, migrated_hidden, changed = tricorder._merge_layout_tiles(
         order, hidden, tile_ids, default_order)
     assert changed
-    assert migrated_order[:4] == [
-        "gpu_0_vram", "gpu_0_power", "gpu_1_vram", "gpu_1_power"
+    assert migrated_order[:6] == [
+        "gpu_0_total", "gpu_0_3d", "gpu_0_vram", "gpu_0_power",
+        "gpu_1_vram", "gpu_1_power",
     ]
     assert migrated_order[-3:] == ["cpu_total", "cpu_power", "igpu"]
-    assert "gpu_2_power" in migrated_hidden
+    assert "gpu_1_total" in migrated_hidden
     assert "optional_tile" in migrated_hidden
 
     again_order, again_hidden, changed_again = tricorder._merge_layout_tiles(
@@ -124,6 +139,41 @@ def test_layout_migration_inserts_power_tiles_idempotently() -> None:
     assert not changed_again
     assert again_order == migrated_order
     assert again_hidden == migrated_hidden
+
+
+def test_new_row_move_preserves_last_tile_and_row_boundaries() -> None:
+    cpu_order = ["ram", "cpu_total", "__row__", "igpu"]
+    assert tricorder._move_tile_to_new_row(cpu_order, "cpu_total", 0) == [
+        "ram", "__row__", "cpu_total", "__row__", "igpu"
+    ]
+
+    igpu_order = ["cpu_total", "__row__", "gpu_0_power", "igpu"]
+    assert tricorder._move_tile_to_new_row(igpu_order, "igpu", 1) == [
+        "cpu_total", "__row__", "gpu_0_power", "__row__", "igpu"
+    ]
+
+    singleton_rows = ["cpu_total", "__row__", "igpu"]
+    assert tricorder._move_tile_to_new_row(singleton_rows, "cpu_total", 0) == singleton_rows
+    assert tricorder._move_tile_to_new_row(singleton_rows, "igpu", 1) == singleton_rows
+    assert tricorder._move_tile_to_new_row(singleton_rows, "missing", 0) == singleton_rows
+
+
+def test_rebuild_helper_uses_versioned_spec_and_replaces_renamed_exe() -> None:
+    script = tricorder._build_rebuild_bat(
+        Path("C:/Benutzer/Jörg Repo"),
+        Path("C:/Benutzer/Jörg Repo/SystemTricorder-v2.7.1.exe"),
+        42,
+        Path("C:/Benutzer/Jörg Temp/rebuild.log"),
+        "main",
+    )
+    assert script.startswith("@echo off\r\nchcp 65001 >NUL\r\nset PYTHONUTF8=1\r\n")
+    assert "PyInstaller --clean --noconfirm system_tricorder.spec" in script
+    assert 'set "PULL_BRANCH=main"' in script
+    assert 'git pull --ff-only --autostash' in script
+    assert 'set "BUILT=%REPO%\\dist\\system_tricorder.exe"' in script
+    assert 'copy /Y "%BUILT%" "%EXE%"' in script
+    assert "Jörg Repo" in script.encode("utf-8").decode("utf-8")
+    assert "--add-data" not in script
 
 
 def test_linux_gpu_power_hwmon(tmp_path) -> None:
@@ -179,6 +229,278 @@ def qapp() -> QApplication:
     app = QApplication.instance() or QApplication([])
     tricorder._init_dp_scale(app)
     return app
+
+
+def test_gpu_total_and_engine_tiles_are_separate(qapp: QApplication) -> None:
+    palette = tricorder.GPU_PALETTES[0]
+    total = tricorder.MetricTile("gpu_0_total", "Test GPU · GPU", palette[3])
+    engines = tricorder.GPU3DComputeTile("gpu_0_3d", "Test GPU", palette)
+
+    total.update_val(91.0)
+    engines.update_3d_compute(32.0, 77.0)
+
+    assert total._graph.history[-1] == pytest.approx(91.0)
+    assert engines._d3_graph.history[-1] == pytest.approx(32.0)
+    assert engines._cm_graph.history[-1] == pytest.approx(77.0)
+    assert not hasattr(engines, "_gpu_graph")
+
+    total.deleteLater()
+    engines.deleteLater()
+    qapp.processEvents()
+
+
+def test_registry_keeps_total_and_engine_tiles_adjacent(qapp: QApplication) -> None:
+    class RegistryHost:
+        ram_type = "DDR5"
+        current_platform = "Windows"
+        detected_gpus = [("AMD Radeon Test", 16.0, "0x1234")]
+        has_igpu = True
+        _drive_info = []
+        _tiles = {}
+
+    host = RegistryHost()
+    tiles, names, default_order = tricorder.TricorderDashboard._build_tile_registry(host)
+    total_index = default_order.index("gpu_0_total")
+    assert default_order[total_index + 1] == "gpu_0_3d"
+    assert isinstance(tiles["gpu_0_total"], tricorder.MetricTile)
+    assert isinstance(tiles["gpu_0_3d"], tricorder.GPU3DComputeTile)
+    assert names["gpu_0_total"].endswith(" · GPU")
+    assert names["gpu_0_3d"].endswith(" · 3D / Compute")
+
+    for tile in tiles.values():
+        tile.deleteLater()
+    qapp.processEvents()
+
+
+def test_dashboard_routes_total_and_engine_metrics_to_separate_tiles() -> None:
+    class RecordingTotal:
+        def __init__(self) -> None:
+            self.values = []
+            self.batches = 0
+
+        def update_val(self, value: float, suffix=None) -> None:
+            self.values.append((value, suffix))
+
+        def batch_update(self) -> None:
+            self.batches += 1
+
+    class RecordingEngines:
+        def __init__(self) -> None:
+            self.values = []
+            self.batches = 0
+
+        def update_3d_compute(self, gpu_3d: float, compute: float) -> None:
+            self.values.append((gpu_3d, compute))
+
+        def batch_update(self) -> None:
+            self.batches += 1
+
+    total = RecordingTotal()
+    engines = RecordingEngines()
+
+    class DashboardHost:
+        _metric_frames = 0
+        _tiles = {"gpu_0_total": total, "gpu_0_3d": engines}
+        thread_widgets = {}
+
+    metrics = tricorder.SystemMetrics(
+        cpu_total_percent=0.0,
+        cpu_cores={},
+        ram_total_gb=1.0,
+        ram_used_gb=0.5,
+        ram_percent=50.0,
+        gpus=[tricorder.GPUMetrics(
+            name="Test GPU", luid="abc", gpu_3d_percent=32.0,
+            gpu_compute_percent=77.0, gpu_total_percent=91.0,
+        )],
+        igpu_percent=0.0,
+        disk_read_mbps=0.0,
+        disk_write_mbps=0.0,
+        drives=[],
+        timestamp=datetime.now(),
+    )
+    host = DashboardHost()
+    tricorder.TricorderDashboard._update_ui(host, metrics)
+
+    assert total.values == [(91.0, None)]
+    assert engines.values == [(32.0, 77.0)]
+    assert total.batches == 1
+    assert engines.batches == 1
+
+
+def test_tile_grid_repairs_and_persists_layout(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "layout.json"
+    config_path.write_text(json.dumps({
+        "version": "0.9",
+        "window": {"geometry": "test", "placement": "normal"},
+    }), encoding="utf-8")
+    monkeypatch.setattr(tricorder, "CONFIG_FILE", config_path)
+
+    default_order = ["cpu_total", "ram", "__row__", "igpu"]
+    tiles = {
+        tile_id: tricorder.MetricTile(tile_id, tile_id, "#00ff88")
+        for tile_id in ("cpu_total", "ram", "igpu")
+    }
+    grid = tricorder.TileGrid(tiles, {tile_id: tile_id for tile_id in tiles}, default_order)
+    assert grid._tile_order == default_order
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["version"] == "1.0"
+    assert saved["tile_order"] == default_order
+    assert saved["window"]["placement"] == "normal"
+
+    grid.deleteLater()
+    qapp.processEvents()
+
+
+def test_layout_saves_preserve_temporarily_absent_hardware(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "layout.json"
+    original = {
+        "version": "0.9",
+        "tile_order": ["gpu_0_3d", "__row__", "gpu_1_3d"],
+        "hidden_tiles": ["drive_PhysicalDrive9"],
+    }
+    config_path.write_text(json.dumps(original, indent=2), encoding="utf-8")
+    monkeypatch.setattr(tricorder, "CONFIG_FILE", config_path)
+
+    tiles = {
+        "gpu_0_total": tricorder.MetricTile(
+            "gpu_0_total", "GPU", "#00ff88"),
+        "gpu_0_3d": tricorder.MetricTile(
+            "gpu_0_3d", "3D / Compute", "#00ff88"),
+    }
+    default_order = ["gpu_0_total", "gpu_0_3d"]
+    grid = tricorder.TileGrid(
+        tiles, {tile_id: tile_id for tile_id in tiles}, default_order)
+
+    assert grid._tile_order == default_order
+    migrated = json.loads(config_path.read_text(encoding="utf-8"))
+    assert migrated["version"] == "1.0"
+    assert migrated["tile_order"] == [
+        "gpu_0_total", "gpu_0_3d", "__row__", "gpu_1_3d"
+    ]
+    assert migrated["hidden_tiles"] == ["drive_PhysicalDrive9"]
+
+    grid.set_min_row_h(160)
+    saved_again = json.loads(config_path.read_text(encoding="utf-8"))
+    assert "gpu_1_3d" in saved_again["tile_order"]
+    assert "drive_PhysicalDrive9" in saved_again["hidden_tiles"]
+
+    grid.deleteLater()
+    qapp.processEvents()
+
+
+def test_layout_migration_save_failure_does_not_block_startup(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(tricorder, "CONFIG_FILE", tmp_path / "layout.json")
+
+    def fail_save(_data: dict) -> None:
+        raise OSError("read-only config target")
+
+    monkeypatch.setattr(tricorder, "_save_config_file", fail_save)
+    tile = tricorder.MetricTile("cpu_total", "CPU", "#00ff88")
+    grid = tricorder.TileGrid(
+        {"cpu_total": tile}, {"cpu_total": "CPU"}, ["cpu_total"])
+    assert grid._tile_order == ["cpu_total"]
+
+    grid.deleteLater()
+    qapp.processEvents()
+
+
+def test_frozen_windows_update_defers_pull_until_exe_exits(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker = tricorder.UpdateWorker()
+    old_sha = "a" * 40
+    new_sha = "b" * 40
+
+    def fake_run_git(_repo: Path, args: list[str], timeout: int = 60) -> str:
+        del timeout
+        if args == ["branch", "--show-current"]:
+            return "main"
+        if args == ["rev-parse", "HEAD"]:
+            return old_sha
+        raise AssertionError(f"unexpected eager git command: {args}")
+
+    monkeypatch.setattr(worker, "_run_git", fake_run_git)
+    monkeypatch.setattr(worker, "_remote_sha_for_branch", lambda _branch: (new_sha, "main"))
+    monkeypatch.setattr(tricorder.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(tricorder.sys, "frozen", True, raising=False)
+
+    ok, message = worker._check_and_install()
+    assert ok
+    assert "Update bereit" in message
+    assert worker.rebuild_needed
+    assert worker.deferred_pull_branch == "main"
+    worker.deleteLater()
+    qapp.processEvents()
+
+
+def test_rebuild_detection_includes_packaging_inputs(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker = tricorder.UpdateWorker()
+
+    for changed_path in (
+        "system_tricorder.py",
+        "system_tricorder.spec",
+        "requirements.txt",
+        "assets/version_info.txt",
+        "assets/SystemTricorder.ico",
+        "assets/SystemTricorder.png",
+    ):
+        monkeypatch.setattr(
+            worker, "_run_git",
+            lambda *_args, path=changed_path, **_kwargs: path,
+        )
+        assert worker._rebuild_inputs_changed(Path("."), "old", "new")
+
+    monkeypatch.setattr(worker, "_run_git", lambda *_args, **_kwargs: "README.md")
+    assert not worker._rebuild_inputs_changed(Path("."), "old", "new")
+    worker.deleteLater()
+    qapp.processEvents()
+
+
+def test_tile_grid_new_row_moves_do_not_lose_cpu_or_igpu(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "layout.json"
+    initial_order = [
+        "ram", "cpu_total", "__row__", "gpu_0_power", "igpu"
+    ]
+    config_path.write_text(json.dumps({
+        "version": "1.0",
+        "tile_order": initial_order,
+        "hidden_tiles": [],
+    }), encoding="utf-8")
+    monkeypatch.setattr(tricorder, "CONFIG_FILE", config_path)
+
+    tiles = {
+        tile_id: tricorder.MetricTile(tile_id, tile_id, "#00ff88")
+        for tile_id in ("ram", "cpu_total", "gpu_0_power", "igpu")
+    }
+    grid = tricorder.TileGrid(tiles, {tile_id: tile_id for tile_id in tiles}, initial_order)
+    grid._on_new_row("cpu_total", 0)
+    grid._on_new_row("igpu", 2)
+
+    expected = [
+        "ram", "__row__", "cpu_total", "__row__",
+        "gpu_0_power", "__row__", "igpu",
+    ]
+    assert grid._tile_order == expected
+    assert sorted(tile_id for tile_id in grid._tile_order if tile_id != "__row__") == [
+        "cpu_total", "gpu_0_power", "igpu", "ram"
+    ]
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["tile_order"] == expected
+
+    grid.deleteLater()
+    qapp.processEvents()
 
 
 def test_power_tile_normalizes_watts_and_preserves_missing_history(

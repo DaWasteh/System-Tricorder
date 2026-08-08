@@ -2,7 +2,7 @@
 
 > A real-time hardware monitoring dashboard for Windows, macOS, and Linux — dark mode, 30 FPS, fully customisable free-form layout.
 
-![Version](https://img.shields.io/badge/version-2.7-00ff88?style=flat-square)
+![Version](https://img.shields.io/badge/version-2.7.1-00ff88?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
@@ -62,6 +62,8 @@ Press **✏ Edit Layout** in the toolbar to enter edit mode. All tiles highlight
 
 Press **⬇ Update** to check GitHub for a newer version and install it via a fast-forward `git pull`. Your local layout/settings file (`~/.tricorder_layout.json`) is stored outside the repo and is not overwritten.
 
+> **One-time v2.7 upgrade note:** close a running v2.7 EXE before updating to v2.7.1, then download the v2.7.1 release EXE or run `git pull` and rebuild. The old v2.7 process predates the versioned-spec updater and can also keep the checked-in EXE locked. Automatic spec-based rebuilds apply from v2.7.1 onward.
+
 ### Controls on each tile
 
 | Button | Position | Action |
@@ -75,7 +77,7 @@ Press **⬇ Update** to check GitHub for a newer version and install it via a fa
 |--------|--------|
 | **＋ Add Tile** | Opens a checklist of all hidden tiles so you can restore any of them |
 | **‹ / ›** | Decrease / increase the minimum row height |
-| **↺ Reset** | Restores the factory default layout and clears all row breaks |
+| **↺ Reset** | Restores the factory default layout, including its default row breaks |
 | **✔ Fertig** | Leave edit mode — layout is saved automatically |
 
 ### Update control
@@ -94,7 +96,7 @@ The global grid has no fixed column count. Each row is independent and can hold 
 
 ```
 CPU  |  RAM  |  CPU Watt
-GPU/3D/Compute  |  Copy  |  VRAM  |  GPU Watt
+GPU  |  3D/Compute  |  Copy  |  VRAM  |  GPU Watt
 iGPU
 SSD C:  |  SSD D:  |  SSD E:  |  HDD F:
 ```
@@ -129,7 +131,8 @@ Your layout, including all row breaks, is saved to `~/.tricorder_layout.json` on
 | CPU · Leistungsaufnahme | CPU package power in watts | Windows Energy Meter/RAPL; Linux powercap |
 | DDR4 / DDR5 RAM | Used / total memory | psutil + WMI type detection |
 | iGPU | Integrated GPU engine utilisation | Windows PDH; Linux DRM/sysfs |
-| GPU N · GPU / 3D / Compute | Driver-native overall load plus separate rasterisation and compute queues | AMD ADLX / NVML / DRM + PDH/fdinfo |
+| GPU N · GPU | Driver-native overall utilisation | AMD ADLX / NVML / DRM |
+| GPU N · 3D / Compute | Separate rasterisation and compute queue sparklines | Windows PDH; Linux DRM fdinfo |
 | GPU N · Copy | Two sparklines: Copy Engine 0 + Copy Engine 1 | Windows PDH; Linux DRM fdinfo |
 | GPU N · Video Codec | Video Codec Engine utilisation | Windows PDH; Linux DRM fdinfo / NVML |
 | GPU N · VRAM | Used / total VRAM | ADLX/NVML or native PDH/sysfs |
@@ -168,12 +171,12 @@ Values are shown in MB/s and automatically switch to GB/s for drives exceeding 1
 
 ```json
 {
-  "version": "0.9",
+  "version": "1.0",
   "min_row_h": 130,
   "tile_order": [
     "cpu_total", "ram", "cpu_power",
     "__row__",
-    "gpu_0_3d", "gpu_0_copy", "gpu_0_codec", "gpu_0_vram", "gpu_0_power",
+    "gpu_0_total", "gpu_0_3d", "gpu_0_copy", "gpu_0_codec", "gpu_0_vram", "gpu_0_power",
     "__row__",
     "igpu",
     "__row__",
@@ -188,6 +191,15 @@ Delete the file to reset to factory defaults.
 ---
 
 ## 🗂️ Changelog
+
+### v2.7.1
+
+- **GPU-Kacheln wieder getrennt** — die treiber-native Gesamtauslastung (`GPU`) besitzt pro dGPU wieder eine eigene frei platzierbare Kachel; die bestehende `3D / Compute`-Kachel bleibt zweigeteilt und behält ihre gespeicherte Tile-ID
+- **CPU/iGPU verschwinden beim Reihenwechsel nicht mehr** — das Verschieben des letzten Tiles einer Reihe in eine neue Reihe arbeitet nun transaktional auf dem Reihenmodell, statt nach dem Entfernen einen ungültigen alten Anker zu verwenden
+- **Robuste Layout-Migration 0.9 → 1.0** — neue GPU-Gesamtkacheln werden direkt vor ihrer 3D/Compute-Kachel eingefügt, versteckte Kacheln bleiben versteckt, beschädigte oder unvollständige Tile-Listen werden repariert und Migrationen sofort atomar gespeichert
+- **Factory-Reihen bleiben erhalten** — eine Konfiguration, die bislang nur Fensterposition und -größe enthielt, wird nicht mehr fälschlich als leeres benutzerdefiniertes Layout interpretiert
+- **Reproduzierbare künftige Windows-Updates** — ab v2.7.1 verwendet der automatische EXE-Neubau die versionierte `system_tricorder.spec`, übernimmt auch Paket-/Asset-Änderungen und ersetzt selbst eine umbenannte Checkout-EXE; für den einmaligen Wechsel von der bereits laufenden v2.7-EXE gilt der oben dokumentierte manuelle Upgrade-Schritt
+- **Regressionstests** — neue Tests decken Reihenwechsel mit CPU/iGPU, getrennte GPU-/3D-/Compute-Datenpfade, sichtbare und versteckte Multi-GPU-Migrationen, persistierte Config-Reparatur und vollständige Versionssynchronisation ab
 
 ### v2.7
 

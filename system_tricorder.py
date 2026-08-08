@@ -134,8 +134,8 @@ except ImportError:
 
 # ── Layout / window config ────────────────────────────────────────────────────
 CONFIG_FILE = Path.home() / ".tricorder_layout.json"
-CONFIG_VERSION = "0.9"
-APP_VERSION = "2.7"
+CONFIG_VERSION = "1.0"
+APP_VERSION = "2.7.1"
 GITHUB_REPO_URL = "https://github.com/DaWasteh/System-Tricorder.git"
 
 
@@ -3021,8 +3021,8 @@ class BaseTile(QFrame):
         """Override in subclass to update a power tile."""
         pass
 
-    def update_3d_compute(self, total: float, gpu_3d: float, compute: float) -> None:
-        """Override in subclass to update overall GPU + 3D/Compute tile."""
+    def update_3d_compute(self, gpu_3d: float, compute: float) -> None:
+        """Override in subclass to update the 3D/Compute engine tile."""
         pass
 
     def update_copy(self, copy0: float, copy1: float) -> None:
@@ -3465,17 +3465,12 @@ class GPUCodecTile(BaseTile):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GPU UTILIZATION TILE  — overall load + 3D + Compute/CUDA engines
+# GPU ENGINE TILE  — separate 3D + Compute/CUDA engine graphs
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class GPU3DComputeTile(BaseTile):
-    """Overall GPU load plus the WDDM/DRM 3D and compute engine split.
+    """Two engine graphs kept separate from driver-native overall GPU load."""
 
-    The overall row is driver-native on AMD (ADLX) and therefore remains
-    accurate for long RDNA4 AI dispatches that Windows exposes to PDH only as
-    occasional compute pulses.  The engine rows stay useful for identifying
-    whether a conventional graphics or compute queue is active.
-    """
     def __init__(self, tile_id: str, gpu_name: str,
                  palette: Tuple[str, str, str, str], parent=None) -> None:
         self._gpu_name  = gpu_name
@@ -3492,7 +3487,7 @@ class GPU3DComputeTile(BaseTile):
         hdr = QHBoxLayout()
         icon_lbl = QLabel("🎮")
         icon_lbl.setStyleSheet(f"font-size: {font_size(13)};")
-        name_lbl = QLabel(f"{self._gpu_name} · GPU / 3D / Compute")
+        name_lbl = QLabel(f"{self._gpu_name} · 3D / Compute")
         name_lbl.setStyleSheet(
             f"color: {self._palette[0]}; font-size: {font_size(13)}; font-weight: bold;")
         hdr.addWidget(icon_lbl)
@@ -3500,24 +3495,6 @@ class GPU3DComputeTile(BaseTile):
         hdr.addWidget(name_lbl)
         hdr.addStretch()
         outer.addLayout(hdr)
-
-        # ── Overall GPU row ───────────────────────────────────────────────────
-        gpu_row = QHBoxLayout()
-        gpu_row.setSpacing(dp(4))
-        gpu_lbl = QLabel("GPU")
-        gpu_lbl.setStyleSheet(
-            f"color: {self._palette[3]}; font-size: {font_size(12)}; font-weight: bold;")
-        gpu_lbl.setFixedWidth(dp(28))
-        _gpu_h = int(20 * _DP_SCALE) if _DP_SCALE > 0 else 20
-        self._gpu_graph = SparklineWidget(self._palette[3], min_height=_gpu_h)
-        self._gpu_val = QLabel("0%")
-        self._gpu_val.setStyleSheet(f"color: {self._palette[3]}; font-size: {font_size(12)};")
-        self._gpu_val.setFixedWidth(dp(34))
-        self._gpu_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # type: ignore
-        gpu_row.addWidget(gpu_lbl)
-        gpu_row.addWidget(self._gpu_graph)
-        gpu_row.addWidget(self._gpu_val)
-        outer.addLayout(gpu_row)
 
         # ── 3D row ────────────────────────────────────────────────────────────
         d3_row = QHBoxLayout()
@@ -3555,16 +3532,13 @@ class GPU3DComputeTile(BaseTile):
         cm_row.addWidget(self._cm_val)
         outer.addLayout(cm_row)
 
-    def update_3d_compute(self, total: float, gpu_3d: float, compute: float) -> None:
-        self._gpu_graph.add_value(total)
+    def update_3d_compute(self, gpu_3d: float, compute: float) -> None:
         self._d3_graph.add_value(gpu_3d)
         self._cm_graph.add_value(compute)
-        self._gpu_val.setText(f"{int(self._gpu_graph.recent_avg())}%")
         self._d3_val.setText(f"{int(self._d3_graph.recent_avg())}%")
         self._cm_val.setText(f"{int(self._cm_graph.recent_avg())}%")
 
     def batch_update(self) -> None:
-        self._gpu_graph.batch_update()
         self._d3_graph.batch_update()
         self._cm_graph.batch_update()
 
@@ -3760,48 +3734,230 @@ class ResponsiveCoreGrid(QWidget):
 # TILE GRID  — manages draggable, hideable, reorderable tile layout
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _tile_rows(tile_order: List[str]) -> List[List[str]]:
+    """Return non-empty rows from a flat tile order."""
+    rows: List[List[str]] = [[]]
+    for tile_id in tile_order:
+        if tile_id == '__row__':
+            if rows[-1]:
+                rows.append([])
+        else:
+            rows[-1].append(tile_id)
+    return [row for row in rows if row]
+
+
+def _flatten_tile_rows(rows: List[List[str]]) -> List[str]:
+    """Flatten non-empty rows with exactly one sentinel between them."""
+    order: List[str] = []
+    for row in rows:
+        if not row:
+            continue
+        if order:
+            order.append('__row__')
+        order.extend(row)
+    return order
+
+
+def _move_tile_to_new_row(tile_order: List[str], tile_id: str,
+                          after_row_idx: int) -> List[str]:
+    """Move one tile transactionally into a new row at an original boundary.
+
+    ``after_row_idx`` is emitted by an inter-row drop zone built from the
+    pre-move layout.  Working on parsed rows avoids retaining a stale flat-list
+    anchor when the dragged tile was itself the final tile in the target row.
+    """
+    rows = _tile_rows(tile_order)
+    source_row_idx = next(
+        (index for index, row in enumerate(rows) if tile_id in row), None)
+    if source_row_idx is None:
+        return list(tile_order)
+
+    boundary = 0 if after_row_idx < 0 else min(after_row_idx + 1, len(rows))
+    source_row = rows[source_row_idx]
+    source_row.remove(tile_id)
+    if not source_row:
+        rows.pop(source_row_idx)
+        if source_row_idx < boundary:
+            boundary -= 1
+
+    boundary = max(0, min(boundary, len(rows)))
+    rows.insert(boundary, [tile_id])
+    return _flatten_tile_rows(rows)
+
+
+def _layout_anchor(tile_id: str) -> Optional[Tuple[str, bool]]:
+    """Return ``(anchor_id, insert_before)`` for additive layout migrations."""
+    if tile_id == "cpu_power":
+        return "cpu_total", False
+    match = re.fullmatch(r"gpu_(\d+)_(total|power)", tile_id)
+    if not match:
+        return None
+    gpu_index, metric = match.groups()
+    if metric == "total":
+        return f"gpu_{gpu_index}_3d", True
+    return f"gpu_{gpu_index}_vram", False
+
+
 def _merge_layout_tiles(saved_order: List[str], saved_hidden: List[str],
                         tile_ids: List[str], default_order: List[str]
                         ) -> Tuple[List[str], List[str], bool]:
-    """Merge newly introduced tiles without destroying a custom row layout.
+    """Merge new tiles and repair malformed state without losing custom rows.
 
-    Power tiles are inserted beside their semantic anchor (CPU total or the
-    matching GPU VRAM tile).  If that anchor was hidden, the new tile starts
-    hidden as well.  This makes the v0.8 → v0.9 migration idempotent and avoids
-    dumping all v2.7 metrics at the end of a carefully arranged layout.
+    New overall-GPU tiles are inserted before their existing 3D/Compute tile;
+    power tiles stay after CPU-total or GPU-VRAM.  Anchored tiles inherit a
+    hidden anchor's state.  The two-pass merge first restores missing anchors,
+    making recovery independent of registry order and idempotent.
     """
-    order = list(saved_order)
-    hidden = list(dict.fromkeys(saved_hidden))
-    known = {item for item in order if item != '__row__'} | set(hidden)
-    changed = False
+    valid_ids = set(tile_ids)
+    order: List[str] = []
+    visible: set[str] = set()
+    last_was_break = True
+    for item in saved_order:
+        if item == '__row__':
+            if not last_was_break:
+                order.append(item)
+            last_was_break = True
+        elif item in valid_ids and item not in visible:
+            order.append(item)
+            visible.add(item)
+            last_was_break = False
+    while order and order[-1] == '__row__':
+        order.pop()
+
+    hidden: List[str] = []
+    for item in saved_hidden:
+        if item in valid_ids and item not in visible and item not in hidden:
+            hidden.append(item)
+
+    changed = order != saved_order or hidden != saved_hidden
+    known = visible | set(hidden)
     default_ids = {item for item in default_order if item != '__row__'}
+    anchored: List[str] = []
 
     for tile_id in tile_ids:
         if tile_id in known:
             continue
-        anchor = ""
-        if tile_id == "cpu_power":
-            anchor = "cpu_total"
-        else:
-            match = re.fullmatch(r"gpu_(\d+)_power", tile_id)
-            if match:
-                anchor = f"gpu_{match.group(1)}_vram"
-
-        if anchor:
-            if anchor in hidden or anchor not in order:
-                hidden.append(tile_id)
+        if _layout_anchor(tile_id) is not None:
+            anchored.append(tile_id)
+            continue
+        if tile_id in default_ids:
+            # A previous failed move may have removed a semantic anchor while
+            # leaving its dependent tile behind.  Restore the anchor beside that
+            # visible dependent instead of dumping it after the final drive row.
+            dependent = next((
+                candidate for candidate in tile_ids
+                if candidate in visible
+                and (anchor_info := _layout_anchor(candidate)) is not None
+                and anchor_info[0] == tile_id
+            ), None)
+            if dependent is None:
+                order.append(tile_id)
             else:
-                order.insert(order.index(anchor) + 1, tile_id)
-        elif tile_id in default_ids:
-            order.append(tile_id)
+                dependent_anchor = _layout_anchor(dependent)
+                insert_after = bool(dependent_anchor and dependent_anchor[1])
+                index = order.index(dependent) + (1 if insert_after else 0)
+                order.insert(index, tile_id)
+            visible.add(tile_id)
         else:
-            # Non-default registered tiles must be discoverable through the
-            # Add Tile dialog instead of silently disappearing from both lists.
+            hidden.append(tile_id)
+        known.add(tile_id)
+        changed = True
+
+    for tile_id in anchored:
+        anchor_info = _layout_anchor(tile_id)
+        if anchor_info is None:
+            continue
+        anchor, insert_before = anchor_info
+        if anchor in visible:
+            index = order.index(anchor) + (0 if insert_before else 1)
+            order.insert(index, tile_id)
+            visible.add(tile_id)
+        else:
             hidden.append(tile_id)
         known.add(tile_id)
         changed = True
 
     return order, hidden, changed
+
+
+def _preserve_dormant_layout(active_order: List[str], active_hidden: List[str],
+                              stored_order: List[str], stored_hidden: List[str],
+                              active_ids: set[str]) -> Tuple[List[str], List[str]]:
+    """Overlay active edits while retaining temporarily unavailable tile IDs.
+
+    Dormant visible tiles follow their nearest still-visible neighbor from the
+    stored row; fully dormant rows remain grouped at the end.  Hidden dormant
+    tiles keep their hidden state.  This prevents a row-height change or other
+    harmless save from deleting layouts for a disconnected GPU or drive.
+    """
+    rows = [list(row) for row in _tile_rows(active_order)]
+    active_visible = {tile_id for tile_id in active_order
+                      if tile_id != '__row__'}
+    stored_rows = _tile_rows([
+        item for item in stored_order if isinstance(item, str)])
+    dormant_visible: set[str] = set()
+    orphan_rows: List[List[str]] = []
+    after_tails: Dict[str, str] = {}
+
+    def locate(tile_id: str) -> Optional[Tuple[int, int]]:
+        for row_index, row in enumerate(rows):
+            if tile_id in row:
+                return row_index, row.index(tile_id)
+        return None
+
+    for stored_row in stored_rows:
+        index = 0
+        while index < len(stored_row):
+            if stored_row[index] in active_ids:
+                index += 1
+                continue
+            start = index
+            segment: List[str] = []
+            while index < len(stored_row) and stored_row[index] not in active_ids:
+                tile_id = stored_row[index]
+                if tile_id != '__row__' and tile_id not in dormant_visible:
+                    segment.append(tile_id)
+                    dormant_visible.add(tile_id)
+                index += 1
+            if not segment:
+                continue
+
+            previous = next((
+                tile_id for tile_id in reversed(stored_row[:start])
+                if tile_id in active_visible
+            ), None)
+            following = next((
+                tile_id for tile_id in stored_row[index:]
+                if tile_id in active_visible
+            ), None)
+
+            if previous is not None:
+                anchor = after_tails.get(previous, previous)
+                location = locate(anchor)
+                if location is not None:
+                    row_index, item_index = location
+                    rows[row_index][item_index + 1:item_index + 1] = segment
+                    after_tails[previous] = segment[-1]
+                    continue
+            if following is not None:
+                location = locate(following)
+                if location is not None:
+                    row_index, item_index = location
+                    rows[row_index][item_index:item_index] = segment
+                    continue
+            orphan_rows.append(segment)
+
+    rows.extend(orphan_rows)
+    persisted_order = _flatten_tile_rows(rows)
+    persisted_hidden = list(dict.fromkeys(
+        tile_id for tile_id in active_hidden if tile_id in active_ids))
+    for tile_id in stored_hidden:
+        if (isinstance(tile_id, str)
+                and tile_id not in active_ids
+                and tile_id not in dormant_visible
+                and tile_id not in persisted_hidden):
+            persisted_hidden.append(tile_id)
+    return persisted_order, persisted_hidden
 
 
 class TileGrid(QWidget):
@@ -3857,18 +4013,47 @@ class TileGrid(QWidget):
             t.rowbreak_requested.connect(self._on_rowbreak)
 
         cfg = self._load_config()
-        if cfg:
-            saved_order = [tid for tid in cfg.get('tile_order', [])
-                           if tid == '__row__' or tid in self._tiles]
-            saved_hidden = [tid for tid in cfg.get('hidden_tiles', []) if tid in self._tiles]
-            saved_order, saved_hidden, _ = _merge_layout_tiles(
+        raw_order = cfg.get('tile_order')
+        raw_hidden = cfg.get('hidden_tiles', [])
+        has_saved_layout = isinstance(raw_order, list)
+        layout_changed = cfg.get('version') != CONFIG_VERSION
+        if not isinstance(raw_hidden, list):
+            raw_hidden = []
+            layout_changed = True
+        if has_saved_layout:
+            saved_order = [tile_id for tile_id in raw_order
+                           if tile_id == '__row__' or tile_id in self._tiles]
+            saved_hidden = [tile_id for tile_id in raw_hidden if tile_id in self._tiles]
+            saved_order, saved_hidden, merged = _merge_layout_tiles(
                 saved_order, saved_hidden, list(self._tiles), default_order)
             self._tile_order = saved_order
             self._hidden = saved_hidden
             self._min_row_h = int(cfg.get('min_row_h', self._min_row_h))
+            layout_changed = layout_changed or merged
         else:
+            # A window-only config is not a custom layout.  Preserve the exact
+            # factory rows rather than reconstructing one flat row from IDs.
             self._tile_order = list(default_order)
-            self._hidden = [tid for tid in self._tiles if tid not in default_order]
+            self._hidden = [tile_id for tile_id in self._tiles
+                            if tile_id not in default_order]
+            layout_changed = True
+
+        if layout_changed:
+            persisted_order, persisted_hidden = _preserve_dormant_layout(
+                self._tile_order, self._hidden,
+                raw_order if isinstance(raw_order, list) else [], raw_hidden,
+                set(self._tiles),
+            )
+            cfg.update({
+                'min_row_h': self._min_row_h,
+                'tile_order': persisted_order,
+                'hidden_tiles': persisted_hidden,
+            })
+            try:
+                _save_config_file(cfg)
+            except Exception as exc:
+                # A read-only home/config target must not prevent app startup.
+                logger.warning("Config migration save failed: %s", exc)
 
         self._vbox = QVBoxLayout(self)
         self._vbox.setSpacing(dp(6))
@@ -3879,14 +4064,7 @@ class TileGrid(QWidget):
 
     def _parse_rows(self) -> List[List[str]]:
         """Split _tile_order into rows of tile IDs (sentinels consumed)."""
-        rows: List[List[str]] = [[]]
-        for tid in self._tile_order:
-            if tid == '__row__':
-                if rows[-1]:          # only break if current row has content
-                    rows.append([])
-            else:
-                rows[-1].append(tid)
-        return [r for r in rows if r]
+        return _tile_rows(self._tile_order)
 
     def _relayout(self) -> None:
         # 1. Reparent all tiles to self so row-widget deletion doesn't kill them
@@ -4069,39 +4247,11 @@ class TileGrid(QWidget):
         after_row_idx == -1  → new row becomes the first row
         after_row_idx ==  N  → new row inserted after existing row N
         """
-        if tile_id not in self._tile_order:
+        new_order = _move_tile_to_new_row(
+            self._tile_order, tile_id, after_row_idx)
+        if new_order == self._tile_order:
             return
-        rows = self._parse_rows()
-
-        # Remove tile from current position (and clean up orphaned sentinels)
-        self._tile_order.remove(tile_id)
-        self._cleanup_rowbreaks()
-
-        if after_row_idx == -1:
-            # Prepend: tile goes before everything else
-            self._tile_order.insert(0, tile_id)
-            # Add a row-break after it only if there are other tiles
-            if len(self._tile_order) > 1 and self._tile_order[1] != '__row__':
-                self._tile_order.insert(1, '__row__')
-        else:
-            # Find the last tile of the target row and insert after it
-            if after_row_idx < len(rows):
-                anchor = rows[after_row_idx][-1]
-                idx = self._tile_order.index(anchor)
-                # Insert: __row__ + tile_id after anchor
-                self._tile_order.insert(idx + 1, '__row__')
-                self._tile_order.insert(idx + 2, tile_id)
-                # If next item is also a tile (not __row__), add another break
-                next_idx = idx + 3
-                if (next_idx < len(self._tile_order) and
-                        self._tile_order[next_idx] != '__row__'):
-                    self._tile_order.insert(next_idx, '__row__')
-            else:
-                # after_row_idx beyond existing rows → append new last row
-                self._tile_order.append('__row__')
-                self._tile_order.append(tile_id)
-
-        self._cleanup_rowbreaks()
+        self._tile_order = new_order
         self._relayout()
         self._save_config()
 
@@ -4174,17 +4324,27 @@ class TileGrid(QWidget):
     def _save_config(self) -> None:
         try:
             data = _load_config_file()
+            stored_order = data.get('tile_order', [])
+            stored_hidden = data.get('hidden_tiles', [])
+            if not isinstance(stored_order, list):
+                stored_order = []
+            if not isinstance(stored_hidden, list):
+                stored_hidden = []
+            persisted_order, persisted_hidden = _preserve_dormant_layout(
+                self._tile_order, self._hidden, stored_order, stored_hidden,
+                set(self._tiles),
+            )
             data.update({
-                'min_row_h':    self._min_row_h,
-                'tile_order':   self._tile_order,
-                'hidden_tiles': self._hidden,
+                'min_row_h': self._min_row_h,
+                'tile_order': persisted_order,
+                'hidden_tiles': persisted_hidden,
             })
             _save_config_file(data)
         except Exception as exc:
             logger.warning("Config save failed: %s", exc)
 
     def reset_layout(self, default_order: List[str]) -> None:
-        """Restore factory layout — removes all row breaks."""
+        """Restore the factory layout, including its default row breaks."""
         self._tile_order = [tid for tid in default_order if tid in self._tiles]
         self._hidden     = [tid for tid in self._tiles if tid not in self._tile_order]
         self._min_row_h  = 130
@@ -4334,8 +4494,9 @@ def _short_sha(sha: str) -> str:
     return sha[:7] if sha else "unknown"
 
 
-def _build_rebuild_bat(repo_root: Path, exe_path: Path, pid: int, log_path: Path) -> str:
-    """Build the Windows .bat that rebuilds the noconsole EXE and relaunches it.
+def _build_rebuild_bat(repo_root: Path, exe_path: Path, pid: int,
+                       log_path: Path, pull_branch: str = "") -> str:
+    """Build the Windows .bat that updates, rebuilds and relaunches the EXE.
 
     The helper waits for `pid` (the currently running Tricorder process) to
     exit so the .exe file lock is released, ensures a `.venv` exists (creating
@@ -4347,11 +4508,15 @@ def _build_rebuild_bat(repo_root: Path, exe_path: Path, pid: int, log_path: Path
     """
     lines = [
         "@echo off",
+        "chcp 65001 >NUL",
+        "set PYTHONUTF8=1",
         "setlocal enableextensions",
         f'set "REPO={repo_root}"',
         f'set "PID={pid}"',
         f'set "EXE={exe_path}"',
         f'set "LOG={log_path}"',
+        f'set "PULL_BRANCH={pull_branch}"',
+        'set "BUILT=%REPO%\\dist\\system_tricorder.exe"',
         'set "PYEXE=%REPO%\\.venv\\Scripts\\python.exe"',
         'echo [%date% %time%] tricorder rebuild helper started >> "%LOG%"',
         "",
@@ -4368,7 +4533,24 @@ def _build_rebuild_bat(repo_root: Path, exe_path: Path, pid: int, log_path: Path
         'echo [%date% %time%] force-killing PID %PID% >> "%LOG%"',
         "taskkill /PID %PID% /F >NUL 2>&1",
         ":procgone",
-        'echo [%date% %time%] process gone, starting build >> "%LOG%"',
+        'echo [%date% %time%] process gone, installing deferred update >> "%LOG%"',
+        "",
+        "REM --- Pull only after the running tracked EXE has released its lock ---",
+        'if "%PULL_BRANCH%"=="" goto pull_done',
+        "where git >NUL 2>&1",
+        "if errorlevel 1 (",
+        '    echo [%date% %time%] ERROR: git not found, aborting update >> "%LOG%"',
+        "    goto cleanup",
+        ")",
+        'pushd "%REPO%"',
+        f'git pull --ff-only --autostash "{GITHUB_REPO_URL}" "%PULL_BRANCH%" >> "%LOG%" 2>&1',
+        'set "PULLRC=%errorlevel%"',
+        "popd",
+        'if not "%PULLRC%"=="0" (',
+        '    echo [%date% %time%] ERROR: deferred git pull failed (rc=%PULLRC%) >> "%LOG%"',
+        "    goto cleanup",
+        ")",
+        ":pull_done",
         "",
         "REM --- Ensure .venv exists (create one in the repo folder if missing) ---",
         'if not exist "%PYEXE%" (',
@@ -4389,10 +4571,10 @@ def _build_rebuild_bat(repo_root: Path, exe_path: Path, pid: int, log_path: Path
         '"%PYEXE%" -m pip install --upgrade pip >> "%LOG%" 2>&1',
         '"%PYEXE%" -m pip install -r "%REPO%\\requirements.txt" pyinstaller >> "%LOG%" 2>&1',
         "",
-        "REM --- Build the noconsole onefile EXE (matches README) ---",
+        "REM --- Build from the tracked spec (icon, PNG and version metadata) ---",
         'echo [%date% %time%] building EXE >> "%LOG%"',
         'pushd "%REPO%"',
-        '"%PYEXE%" -m PyInstaller --noconsole --onefile --icon "assets\\SystemTricorder.ico" --add-data "assets\\SystemTricorder.png;assets" system_tricorder.py >> "%LOG%" 2>&1',
+        '"%PYEXE%" -m PyInstaller --clean --noconfirm system_tricorder.spec >> "%LOG%" 2>&1',
         'set "BUILDRC=%errorlevel%"',
         "popd",
         'if not "%BUILDRC%"=="0" (',
@@ -4400,7 +4582,20 @@ def _build_rebuild_bat(repo_root: Path, exe_path: Path, pid: int, log_path: Path
         "    goto cleanup",
         ")",
         "",
-        "REM --- Relaunch the EXE if it exists ---",
+        "REM --- Replace a renamed checkout EXE with the freshly built binary ---",
+        'if not exist "%BUILT%" (',
+        '    echo [%date% %time%] ERROR: built EXE missing: %BUILT% >> "%LOG%"',
+        "    goto cleanup",
+        ")",
+        'if /I not "%BUILT%"=="%EXE%" (',
+        '    copy /Y "%BUILT%" "%EXE%" >> "%LOG%" 2>&1',
+        "    if errorlevel 1 (",
+        '        echo [%date% %time%] ERROR: could not replace %EXE% >> "%LOG%"',
+        "        goto cleanup",
+        "    )",
+        ")",
+        "",
+        "REM --- Relaunch the exact executable path that initiated the update ---",
         'if exist "%EXE%" (',
         '    echo [%date% %time%] relaunching %EXE% >> "%LOG%"',
         '    start "" "%EXE%"',
@@ -4424,12 +4619,14 @@ class UpdateWorker(QThread):
     """
 
     update_finished = pyqtSignal(bool, str)
-    # Set by _check_and_install() when a git pull changed Python source files.
-    # The dashboard reads this to decide whether to trigger an EXE rebuild.
+    # Set when a git pull changes source or packaging inputs that affect the EXE.
+    # The dashboard reads this to decide whether to trigger a rebuild.
     rebuild_needed: bool = False
+    deferred_pull_branch: str = ""
 
     def run(self) -> None:                                                # type: ignore[override]
         self.rebuild_needed = False
+        self.deferred_pull_branch = ""
         try:
             ok, message = self._check_and_install()
         except Exception as exc:
@@ -4499,16 +4696,32 @@ class UpdateWorker(QThread):
                 f"Lokale Settings bleiben in {CONFIG_FILE}.",
             )
 
+        if platform.system() == "Windows" and getattr(sys, "frozen", False):
+            # The checked-in EXE may itself change in the pull.  A running
+            # Windows executable cannot be replaced reliably, so let the
+            # detached helper pull only after this process has exited.
+            self.deferred_pull_branch = remote_branch
+            self.rebuild_needed = True
+            return (
+                True,
+                "Update bereit: "
+                f"{_short_sha(current_sha)} -> {_short_sha(remote_sha)}. "
+                "Download und EXE-Neubau starten nach dem Schliessen. "
+                f"Lokale Settings bleiben unveraendert ({CONFIG_FILE}).",
+            )
+
         self._run_git(repo_root, ["pull", "--ff-only", "--autostash", GITHUB_REPO_URL, remote_branch], timeout=180)
         new_sha = self._run_git(repo_root, ["rev-parse", "HEAD"])
-        py_changed = self._python_files_changed(repo_root, current_sha, new_sha)
-        self.rebuild_needed = py_changed
-        if py_changed and platform.system() == "Windows" and getattr(sys, "frozen", False):
-            extra = " Python-Code hat sich geaendert - die EXE wird nach dem Neustart automatisch neu gebaut."
-        elif py_changed:
-            extra = " Python-Code hat sich geaendert - bitte die App neu starten bzw. das native Paket neu bauen."
+        rebuild_changed = self._rebuild_inputs_changed(
+            repo_root, current_sha, new_sha)
+        self.rebuild_needed = rebuild_changed
+        if (rebuild_changed and platform.system() == "Windows"
+                and getattr(sys, "frozen", False)):
+            extra = " App- oder Paketdateien haben sich geaendert - die EXE wird nach dem Neustart automatisch neu gebaut."
+        elif rebuild_changed:
+            extra = " App- oder Paketdateien haben sich geaendert - bitte die App neu starten bzw. das native Paket neu bauen."
         else:
-            extra = " Keine .py-Aenderungen - kein Paket-Rebuild noetig."
+            extra = " Keine rebuild-relevanten Aenderungen - kein Paket-Rebuild noetig."
         return (
             True,
             "Update installiert: "
@@ -4517,20 +4730,23 @@ class UpdateWorker(QThread):
             + extra,
         )
 
-    def _python_files_changed(self, repo_root: Path, old_sha: str, new_sha: str) -> bool:
-        """Return True if any .py file changed between old_sha and new_sha.
-
-        Used to decide whether an (expensive) EXE rebuild is necessary after
-        a fast-forward pull.  Non-code changes (README, docs, images) return
-        False so we skip the 1-3 minute PyInstaller build.
-        """
+    def _rebuild_inputs_changed(self, repo_root: Path,
+                                old_sha: str, new_sha: str) -> bool:
+        """Return whether source or packaging inputs changed between commits."""
         if not old_sha or not new_sha or old_sha == new_sha:
             return False
         try:
-            out = self._run_git(repo_root, ["diff", "--name-only", old_sha, new_sha], timeout=30)
+            out = self._run_git(
+                repo_root, ["diff", "--name-only", old_sha, new_sha], timeout=30)
         except Exception:
             return True  # if the diff fails, assume a rebuild is safer
-        return any(line.strip().lower().endswith(".py") for line in out.splitlines())
+        for line in out.splitlines():
+            path = line.strip().replace('\\', '/').lower()
+            if (path.endswith(('.py', '.spec'))
+                    or path == 'requirements.txt'
+                    or path.startswith('assets/')):
+                return True
+        return False
 
 
 def section_label(html: str) -> QLabel:
@@ -4556,7 +4772,7 @@ def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD  v2.7
+# MAIN DASHBOARD  v2.7.1
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TricorderDashboard(QMainWindow):
@@ -4916,9 +5132,12 @@ class TricorderDashboard(QMainWindow):
         for gi, (gname, _, _) in enumerate(self.detected_gpus):
             pal = GPU_PALETTES[gi % len(GPU_PALETTES)]
             sn  = short_gpu_name(gname)
+            reg(f"gpu_{gi}_total",
+                MetricTile(f"gpu_{gi}_total", f"{sn} · GPU", pal[3]),
+                f"{sn} · GPU")
             reg(f"gpu_{gi}_3d",
                 GPU3DComputeTile(f"gpu_{gi}_3d", sn, pal),
-                f"{sn} · GPU / 3D / Compute")
+                f"{sn} · 3D / Compute")
             reg(f"gpu_{gi}_copy",
                 GPUCopyTile(f"gpu_{gi}_copy", sn, pal),
                 f"{sn} · Copy")
@@ -4963,7 +5182,10 @@ class TricorderDashboard(QMainWindow):
         self._btn_update.setEnabled(True)
         self._btn_update.setText("⬇  Update")
         worker = self._update_worker
-        rebuild_needed = bool(worker is not None and getattr(worker, "rebuild_needed", False))
+        rebuild_needed = bool(
+            worker is not None and getattr(worker, "rebuild_needed", False))
+        deferred_pull_branch = str(
+            getattr(worker, "deferred_pull_branch", "") if worker is not None else "")
         self._update_worker = None
         if worker is not None:
             worker.deleteLater()
@@ -4983,24 +5205,21 @@ class TricorderDashboard(QMainWindow):
                 "startet sie danach automatisch neu. Details stehen in der "
                 "Datei tricorder_rebuild_<pid>.log im TEMP-Ordner.",
             )
-            if self._spawn_rebuild_and_restart():
+            if self._spawn_rebuild_and_restart(deferred_pull_branch):
                 self.close()  # releases the .exe lock so PyInstaller can overwrite it
             else:
                 QMessageBox.warning(
                     self, "System Tricorder Update",
                     "Der automatische Rebuild konnte nicht gestartet werden. "
                     "Bitte System Tricorder manuell schliessen und neu bauen:\n"
-                    ".venv\\Scripts\\python.exe -m PyInstaller --noconsole --onefile "
-                    "--icon assets\\SystemTricorder.ico "
-                    "--add-data assets\\SystemTricorder.png;assets system_tricorder.py",
+                    ".venv\\Scripts\\python.exe -m PyInstaller --clean --noconfirm "
+                    "system_tricorder.spec",
                 )
         else:
             QMessageBox.information(self, "System Tricorder Update", message)
 
-    def _spawn_rebuild_and_restart(self) -> bool:
-        """Spawn a detached helper .bat (Windows) that rebuilds the noconsole
-        EXE after this process exits and relaunches it.  Returns True on
-        successful launch of the helper."""
+    def _spawn_rebuild_and_restart(self, pull_branch: str = "") -> bool:
+        """Spawn the detached Windows update/rebuild/relaunch helper."""
         try:
             repo_root = _find_git_checkout(_app_start_dir())
             if repo_root is None:
@@ -5010,8 +5229,11 @@ class TricorderDashboard(QMainWindow):
             tmp_dir = Path(os.environ.get("TEMP", str(repo_root)))
             bat_path = tmp_dir / f"tricorder_rebuild_{pid}.bat"
             log_path = tmp_dir / f"tricorder_rebuild_{pid}.log"
-            bat_text = _build_rebuild_bat(repo_root, exe_path, pid, log_path)
-            bat_path.write_text(bat_text)  # default locale encoding; repo paths are ASCII here
+            bat_text = _build_rebuild_bat(
+                repo_root, exe_path, pid, log_path, pull_branch)
+            # The helper switches cmd.exe to code page 65001 before any paths
+            # are consumed, so non-ASCII user/repo names remain intact.
+            bat_path.write_text(bat_text, encoding="utf-8")
             DETACHED_PROCESS = 0x00000008
             CREATE_NEW_PROCESS_GROUP = 0x00000200
             CREATE_NO_WINDOW = 0x08000000
@@ -5180,10 +5402,13 @@ class TricorderDashboard(QMainWindow):
             w.update_val(m.igpu_percent)
 
         for i, gm in enumerate(m.gpus):
+            w_total = _t(f"gpu_{i}_total")
+            if w_total:
+                w_total.update_val(gm.gpu_total_percent)
             w_3d = _t(f"gpu_{i}_3d")
             if w_3d:
                 w_3d.update_3d_compute(
-                    gm.gpu_total_percent, gm.gpu_3d_percent, gm.gpu_compute_percent)
+                    gm.gpu_3d_percent, gm.gpu_compute_percent)
             w_copy = _t(f"gpu_{i}_copy")
             if w_copy:
                 w_copy.update_copy(gm.gpu_copy0_percent, gm.gpu_copy1_percent)

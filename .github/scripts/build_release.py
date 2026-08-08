@@ -39,6 +39,8 @@ def main() -> int:
     shutil.rmtree(dist_dir, ignore_errors=True)
     shutil.rmtree(build_dir, ignore_errors=True)
     release_dir.mkdir(exist_ok=True)
+    generated_spec_dir = build_dir / "generated-spec"
+    generated_spec_dir.mkdir(parents=True, exist_ok=True)
 
     command = [
         sys.executable,
@@ -50,15 +52,17 @@ def main() -> int:
         "--onefile",
         "--name",
         "SystemTricorder",
+        "--specpath",
+        str(generated_spec_dir),
         "--add-data",
-        f"assets/SystemTricorder.png{os.pathsep}assets",
+        f"{root / 'assets' / 'SystemTricorder.png'}{os.pathsep}assets",
     ]
     if sys.platform == "win32":
         command.extend([
-            "--icon", "assets/SystemTricorder.ico",
-            "--version-file", "assets/version_info.txt",
+            "--icon", str(root / "assets" / "SystemTricorder.ico"),
+            "--version-file", str(root / "assets" / "version_info.txt"),
         ])
-    command.append("system_tricorder.py")
+    command.append(str(root / "system_tricorder.py"))
     subprocess.run(command, cwd=root, check=True)
 
     arch = normalized_arch()

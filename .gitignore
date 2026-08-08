@@ -7,8 +7,10 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .vs/
+.pi-subagents/
 
 build/
 release/
 *.spec
+!system_tricorder.spec
 .DS_Store

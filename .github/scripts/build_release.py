@@ -54,19 +54,41 @@ def main() -> int:
         f"assets/SystemTricorder.png{os.pathsep}assets",
     ]
     if sys.platform == "win32":
-        command.extend(["--icon", "assets/SystemTricorder.ico"])
+        command.extend([
+            "--icon", "assets/SystemTricorder.ico",
+            "--version-file", "assets/version_info.txt",
+        ])
     command.append("system_tricorder.py")
     subprocess.run(command, cwd=root, check=True)
 
     arch = normalized_arch()
     if sys.platform == "win32":
         source = dist_dir / "SystemTricorder.exe"
+        smoke_executable = source
         artifact = release_dir / f"SystemTricorder-{args.slug}-{arch}.exe"
-        shutil.copy2(source, artifact)
     else:
         app_bundle = dist_dir / "SystemTricorder.app"
         source = app_bundle if app_bundle.exists() else dist_dir / "SystemTricorder"
+        smoke_executable = (
+            app_bundle / "Contents" / "MacOS" / "SystemTricorder"
+            if app_bundle.exists() else source
+        )
         artifact = release_dir / f"SystemTricorder-{args.slug}-{arch}.tar.gz"
+
+    smoke_home = build_dir / "self-test-home"
+    smoke_home.mkdir(parents=True, exist_ok=True)
+    smoke_env = os.environ.copy()
+    smoke_env.update({"HOME": str(smoke_home), "USERPROFILE": str(smoke_home)})
+    try:
+        subprocess.run(
+            [str(smoke_executable), "--self-test"], cwd=root, env=smoke_env,
+            check=True, timeout=60,
+        )
+    finally:
+        shutil.rmtree(smoke_home, ignore_errors=True)
+    if sys.platform == "win32":
+        shutil.copy2(source, artifact)
+    else:
         with tarfile.open(artifact, "w:gz") as archive:
             archive.add(source, arcname=source.name)
 

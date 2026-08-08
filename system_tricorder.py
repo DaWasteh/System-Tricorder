@@ -19,10 +19,10 @@ except Exception:
     pynvml = None                                               # type: ignore
     NVML_AVAILABLE = False
 if platform.system() == 'Windows':
-    from ctypes import wintypes
+    from ctypes import wintypes  # pyright: ignore[reportAssignmentType]
 else:
     # Define dummy wintypes on non-Windows platforms for ctypes structures.
-    class wintypes:
+    class wintypes:  # type: ignore[reportAssignmentType]
         DWORD = ctypes.c_uint32
         LPWSTR = ctypes.c_wchar_p
         ULONGLONG = ctypes.c_uint64
@@ -31,7 +31,7 @@ import psutil
 from pathlib import Path
 from collections import deque
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 
 # ── High-DPI scaling helpers ──────────────────────────────────────────────────
@@ -134,8 +134,8 @@ except ImportError:
 
 # ── Layout / window config ────────────────────────────────────────────────────
 CONFIG_FILE = Path.home() / ".tricorder_layout.json"
-CONFIG_VERSION = "0.8"
-APP_VERSION = "2.1"
+CONFIG_VERSION = "0.9"
+APP_VERSION = "2.7"
 GITHUB_REPO_URL = "https://github.com/DaWasteh/System-Tricorder.git"
 
 
@@ -480,6 +480,75 @@ def _linux_read_amd_vram(card_dir: str) -> Tuple[float, float]:
         return (0.0, 0.0)
 
 
+def _linux_read_gpu_power_watts(card_dir: str) -> Optional[float]:
+    """Read a DRM device's hwmon power sensor (sysfs reports microwatts)."""
+    try:
+        hwmon_root = Path(card_dir) / "device" / "hwmon"
+        for hwmon in hwmon_root.glob("hwmon*"):
+            for filename in ("power1_average", "power1_input"):
+                path = hwmon / filename
+                if path.is_file():
+                    value = float(path.read_text().strip()) / 1_000_000.0
+                    if math.isfinite(value) and value >= 0:
+                        return value
+    except Exception:
+        pass
+    return None
+
+
+class _LinuxCpuPowerSampler:
+    """Best-effort CPU package power from Linux powercap energy deltas."""
+
+    def __init__(self) -> None:
+        self._domains: List[Tuple[Path, Optional[int]]] = []
+        self._previous: Dict[Path, Tuple[int, float]] = {}
+        if platform.system() != "Linux":
+            return
+        powercap = Path("/sys/class/powercap")
+        try:
+            candidates = list(powercap.glob("intel-rapl:*")) + list(powercap.glob("amd-rapl:*"))
+            for domain in candidates:
+                # Keep package domains (intel-rapl:0), not subdomains such as
+                # intel-rapl:0:0 which would double-count cores/DRAM.
+                if domain.name.count(":") != 1:
+                    continue
+                name = (domain / "name").read_text(errors="ignore").strip().lower()
+                energy_path = domain / "energy_uj"
+                if "package" not in name or not energy_path.is_file():
+                    continue
+                max_range: Optional[int] = None
+                with contextlib.suppress(Exception):
+                    max_range = int((domain / "max_energy_range_uj").read_text().strip())
+                self._domains.append((energy_path, max_range))
+        except Exception:
+            self._domains = []
+
+    def sample(self) -> Optional[float]:
+        if not self._domains:
+            return None
+        now = time.monotonic()
+        total_watts = 0.0
+        valid = 0
+        for energy_path, max_range in self._domains:
+            try:
+                energy_uj = int(energy_path.read_text().strip())
+                previous = self._previous.get(energy_path)
+                self._previous[energy_path] = (energy_uj, now)
+                if previous is None:
+                    continue
+                previous_uj, previous_t = previous
+                delta = energy_uj - previous_uj
+                if delta < 0 and max_range:
+                    delta += max_range
+                dt = now - previous_t
+                if delta >= 0 and dt > 0:
+                    total_watts += delta / 1_000_000.0 / dt
+                    valid += 1
+            except Exception:
+                continue
+        return total_watts if valid else None
+
+
 def _read_nvml_gpu(handle) -> Tuple[float, float, float]:
     """Return ``(gpu_util, vram_used_gb, vram_total_gb)`` via NVML.
 
@@ -489,9 +558,19 @@ def _read_nvml_gpu(handle) -> Tuple[float, float, float]:
     try:
         util = pynvml.nvmlDeviceGetUtilizationRates(handle)       # type: ignore
         mem  = pynvml.nvmlDeviceGetMemoryInfo(handle)             # type: ignore
-        return (float(util.gpu), mem.used / (1024 ** 3), mem.total / (1024 ** 3))
+        return (float(util.gpu), float(mem.used) / (1024 ** 3),
+                float(mem.total) / (1024 ** 3))
     except Exception:
         return (0.0, 0.0, 0.0)
+
+
+def _read_nvml_power_watts(handle) -> Optional[float]:
+    """Return total NVIDIA board power in watts when NVML exposes it."""
+    try:
+        milliwatts = float(pynvml.nvmlDeviceGetPowerUsage(handle))  # type: ignore
+        return max(milliwatts, 0.0) / 1000.0
+    except Exception:
+        return None
 
 
 class _LinuxDrmFdinfoSampler:
@@ -736,56 +815,42 @@ class _PdhCounterItem(ctypes.Structure):
     _fields_ = [("szName", wintypes.LPWSTR), ("FmtValue", _PdhFmtValue)]
 
 
-class _PdhGpuSampler:
-    """Read GPU engine utilization straight from the Windows PDH (Performance
-    Data Helper) API — the same data source Task Manager uses.
-
-    Why not WMI?  ``Win32_PerfFormattedData_...GPUEngine`` is *cached* by the
-    perflib adapter for ~1 second: at 30 FPS the same stale value is returned
-    ~30 times before it jumps.  On bursty workloads (AI/compute on RDNA3/4) the
-    cache window often lands on an idle gap, so the dashboard read "long
-    stretches of 0 %" while Adrenalin reported a sustained load.  PDH returns a
-    freshly computed value on every collect — no cache.
-
-    A single wildcard counter is registered::
-
-        \\GPU Engine(*)\\Utilization Percentage
-
-    PDH maintains the highly-dynamic per-process instance list internally, so
-    we never enumerate instances ourselves.  ``sample()`` returns every live
-    engine as ``(name_lower, util)`` — the exact shape the old WMI rows had —
-    so the aggregation pipeline is reused verbatim.
-
-    The "GPU Engine" / "Utilization Percentage" names are English-only on
-    every locale (absent from all non-009 Perflib language tables), so the
-    English path is universal and safe on German/other-language Windows.
-    """
+class _PdhArraySampler:
+    """Small wildcard-array PDH reader shared by fast Windows sensors."""
 
     _PDH_FMT_DOUBLE = 0x00000200
-    _PDH_MORE_DATA  = 0x800007D2
-    _PATH = "\\GPU Engine(*)\\Utilization Percentage"
+    _PDH_MORE_DATA = 0x800007D2
 
-    def __init__(self) -> None:
+    def __init__(self, path: str, label: str, *, english_path: bool = False,
+                 warn_on_failure: bool = True) -> None:
+        self._path = path
+        self._label = label
         self._ok = False
-        self._query:  Optional[ctypes.c_void_p] = None
+        self._query: Optional[ctypes.c_void_p] = None
         self._counter: Optional[ctypes.c_void_p] = None
+        self._buffer = None
+        self._buffer_size = 0
         try:
             self._pdh = ctypes.WinDLL("pdh")
             query = ctypes.c_void_p()
             if self._pdh.PdhOpenQueryW(None, None, ctypes.byref(query)) != 0:
-                return
+                raise RuntimeError("PdhOpenQueryW failed")
             counter = ctypes.c_void_p()
-            if self._pdh.PdhAddCounterW(query, self._PATH, 0, ctypes.byref(counter)) != 0:
+            add_counter = (self._pdh.PdhAddEnglishCounterW
+                           if english_path else self._pdh.PdhAddCounterW)
+            status = int(add_counter(query, path, 0, ctypes.byref(counter))) & 0xFFFFFFFF
+            if status != 0:
                 self._pdh.PdhCloseQuery(query)
-                return
+                raise RuntimeError(f"counter add failed with 0x{status:08X}")
             self._query = query
             self._counter = counter
-            self._pdh.PdhCollectQueryData(query)          # prime: ≥2 collects needed for a rate
+            # Prime rate/delta counters.  The first formatted sample otherwise
+            # commonly reports zero even when the hardware is already active.
+            self._pdh.PdhCollectQueryData(query)
             self._ok = True
         except Exception as exc:
-            # One-time event with real consequences (falls back to cached
-            # WMI counters) — belongs in the log file, not on debug level.
-            logger.warning("PDH GPU sampler init failed: %s", exc)
+            log = logger.warning if warn_on_failure else logger.info
+            log("%s unavailable: %s", label, exc)
             self._ok = False
 
     @property
@@ -793,37 +858,40 @@ class _PdhGpuSampler:
         return self._ok
 
     def sample(self) -> List[Tuple[str, float]]:
-        if not self._ok or self._query is None:
+        if not self._ok or self._query is None or self._counter is None:
             return []
         try:
-            self._pdh.PdhCollectQueryData(self._query)
+            collect_status = int(self._pdh.PdhCollectQueryData(self._query)) & 0xFFFFFFFF
+            if collect_status != 0:
+                return []
             size = wintypes.DWORD(0)
             count = wintypes.DWORD(0)
             self._pdh.PdhGetFormattedCounterArrayW(
                 self._counter, self._PDH_FMT_DOUBLE,
                 ctypes.byref(size), ctypes.byref(count), None)
-            # The per-process instance list can grow between the size call and
-            # the data call (spawning processes = new GPU engine instances);
-            # PDH then fails with PDH_MORE_DATA and an updated required size.
-            # Retry instead of dropping the whole sample.
+            # Dynamic per-process GPU instances can appear between the sizing
+            # and data calls.  PDH then updates ``size`` and returns MORE_DATA;
+            # retry rather than discarding the complete telemetry frame.
             for _ in range(3):
                 if size.value == 0:
                     return []
-                buf = (ctypes.c_ubyte * size.value)()
+                if self._buffer is None or size.value > self._buffer_size:
+                    self._buffer_size = int(size.value)
+                    self._buffer = (ctypes.c_ubyte * self._buffer_size)()
                 count = wintypes.DWORD(0)
-                status = self._pdh.PdhGetFormattedCounterArrayW(
+                status = int(self._pdh.PdhGetFormattedCounterArrayW(
                     self._counter, self._PDH_FMT_DOUBLE,
-                    ctypes.byref(size), ctypes.byref(count), buf) & 0xFFFFFFFF
+                    ctypes.byref(size), ctypes.byref(count), self._buffer)) & 0xFFFFFFFF
                 if status == 0:
-                    arr = (_PdhCounterItem * count.value).from_buffer(buf)
-                    return [(str(it.szName).lower(), float(it.FmtValue.doubleValue))
-                            for it in arr
-                            if it.szName and it.FmtValue.CStatus == 0]
+                    arr = (_PdhCounterItem * count.value).from_buffer(self._buffer)
+                    return [(str(item.szName).lower(), float(item.FmtValue.doubleValue))
+                            for item in arr
+                            if item.szName and item.FmtValue.CStatus in (0, 1)]
                 if status != self._PDH_MORE_DATA:
                     return []
             return []
         except Exception as exc:
-            logger.debug("PDH GPU sample failed: %s", exc)
+            logger.debug("%s sample failed: %s", self._label, exc)
             return []
 
     def close(self) -> None:
@@ -833,6 +901,325 @@ class _PdhGpuSampler:
         self._ok = False
         self._query = None
         self._counter = None
+        self._buffer = None
+        self._buffer_size = 0
+
+
+class _PdhGpuSampler(_PdhArraySampler):
+    """Task-Manager-grade WDDM engine split without WMI/perflib caching.
+
+    ``GPU Engine`` object/counter names are invariant English even on localized
+    Windows installations.  ADLX augments this per-engine stream with AMD's
+    authoritative overall utilization because WDDM can undersample long RDNA4
+    compute dispatches.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            r"\GPU Engine(*)\Utilization Percentage", "PDH GPU sampler")
+
+
+class _PdhGpuMemorySampler(_PdhArraySampler):
+    """Read dedicated GPU memory without a blocking WMI round trip."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            r"\GPU Adapter Memory(*)\Dedicated Usage", "PDH GPU memory sampler",
+            warn_on_failure=False)
+
+
+class _PdhEnergySampler(_PdhArraySampler):
+    """Read Windows Energy Meter package power via a locale-neutral path."""
+
+    def __init__(self) -> None:
+        # Unlike GPU counters, Energy Meter is localized ("Energiemessung" on
+        # de-DE).  PdhAddEnglishCounterW maps this canonical path correctly.
+        super().__init__(r"\Energy Meter(*)\Power", "PDH CPU energy sampler",
+                         english_path=True, warn_on_failure=False)
+
+
+def _cpu_package_power_from_pdh(rows: List[Tuple[str, float]]) -> Optional[float]:
+    """Convert Energy Meter RAPL package values from milliwatts to watts.
+
+    ``PKG`` already includes cores/uncore/iGPU.  Summing PP0/PP1/DRAM with it
+    would double-count power, so only one PKG channel per socket is used.  A
+    PP0-only system is left unsupported because core power is not package power.
+    """
+    package_mw = [value for name, value in rows
+                  if re.fullmatch(r"rapl_package\d+_pkg", name) and value >= 0]
+    if package_mw:
+        return sum(package_mw) / 1000.0
+    # PP0 is core-domain power, not package power.  Showing it under a CPU
+    # package label would be misleading, so unsupported is preferable.
+    return None
+
+
+class _AdlxGpuSampler:
+    """Read AMD's driver-native overall load, board/GPU power and VRAM metrics.
+
+    WDDM's ``GPU Engine`` counters are useful for the 3D/Compute/Copy/Codec
+    split, but some long RDNA4 compute dispatches only appear there as a brief
+    100 % pulse every few seconds.  AMD Software uses ADLX instead and reports
+    the GPU as continuously busy.  This small ctypes wrapper calls the public
+    ADLX C ABI from the driver-installed ``amdadlx64.dll`` directly, avoiding
+    both the obsolete ADL path and third-party binary Python bindings.
+
+    ADLX interfaces are reference counted.  Every interface obtained here is
+    released before ``ADLXTerminate``; getting that order wrong can crash while
+    the DLL unloads.  The sampler is created, sampled and closed in the monitor
+    thread so all driver calls stay off the Qt UI thread.
+    """
+
+    # ADLX SDK V1.4 full version (1.4.0.110).  ADLX interfaces are ABI-locked,
+    # and newer drivers (including ADLX 1.5 on RDNA4) accept this client version.
+    _CLIENT_VERSION = (1 << 48) | (4 << 32) | 110
+    _SUCCESS = (0, 1, 2)  # ADLX_OK / ALREADY_ENABLED / ALREADY_INITIALIZED
+
+    def __init__(self) -> None:
+        self._dll = None
+        self._terminate = None
+        self._initialized = False
+        self._started = False
+        self._ok = False
+        self._system = ctypes.c_void_p()
+        self._perf = ctypes.c_void_p()
+        self._gpus: List[dict] = []
+
+        if platform.system() != "Windows":
+            return
+        try:
+            dll_name = "amdadlx64.dll" if ctypes.sizeof(ctypes.c_void_p) == 8 else "amdadlx32.dll"
+            system_dir = Path(os.environ.get("WINDIR", r"C:\Windows")) / (
+                "System32" if ctypes.sizeof(ctypes.c_void_p) == 8 else "SysWOW64"
+            )
+            dll_path = system_dir / dll_name
+            # An absolute System32 path prevents cwd-based DLL hijacking.  Some
+            # driver packages expose ADLX only through the normal secure loader
+            # path, so retain a name-only fallback when the file is not present.
+            self._dll = ctypes.CDLL(str(dll_path if dll_path.is_file() else dll_name))
+
+            init2 = getattr(self._dll, "ADLXInitialize2", None)
+            mapping = ctypes.c_void_p()
+            if init2 is not None:
+                init2.argtypes = [ctypes.c_uint64, ctypes.POINTER(ctypes.c_void_p),
+                                  ctypes.POINTER(ctypes.c_void_p)]
+                init2.restype = ctypes.c_int32
+                result = int(init2(self._CLIENT_VERSION, ctypes.byref(self._system),
+                                   ctypes.byref(mapping)))
+            else:
+                init1 = self._dll.ADLXInitialize
+                init1.argtypes = [ctypes.c_uint64, ctypes.POINTER(ctypes.c_void_p)]
+                init1.restype = ctypes.c_int32
+                result = int(init1(self._CLIENT_VERSION, ctypes.byref(self._system)))
+            if result not in self._SUCCESS or not self._system:
+                raise RuntimeError(f"ADLXInitialize failed with result {result}")
+            self._initialized = True
+
+            self._terminate = self._dll.ADLXTerminate
+            self._terminate.argtypes = []
+            self._terminate.restype = ctypes.c_int32
+
+            gpu_list = ctypes.c_void_p()
+            if self._call(self._system, 1, ctypes.c_int32,
+                          [ctypes.POINTER(ctypes.c_void_p)], ctypes.byref(gpu_list)) != 0:
+                raise RuntimeError("ADLX GetGPUs failed")
+            try:
+                begin = int(self._call(gpu_list, 5, ctypes.c_uint32, []))
+                end = int(self._call(gpu_list, 6, ctypes.c_uint32, []))
+                for index in range(begin, end):
+                    gpu = ctypes.c_void_p()
+                    result = self._call(
+                        gpu_list, 11, ctypes.c_int32,
+                        [ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)],
+                        index, ctypes.byref(gpu),
+                    )
+                    if result != 0 or not gpu:
+                        continue
+                    self._gpus.append({
+                        "ptr": gpu,
+                        "name": self._gpu_string(gpu, 7),
+                        "device_id": self._normalise_device_id(self._gpu_string(gpu, 14)),
+                    })
+            finally:
+                self._release(gpu_list)
+
+            if not self._gpus:
+                raise RuntimeError("ADLX returned no AMD GPUs")
+            if self._call(
+                self._system, 9, ctypes.c_int32,
+                [ctypes.POINTER(ctypes.c_void_p)], ctypes.byref(self._perf),
+            ) != 0 or not self._perf:
+                raise RuntimeError("ADLX GetPerformanceMonitoringServices failed")
+
+            # 250 ms is the minimum advertised by current ADLX drivers.  A
+            # rejected interval is harmless: the driver's existing interval is
+            # retained and GetCurrentGPUMetrics still returns valid samples.
+            self._call(self._perf, 4, ctypes.c_int32, [ctypes.c_int32], 250)
+            result = self._call(self._perf, 11, ctypes.c_int32, [])
+            if result not in self._SUCCESS:
+                raise RuntimeError(f"ADLX tracking start failed with result {result}")
+            self._started = True
+
+            for gpu_info in self._gpus:
+                support = ctypes.c_void_p()
+                result = self._call(
+                    self._perf, 21, ctypes.c_int32,
+                    [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)],
+                    gpu_info["ptr"], ctypes.byref(support),
+                )
+                if result == 0 and support:
+                    try:
+                        gpu_info["usage_supported"] = self._support_flag(support, 3)
+                        gpu_info["gpu_power_supported"] = self._support_flag(support, 8)
+                        gpu_info["board_power_supported"] = self._support_flag(support, 9)
+                        gpu_info["vram_supported"] = self._support_flag(support, 11)
+                    finally:
+                        self._release(support)
+                else:
+                    gpu_info.update({
+                        "usage_supported": False,
+                        "gpu_power_supported": False,
+                        "board_power_supported": False,
+                        "vram_supported": False,
+                    })
+            self._ok = any(
+                g.get("usage_supported") or g.get("board_power_supported")
+                or g.get("gpu_power_supported") or g.get("vram_supported")
+                for g in self._gpus
+            )
+            if self._ok:
+                logger.info("ADLX telemetry active for %d AMD GPU(s)", len(self._gpus))
+        except Exception as exc:
+            logger.warning("ADLX GPU telemetry unavailable; using WDDM counters: %s", exc)
+            self.close()
+
+    @staticmethod
+    def _method(obj: ctypes.c_void_p, index: int, restype, argtypes):
+        if not obj:
+            raise RuntimeError("null ADLX interface")
+        vtable = ctypes.cast(obj, ctypes.POINTER(ctypes.c_void_p))[0]
+        address = ctypes.cast(vtable, ctypes.POINTER(ctypes.c_void_p))[index]
+        if not address:
+            raise RuntimeError(f"null ADLX vtable entry {index}")
+        return ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(address)  # type: ignore[attr-defined]
+
+    @classmethod
+    def _call(cls, obj: ctypes.c_void_p, index: int, restype, argtypes, *args):
+        return cls._method(obj, index, restype, argtypes)(obj, *args)
+
+    @classmethod
+    def _release(cls, obj: ctypes.c_void_p) -> None:
+        if obj:
+            cls._call(obj, 1, ctypes.c_long, [])
+
+    @classmethod
+    def _gpu_string(cls, gpu: ctypes.c_void_p, index: int) -> str:
+        value = ctypes.c_char_p()
+        result = cls._call(
+            gpu, index, ctypes.c_int32,
+            [ctypes.POINTER(ctypes.c_char_p)], ctypes.byref(value),
+        )
+        if result != 0 or not value.value:
+            return ""
+        return value.value.decode("utf-8", errors="replace").strip()
+
+    @classmethod
+    def _support_flag(cls, support: ctypes.c_void_p, index: int) -> bool:
+        value = ctypes.c_uint8()
+        result = cls._call(
+            support, index, ctypes.c_int32,
+            [ctypes.POINTER(ctypes.c_uint8)], ctypes.byref(value),
+        )
+        return result == 0 and bool(value.value)
+
+    @staticmethod
+    def _normalise_device_id(device_id: str) -> str:
+        value = (device_id or "").strip().lower().removeprefix("0x")
+        return f"0x{value.upper()}" if value else ""
+
+    @classmethod
+    def _metric_double(cls, metrics: ctypes.c_void_p, index: int) -> Optional[float]:
+        value = ctypes.c_double()
+        result = cls._call(
+            metrics, index, ctypes.c_int32,
+            [ctypes.POINTER(ctypes.c_double)], ctypes.byref(value),
+        )
+        return float(value.value) if result == 0 and math.isfinite(value.value) else None
+
+    @classmethod
+    def _metric_int(cls, metrics: ctypes.c_void_p, index: int) -> Optional[int]:
+        value = ctypes.c_int32()
+        result = cls._call(
+            metrics, index, ctypes.c_int32,
+            [ctypes.POINTER(ctypes.c_int32)], ctypes.byref(value),
+        )
+        return int(value.value) if result == 0 else None
+
+    @property
+    def ok(self) -> bool:
+        return self._ok
+
+    def sample(self) -> List[dict]:
+        """Return one metrics dictionary per ADLX GPU in driver order."""
+        if not self._ok or not self._perf:
+            return []
+        samples: List[dict] = []
+        for gpu_info in self._gpus:
+            metrics = ctypes.c_void_p()
+            try:
+                result = self._call(
+                    self._perf, 18, ctypes.c_int32,
+                    [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)],
+                    gpu_info["ptr"], ctypes.byref(metrics),
+                )
+                if result != 0 or not metrics:
+                    continue
+                usage = (self._metric_double(metrics, 4)
+                         if gpu_info.get("usage_supported") else None)
+                if gpu_info.get("board_power_supported"):
+                    power = self._metric_double(metrics, 10)
+                elif gpu_info.get("gpu_power_supported"):
+                    power = self._metric_double(metrics, 9)
+                else:
+                    power = None
+                vram_mb = (self._metric_int(metrics, 12)
+                           if gpu_info.get("vram_supported") else None)
+                samples.append({
+                    "name": gpu_info["name"],
+                    "device_id": gpu_info["device_id"],
+                    "usage_percent": min(max(usage, 0.0), 100.0) if usage is not None else None,
+                    "power_watts": max(power, 0.0) if power is not None else None,
+                    "vram_used_gb": max(vram_mb, 0) / 1024.0 if vram_mb is not None else None,
+                })
+            except Exception as exc:
+                logger.debug("ADLX sample failed for %s: %s", gpu_info.get("name"), exc)
+            finally:
+                if metrics:
+                    with contextlib.suppress(Exception):
+                        self._release(metrics)
+        return samples
+
+    def close(self) -> None:
+        self._ok = False
+        if self._started and self._perf:
+            with contextlib.suppress(Exception):
+                self._call(self._perf, 12, ctypes.c_int32, [])
+        self._started = False
+        for gpu_info in self._gpus:
+            with contextlib.suppress(Exception):
+                self._release(gpu_info["ptr"])  # type: ignore[arg-type]
+        self._gpus.clear()
+        if self._perf:
+            with contextlib.suppress(Exception):
+                self._release(self._perf)
+        self._perf = ctypes.c_void_p()
+        if self._initialized and self._terminate is not None:
+            with contextlib.suppress(Exception):
+                self._terminate()
+        self._initialized = False
+        self._system = ctypes.c_void_p()
+        self._terminate = None
+        self._dll = None
 
 
 def get_wmi_gpu_list() -> List[Tuple[str, bool, float, str]]:
@@ -859,8 +1246,12 @@ def get_wmi_gpu_list() -> List[Tuple[str, bool, float, str]]:
     for _devid, _vram, _ in get_dxgi_adapter_map().values():
         _key = _devid.lower().replace("0x", "")
         dxgi_vram_by_dev[_key] = max(dxgi_vram_by_dev.get(_key, 0.0), _vram)
+    com_initialized = False
+    wmi = None
+    c = None
     try:
         pythoncom.CoInitialize()                                    # type: ignore
+        com_initialized = True
         wmi = win32com.client.GetObject("winmgmts:root\\cimv2")    # type: ignore
         for c in wmi.ExecQuery("SELECT Name, AdapterRAM, PNPDeviceID FROM Win32_VideoController"):
             try:
@@ -879,7 +1270,7 @@ def get_wmi_gpu_list() -> List[Tuple[str, bool, float, str]]:
                 if is_amd:
                     # Check for discrete AMD GPU DEV IDs — if present, NOT an iGPU
                     amd_dgpu_devs = ('1001', '1002', '1003', '1004', '1005', '1006',  # RX 5000/6000
-                                     '164c', '164d', '164e', '164f',  # RX 6000 series
+                                     '164c', '164d',  # discrete Radeon models
                                      '17fd', '17fe', '17df', '17e3',  # RX 7000 series
                                      '742f', '743f', '7430', '7431',  # RX 9000 series
                                      '67df', '67d0', '67d1', '67d8',  # RX 6000M
@@ -914,6 +1305,14 @@ def get_wmi_gpu_list() -> List[Tuple[str, bool, float, str]]:
                 pass   # skip problematic WMI rows without aborting the loop
     except Exception:
         pass
+    finally:
+        # Release COM proxies before tearing down this apartment; otherwise
+        # pywin32 may attempt IUnknown::Release after CoUninitialize.
+        c = None
+        wmi = None
+        if com_initialized:
+            with contextlib.suppress(Exception):
+                pythoncom.CoUninitialize()                          # type: ignore
     result.sort(key=lambda x: (int(x[1]), -x[2]))
     return result
 
@@ -1126,8 +1525,12 @@ def build_drive_info() -> List[Tuple[str, str]]:
         # ── Windows drive letter mapping ──────────────────────────────────────
         letter_map: Dict[str, str] = {}
         if platform.system() == 'Windows' and WMI_AVAILABLE:
+            com_initialized = False
+            wmi = None
+            row = None
             try:
                 pythoncom.CoInitialize()                            # type: ignore
+                com_initialized = True
                 wmi = win32com.client.GetObject("winmgmts:root\\cimv2")  # type: ignore
                 for row in wmi.ExecQuery(
                     "SELECT Antecedent, Dependent "
@@ -1146,6 +1549,12 @@ def build_drive_info() -> List[Tuple[str, str]]:
                             letter_map[key] = letter
             except Exception:
                 pass
+            finally:
+                row = None
+                wmi = None
+                if com_initialized:
+                    with contextlib.suppress(Exception):
+                        pythoncom.CoUninitialize()                  # type: ignore
 
         linux_disk_mount: Dict[str, str] = {}
         linux_lsblk = _linux_lsblk_disks() if platform.system() == 'Linux' else {}
@@ -1204,6 +1613,8 @@ class GPUMetrics:
     gpu_codec_percent:   float = 0.0
     gpu_vram_used_gb:    float = 0.0
     gpu_vram_total_gb:   float = 8.0
+    gpu_total_percent:   float = 0.0
+    gpu_power_watts:     Optional[float] = None
 
 
 @dataclass
@@ -1227,6 +1638,7 @@ class SystemMetrics:
     disk_write_mbps:   float   # aggregate
     drives:            List[DriveMetrics]   # per-physical-drive
     timestamp:         datetime
+    cpu_power_watts:   Optional[float] = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1240,7 +1652,8 @@ class HardwareMonitorThread(QThread):
     # load spikes the dashboard falls behind and replays stale frames
     # (visible stutter).  With the slot, a slow UI simply skips frames.
 
-    def __init__(self, drive_info: List[Tuple[str, str]], parent=None) -> None:
+    def __init__(self, drive_info: List[Tuple[str, str]], parent=None,
+                 dgpu_info: Optional[List[Tuple[str, float, str]]] = None) -> None:
         super().__init__(parent)
         self._running         = False
         self._latest:      Optional[SystemMetrics] = None
@@ -1250,8 +1663,10 @@ class HardwareMonitorThread(QThread):
         # in ~/.tricorder.log instead of silent debug-level drops.
         self._loop_err_count   = 0
         self._empty_rows_count = 0
-        self._com_initialized = False
+        self._sensor_error_last: Dict[str, float] = {}
+        self._last_slow_loop_warning = 0.0
         self._drive_info      = drive_info
+        self._provided_dgpu_info = list(dgpu_info) if dgpu_info is not None else None
         self._platform        = platform.system()
         self._is_linux        = self._platform == "Linux"
         self._is_windows      = self._platform == "Windows"
@@ -1264,11 +1679,24 @@ class HardwareMonitorThread(QThread):
         self._luid_device_map: Dict[str, Tuple[str, float, str]] = {}
         self._igpu_luid:      Optional[str]   = None
         self._pdh:            Optional[_PdhGpuSampler] = None
+        self._pdh_memory:     Optional[_PdhGpuMemorySampler] = None
+        self._pdh_energy:     Optional[_PdhEnergySampler] = None
+        self._adlx:           Optional[_AdlxGpuSampler] = None
+        self._adlx_cache:     List[dict] = []
+        self._last_adlx_query = 0.0
+        self._last_adlx_success = 0.0
+        self._next_adlx_retry = 0.0
+        self._last_memory_query = 0.0
+        self._last_memory_success = 0.0
+        self._last_power_query = 0.0
+        self._last_power_success = 0.0
+        self._cpu_power_watts: Optional[float] = None
 
         # Linux-specific fields
         self._linux_gpus:     List[dict] = []
-        self._nvml_handles:   Dict[str, any] = {}
+        self._nvml_handles:   Dict[str, Any] = {}
         self._linux_fdinfo:   Optional[_LinuxDrmFdinfoSampler] = None
+        self._linux_cpu_power: Optional[_LinuxCpuPowerSampler] = None
 
         if self._is_linux:
             self._init_linux()
@@ -1281,12 +1709,13 @@ class HardwareMonitorThread(QThread):
     def _init_linux(self) -> None:
         self._linux_gpus = _linux_detect_gpus()
         self._linux_fdinfo = _LinuxDrmFdinfoSampler()
+        self._linux_cpu_power = _LinuxCpuPowerSampler()
 
         # Fill NVIDIA VRAM via NVML if available.  Match by PCI bus-id first;
         # handle index order is not guaranteed to match DRM card order.
         if NVML_AVAILABLE:
             try:
-                by_slot: Dict[str, any] = {}
+                by_slot: Dict[str, Any] = {}
                 dev_count = pynvml.nvmlDeviceGetCount()          # type: ignore
                 for idx in range(dev_count):
                     handle = pynvml.nvmlDeviceGetHandleByIndex(idx)  # type: ignore
@@ -1306,7 +1735,7 @@ class HardwareMonitorThread(QThread):
                         handle_key = gpu.get("card_dir") or gpu.get("pci_slot") or str(nvidia_idx)
                         self._nvml_handles[handle_key] = handle
                         mem = pynvml.nvmlDeviceGetMemoryInfo(handle)            # type: ignore
-                        gpu["vram_total_gb"] = mem.total / (1024 ** 3)
+                        gpu["vram_total_gb"] = float(mem.total) / (1024 ** 3)
             except Exception as exc:
                 logger.debug("NVML init: %s", exc)
 
@@ -1339,19 +1768,85 @@ class HardwareMonitorThread(QThread):
 
     # ── Windows init ────────────────────────────────────────────────────────
     def _init_windows(self) -> None:
-        self._dgpu_info, _ = _windows_detect_dgpus()
+        if self._provided_dgpu_info is not None:
+            self._dgpu_info = list(self._provided_dgpu_info)
+        else:
+            self._dgpu_info, _ = _windows_detect_dgpus()
+        amd_device_ids = [
+            dev_key.lower()
+            for name, _, dev_key in self._dgpu_info
+            if "amd" in name.lower() or "radeon" in name.lower()
+        ]
+        self._has_amd_gpu = bool(amd_device_ids)
+        self._ambiguous_adlx_device_ids = {
+            device_id for device_id in amd_device_ids
+            if amd_device_ids.count(device_id) > 1
+        }
+        if self._ambiguous_adlx_device_ids:
+            logger.warning(
+                "ADLX per-card merge disabled for ambiguous AMD device id(s): %s",
+                ", ".join(sorted(self._ambiguous_adlx_device_ids)),
+            )
 
         # NVML handles for TCC-mode GPUs, keyed by their "nvml:<index>" dev key.
-        self._nvml_win_handles: Dict[str, any] = {}
+        self._nvml_win_handles: Dict[str, Any] = {}
         for _, _, dev_key in self._dgpu_info:
             if dev_key.startswith("nvml:"):
                 with contextlib.suppress(Exception):
                     self._nvml_win_handles[dev_key] = pynvml.nvmlDeviceGetHandleByIndex(  # type: ignore
                         int(dev_key.split(":", 1)[1]))
 
+        # Standard WDDM NVIDIA cards are visible to PDH but still need NVML for
+        # total-board power.  Bind handles once by PCI device id (name fallback)
+        # and sample them at the same 4 Hz cadence as ADLX.
+        self._nvml_wddm_handles: Dict[int, Any] = {}
+        if NVML_AVAILABLE:
+            try:
+                records: List[dict] = []
+                for nvml_index in range(pynvml.nvmlDeviceGetCount()):  # type: ignore
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_index)  # type: ignore
+                    raw_name = pynvml.nvmlDeviceGetName(handle)  # type: ignore
+                    nvml_name = (raw_name.decode(errors="replace")
+                                 if isinstance(raw_name, bytes) else str(raw_name))
+                    device_id = ""
+                    with contextlib.suppress(Exception):
+                        pci = pynvml.nvmlDeviceGetPciInfo(handle)  # type: ignore
+                        device_id = f"0x{(int(pci.pciDeviceId) >> 16) & 0xFFFF:04X}"
+                    records.append({
+                        "handle": handle,
+                        "device_id": device_id.lower(),
+                        "name": re.sub(r"\s+", " ", nvml_name.lower()).strip(),
+                    })
+                for gpu_index, (gpu_name, _, dev_key) in enumerate(self._dgpu_info):
+                    name_key = re.sub(r"\s+", " ", gpu_name.lower()).strip()
+                    if dev_key.startswith("nvml:") or not any(
+                        marker in name_key for marker in
+                        ("nvidia", "geforce", "quadro", "tesla")
+                    ):
+                        continue
+                    match_index = next(
+                        (i for i, rec in enumerate(records)
+                         if rec["device_id"] and rec["device_id"] == dev_key.lower()),
+                        None,
+                    )
+                    if match_index is None:
+                        match_index = next(
+                            (i for i, rec in enumerate(records) if rec["name"] == name_key),
+                            None,
+                        )
+                    if match_index is None and records:
+                        match_index = 0
+                    if match_index is not None:
+                        self._nvml_wddm_handles[gpu_index] = records.pop(match_index)["handle"]
+            except Exception as exc:
+                logger.debug("Windows NVML handle mapping: %s", exc)
+
+        self._nvml_win_cache: Dict[int, dict] = {}
+        self._last_nvml_query = 0.0
+        self._last_nvml_success = 0.0
+
         self._luid_device_map = get_dxgi_adapter_map()
-        self._last_dxgi_refresh = time.time()
-        self._last_vram_query = 0.0                 # 0 → query on the first frame
+        self._last_dxgi_refresh = time.monotonic()
         self._vram_cache: Dict[str, float] = {}     # luid → dedicated usage (GB)
         _igpu_name_markers = ('hd graphics', 'uhd graphics', 'iris',
                               'intel(r) graphics', 'arc(tm) graphics',
@@ -1361,7 +1856,6 @@ class HardwareMonitorThread(QThread):
              if any(m in name.lower() for m in _igpu_name_markers)),
             None,
         )
-        self._pdh = _PdhGpuSampler()
 
     def _log_loop_error(self, prefix: str, exc: Exception) -> None:
         """Log monitor-loop failures visibly, but throttled.
@@ -1377,6 +1871,15 @@ class HardwareMonitorThread(QThread):
             logger.warning("%s (streak of %d): %s", prefix, n, exc)
         else:
             logger.debug("%s: %s", prefix, exc)
+
+    def _log_sensor_error(self, sensor: str, exc: Exception) -> None:
+        """Warn once per minute per sensor while retaining cached values."""
+        now = time.monotonic()
+        if now - self._sensor_error_last.get(sensor, 0.0) >= 60.0:
+            logger.warning("%s telemetry failed; keeping last value: %s", sensor, exc)
+            self._sensor_error_last[sensor] = now
+        else:
+            logger.debug("%s telemetry failed: %s", sensor, exc)
 
     # ── Latest-value hand-over ─────────────────────────────────────────────
     def _publish(self, m: SystemMetrics) -> None:
@@ -1437,17 +1940,28 @@ class HardwareMonitorThread(QThread):
                 cpu_total = psutil.cpu_percent(interval=None)
                 cpu_cores = {i: float(v) for i, v in enumerate(psutil.cpu_percent(percpu=True))}
                 ram       = psutil.virtual_memory()
+                if (self._linux_cpu_power is not None
+                        and now - self._last_power_query >= 0.25):
+                    self._last_power_query = now
+                    cpu_power = self._linux_cpu_power.sample()
+                    if cpu_power is not None:
+                        self._cpu_power_watts = cpu_power
+                        self._last_power_success = now
+                    elif now - self._last_power_success >= 2.0:
+                        self._cpu_power_watts = None
 
                 # ── GPU (Linux-specific) ───────────────────────────────────
                 fdinfo = self._linux_fdinfo.sample() if self._linux_fdinfo is not None else {}
                 gpus: List[GPUMetrics] = []
                 for name, vram_total, dev_id in self._dgpu_info:
                     gpu_util  = 0.0
+                    gpu_3d_util = 0.0
                     compute_util = 0.0
                     copy0_util = 0.0
                     copy1_util = 0.0
                     codec_util = 0.0
                     vram_used = 0.0
+                    power_watts: Optional[float] = None
 
                     # Find matching Linux GPU entry
                     linux_gpu = None
@@ -1466,12 +1980,14 @@ class HardwareMonitorThread(QThread):
                     if linux_gpu is not None:
                         slot = _linux_norm_pci_slot(linux_gpu.get("pci_slot", ""))
                         fd = fdinfo.get(slot, {}) if slot else {}
+                        gpu_3d_util = float(fd.get("3d", 0.0))
                         compute_util = float(fd.get("compute", 0.0))
                         copy0_util = float(fd.get("c0", 0.0))
                         copy1_util = float(fd.get("c1", 0.0))
                         codec_util = float(fd.get("codec", 0.0))
                         if linux_gpu["vendor"] == "amd":
                             gpu_util  = _linux_read_amd_gpu_busy(linux_gpu.get("card_dir", ""))
+                            power_watts = _linux_read_gpu_power_watts(linux_gpu.get("card_dir", ""))
                             if gpu_util <= 0:
                                 gpu_util = float(fd.get("3d", 0.0))
                             vram_used, vram_total_actual = _linux_read_amd_vram(linux_gpu.get("card_dir", ""))
@@ -1485,22 +2001,26 @@ class HardwareMonitorThread(QThread):
                                 handle = self._nvml_handles.get(linux_gpu.get("pci_slot") or "")
                             if handle is not None:
                                 gpu_util, vram_used, vram_total_nv = _read_nvml_gpu(handle)
+                                power_watts = _read_nvml_power_watts(handle)
                                 if vram_total_nv > 0:
                                     vram_total = vram_total_nv
                         elif linux_gpu["vendor"] == "intel":
-                            gpu_util = float(fd.get("3d", 0.0))
+                            gpu_util = gpu_3d_util
                             vram_used = float(fd.get("vram_used_gb", 0.0))
+                            power_watts = _linux_read_gpu_power_watts(linux_gpu.get("card_dir", ""))
 
                     gpus.append(GPUMetrics(
                         name=name,
                         luid="",
-                        gpu_3d_percent=gpu_util,
+                        gpu_total_percent=gpu_util,
+                        gpu_3d_percent=gpu_3d_util,
                         gpu_compute_percent=compute_util,
                         gpu_copy0_percent=copy0_util,
                         gpu_copy1_percent=copy1_util,
                         gpu_codec_percent=codec_util,
                         gpu_vram_used_gb=min(vram_used, vram_total),
                         gpu_vram_total_gb=vram_total,
+                        gpu_power_watts=power_watts,
                     ))
 
                 if not gpus and self._dgpu_info:
@@ -1524,6 +2044,7 @@ class HardwareMonitorThread(QThread):
                 self._publish(SystemMetrics(
                     cpu_total_percent=cpu_total,
                     cpu_cores=cpu_cores,
+                    cpu_power_watts=self._cpu_power_watts,
                     ram_total_gb=ram.total / (1024 ** 3),
                     ram_used_gb=ram.used  / (1024 ** 3),
                     ram_percent=ram.percent,
@@ -1548,9 +2069,11 @@ class HardwareMonitorThread(QThread):
         """
         util = vram_used = 0.0
         codec = 0.0
+        power_watts: Optional[float] = None
         handle = self._nvml_win_handles.get(dev_key)
         if handle is not None:
             util, vram_used, vram_total_nv = _read_nvml_gpu(handle)
+            power_watts = _read_nvml_power_watts(handle)
             if vram_total_nv > 0:
                 vram_total = vram_total_nv
             with contextlib.suppress(Exception):
@@ -1559,87 +2082,199 @@ class HardwareMonitorThread(QThread):
                 codec = float(max(enc, dec))
         return GPUMetrics(
             name=name, luid=dev_key,
+            gpu_total_percent=util,
             gpu_compute_percent=util,
             gpu_codec_percent=codec,
             gpu_vram_used_gb=min(vram_used, vram_total) if vram_total else vram_used,
             gpu_vram_total_gb=vram_total,
+            gpu_power_watts=power_watts,
         )
 
     # ══════════════════════════════════════════════════════════════════════
     # WINDOWS MONITORING LOOP
     # ══════════════════════════════════════════════════════════════════════
     def _run_windows(self) -> None:
-        if WMI_AVAILABLE:
-            try:
-                pythoncom.CoInitialize()                                    # type: ignore
-                self._com_initialized = True
-            except Exception as exc:
-                logger.warning("CoInitialize failed: %s", exc)
+        # Driver/performance-counter APIs are initialized inside this worker
+        # thread so startup and the Qt event loop never wait on sensor setup.
+        self._pdh = _PdhGpuSampler()
+        self._pdh_memory = _PdhGpuMemorySampler()
+        self._pdh_energy = _PdhEnergySampler()
+        self._adlx = _AdlxGpuSampler() if self._has_amd_gpu else None
+        self._adlx_cache = []
+        self._last_adlx_query = 0.0
+        self._last_adlx_success = time.monotonic()
+        self._next_adlx_retry = self._last_adlx_success + 30.0
+        self._nvml_win_cache = {}
+        self._last_nvml_query = 0.0
+        self._last_nvml_success = 0.0
+        self._last_memory_query = 0.0
+        self._last_memory_success = 0.0
+        self._last_power_query = 0.0
+        self._last_power_success = 0.0
+        self._cpu_power_watts = None
 
-        # WMI is connected lazily at the END of a loop iteration (see below):
-        # GetObject("winmgmts:...") can block for seconds when the WMI service
-        # is busy, and doing that before the loop meant the dashboard showed
-        # NO data at all (not even CPU/RAM) until WMI answered.
-        wmi = None
-        wmi_next_try = 0.0
+        # WMI remains a one-shot inventory source only.  It is deliberately
+        # absent from this hot loop: COM/perflib calls can block for seconds and
+        # were the main source of visible telemetry pauses under heavy AI load.
 
-        self._last_io      = psutil.disk_io_counters()
-        self._last_io_per  = psutil.disk_io_counters(perdisk=True) or {}
-        self._last_t       = time.time()
+        try:
+            self._last_io = psutil.disk_io_counters()
+            self._last_io_per = psutil.disk_io_counters(perdisk=True) or {}
+        except Exception as exc:
+            self._log_sensor_error("Disk", exc)
+            self._last_io = None
+            self._last_io_per = {}
+        self._last_disk_t = time.monotonic()
+        self._last_disk_query = self._last_disk_t
+        rmb = wmb = 0.0
+        drives = [DriveMetrics(key=key, label=label, read_mbps=0.0, write_mbps=0.0)
+                  for key, label in self._drive_info]
+        cpu_total = 0.0
+        cpu_cores: Dict[int, float] = {}
+        ram_total_gb = ram_used_gb = ram_percent = 0.0
+        next_tick = time.monotonic()
 
         while self._running:
+            loop_started = time.monotonic()
             try:
-                now = time.time()
-                dt  = max(now - self._last_t, 0.001)
+                now = loop_started
 
-                # ── Aggregate disk I/O ──────────────────────────────────────
-                io_agg  = psutil.disk_io_counters()
-                rmb = wmb = 0.0
-                if io_agg and self._last_io:
-                    rmb = (io_agg.read_bytes  - self._last_io.read_bytes)  / (1024 * 1024) / dt
-                    wmb = (io_agg.write_bytes - self._last_io.write_bytes) / (1024 * 1024) / dt
-                self._last_io = io_agg
+                # Disk enumeration is comparatively expensive on a nine-drive
+                # workstation and does not benefit from 30 Hz polling.  Read it
+                # at 10 Hz, isolate failures (including WinError 1450), and keep
+                # publishing the last good frame instead of freezing all tiles.
+                if now - self._last_disk_query >= 0.1:
+                    self._last_disk_query = now
+                    disk_dt = max(now - self._last_disk_t, 0.001)
+                    try:
+                        io_agg = psutil.disk_io_counters()
+                        io_per = psutil.disk_io_counters(perdisk=True) or {}
+                        next_rmb = next_wmb = 0.0
+                        if io_agg and self._last_io:
+                            next_rmb = max(0.0, (io_agg.read_bytes - self._last_io.read_bytes)
+                                           / (1024 * 1024) / disk_dt)
+                            next_wmb = max(0.0, (io_agg.write_bytes - self._last_io.write_bytes)
+                                           / (1024 * 1024) / disk_dt)
+                        next_drives: List[DriveMetrics] = []
+                        for key, label in self._drive_info:
+                            if key in io_per and key in self._last_io_per:
+                                read_mbps = max(
+                                    0.0, (io_per[key].read_bytes - self._last_io_per[key].read_bytes)
+                                    / (1024 * 1024) / disk_dt)
+                                write_mbps = max(
+                                    0.0, (io_per[key].write_bytes - self._last_io_per[key].write_bytes)
+                                    / (1024 * 1024) / disk_dt)
+                            else:
+                                read_mbps = write_mbps = 0.0
+                            next_drives.append(DriveMetrics(
+                                key=key, label=label,
+                                read_mbps=read_mbps, write_mbps=write_mbps))
+                        self._last_io = io_agg
+                        self._last_io_per = io_per
+                        self._last_disk_t = now
+                        rmb, wmb, drives = next_rmb, next_wmb, next_drives
+                    except Exception as exc:
+                        self._log_sensor_error("Disk", exc)
 
-                # ── Per-drive I/O ───────────────────────────────────────────
-                io_per  = psutil.disk_io_counters(perdisk=True) or {}
-                drives: List[DriveMetrics] = []
-                for key, label in self._drive_info:
-                    if key in io_per and key in self._last_io_per:
-                        r = max(0.0, (io_per[key].read_bytes  - self._last_io_per[key].read_bytes)  / (1024 * 1024) / dt)
-                        w = max(0.0, (io_per[key].write_bytes - self._last_io_per[key].write_bytes) / (1024 * 1024) / dt)
-                    else:
-                        r = w = 0.0
-                    drives.append(DriveMetrics(key=key, label=label, read_mbps=r, write_mbps=w))
-                self._last_io_per = io_per
-                self._last_t = now
+                # CPU and RAM failures are independent from GPU/disk telemetry;
+                # keep the last values and still publish a complete frame.
+                try:
+                    cpu_total = psutil.cpu_percent(interval=None)
+                    cpu_cores = {
+                        i: float(value)
+                        for i, value in enumerate(psutil.cpu_percent(percpu=True))
+                    }
+                except Exception as exc:
+                    self._log_sensor_error("CPU", exc)
+                try:
+                    ram = psutil.virtual_memory()
+                    ram_total_gb = ram.total / (1024 ** 3)
+                    ram_used_gb = ram.used / (1024 ** 3)
+                    ram_percent = float(ram.percent)
+                except Exception as exc:
+                    self._log_sensor_error("RAM", exc)
 
-                # ── CPU ─────────────────────────────────────────────────────
-                cpu_total = psutil.cpu_percent(interval=None)
-                cpu_cores = {i: float(v) for i, v in enumerate(psutil.cpu_percent(percpu=True))}
-                ram       = psutil.virtual_memory()
+                # ADLX updates at a driver-defined cadence (minimum 250 ms).
+                # Cache its latest frame rather than making redundant calls at
+                # the 30 FPS UI/PDH rate.
+                if (self._adlx is not None and self._adlx.ok
+                        and now - self._last_adlx_query >= 0.25):
+                    self._last_adlx_query = now
+                    adlx_sample = self._adlx.sample()
+                    if adlx_sample:
+                        self._adlx_cache = adlx_sample
+                        self._last_adlx_success = now
+                        self._next_adlx_retry = now + 5.0
+                    elif now - self._last_adlx_success >= 1.0:
+                        # Never leave a stale 100 % / high-power value visible
+                        # after a driver reset or failed ADLX session.
+                        self._adlx_cache = []
+                adlx_stale = now - self._last_adlx_success >= 5.0
+                if (self._has_amd_gpu
+                        and (self._adlx is None or not self._adlx.ok or adlx_stale)
+                        and now >= self._next_adlx_retry):
+                    if self._adlx is not None:
+                        self._adlx.close()
+                    self._adlx = _AdlxGpuSampler()
+                    self._next_adlx_retry = now + (5.0 if self._adlx.ok else 30.0)
+                    if not self._adlx.ok:
+                        self._adlx_cache = []
 
-                # ── GPU (PDH, WMI only for VRAM usage / as fallback) ────────
+                if (self._nvml_wddm_handles
+                        and now - self._last_nvml_query >= 0.25):
+                    self._last_nvml_query = now
+                    nvml_cache: Dict[int, dict] = {}
+                    for gpu_index, handle in self._nvml_wddm_handles.items():
+                        util, used_gb, total_gb = _read_nvml_gpu(handle)
+                        if total_gb > 0:
+                            nvml_cache[gpu_index] = {
+                                "usage_percent": util,
+                                "vram_used_gb": used_gb,
+                                "power_watts": _read_nvml_power_watts(handle),
+                            }
+                    if nvml_cache:
+                        self._nvml_win_cache = nvml_cache
+                        self._last_nvml_success = now
+                    elif now - self._last_nvml_success >= 2.0:
+                        self._nvml_win_cache = {}
+
+                # Dedicated VRAM and CPU package power change much more slowly
+                # than engine utilization.  Native PDH reads at 2/4 Hz replace
+                # the old synchronous WMI query that could stall for seconds.
+                if (self._pdh_memory is not None and self._pdh_memory.ok
+                        and now - self._last_memory_query >= 0.5):
+                    self._last_memory_query = now
+                    memory_rows = self._pdh_memory.sample()
+                    if memory_rows:
+                        self._last_memory_success = now
+                        vram_cache: Dict[str, float] = {}
+                        for instance, dedicated_bytes in memory_rows:
+                            luid = instance.split('_phys')[0]
+                            used_gb = max(dedicated_bytes, 0.0) / (1024 ** 3)
+                            vram_cache[luid] = max(vram_cache.get(luid, 0.0), used_gb)
+                        self._vram_cache = vram_cache
+                    elif now - self._last_memory_success >= 5.0:
+                        self._vram_cache = {}
+                if (self._pdh_energy is not None and self._pdh_energy.ok
+                        and now - self._last_power_query >= 0.25):
+                    self._last_power_query = now
+                    cpu_power = _cpu_package_power_from_pdh(self._pdh_energy.sample())
+                    if cpu_power is not None:
+                        self._cpu_power_watts = cpu_power
+                        self._last_power_success = now
+                    elif now - self._last_power_success >= 2.0:
+                        self._cpu_power_watts = None
+
+                # ── GPU (PDH engine split + ADLX overall AMD load) ─────────
                 igpu_p = 0.0
                 luid_data: Dict[str, dict] = {}
 
-                if (self._pdh and self._pdh.ok) or wmi:
+                if self._pdh and self._pdh.ok:
                     _LUID_RE = re.compile(r'luid_(0x[0-9a-f]+_0x[0-9a-f]+)')
                     _ENG_RE  = re.compile(r'_eng_(\d+)_')
 
                     _engine_rows: list = []
-                    if self._pdh and self._pdh.ok:
-                        _engine_rows = self._pdh.sample()
-                    elif wmi:
-                        try:
-                            _engine_rows = [
-                                (str(r.Name).lower(), float(r.UtilizationPercentage or 0))
-                                for r in wmi.ExecQuery(
-                                    "SELECT Name, UtilizationPercentage "
-                                    "FROM Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine"
-                                )
-                            ]
-                        except Exception as exc:
-                            logger.debug("GPU engine query: %s", exc)
+                    _engine_rows = self._pdh.sample()
 
                     # Persistent empty samples are the "tiles frozen at 0"
                     # symptom (e.g. after a driver reset) — leave evidence.
@@ -1668,27 +2303,7 @@ class HardwareMonitorThread(QThread):
                         except Exception:
                             pass
 
-                    # ── Step 2: fill VRAM usage from memory query ──────────────
-                    # The WMI/perflib round-trip is far too expensive for 30 Hz
-                    # and VRAM usage moves slowly — query at 1 Hz and re-apply
-                    # the cached per-LUID values on the frames in between.
-                    if wmi is not None and now - self._last_vram_query >= 1.0:
-                        self._last_vram_query = now
-                        try:
-                            vram_cache: Dict[str, float] = {}
-                            for a in wmi.ExecQuery(
-                                "SELECT Name, DedicatedUsage "
-                                "FROM Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory"
-                            ):
-                                try:
-                                    luid = str(a.Name).lower().split('_phys')[0]
-                                    used = float(a.DedicatedUsage or 0) / (1024 ** 3)
-                                    vram_cache[luid] = max(vram_cache.get(luid, 0.0), used)
-                                except Exception:
-                                    pass
-                            self._vram_cache = vram_cache
-                        except Exception:
-                            pass
+                    # ── Step 2: apply the native PDH VRAM cache ────────────────
                     for luid, used in self._vram_cache.items():
                         ld = luid_data.setdefault(luid, {'3d': 0.0, 'compute': 0.0,
                                                          'c0': 0.0, 'c1': 0.0, 'codec': 0.0, 'used': 0.0})
@@ -1799,8 +2414,22 @@ class HardwareMonitorThread(QThread):
                 leftover = [luid for luid in self._luid_order
                             if luid not in bound and luid in luid_data]
 
+                # ADLX enumerates only AMD GPUs and may use a different order
+                # than WMI (for example PCI order versus descending VRAM).
+                # Bind by PCI device id.  Ambiguous identical-card IDs are
+                # deliberately excluded below rather than risking swapped data.
+                adlx_by_device: Dict[str, List[dict]] = {}
+                adlx_by_name: Dict[str, List[dict]] = {}
+                for adlx_gpu in self._adlx_cache:
+                    adlx_dev = str(adlx_gpu.get("device_id") or "").lower()
+                    adlx_name = re.sub(r"\s+", " ", str(adlx_gpu.get("name") or "").lower()).strip()
+                    if adlx_dev:
+                        adlx_by_device.setdefault(adlx_dev, []).append(adlx_gpu)
+                    if adlx_name:
+                        adlx_by_name.setdefault(adlx_name, []).append(adlx_gpu)
+
                 gpus: List[GPUMetrics] = []
-                for name, vram_total, dev_id in self._dgpu_info:
+                for gpu_index, (name, vram_total, dev_id) in enumerate(self._dgpu_info):
                     # TCC-mode NVIDIA GPUs: invisible to DXGI/perf counters —
                     # read utilization and VRAM directly via NVML.
                     if dev_id.startswith("nvml:"):
@@ -1816,8 +2445,35 @@ class HardwareMonitorThread(QThread):
                         self._luid_vram[luid]      = vram_total
                         self._luid_device_id[luid] = dev_id
                     used = min(d.get('used', 0.0), vram_total)
+                    engine_total = max(
+                        d.get('3d', 0.0), d.get('compute', 0.0),
+                        d.get('c0', 0.0), d.get('c1', 0.0), d.get('codec', 0.0),
+                    )
+                    name_key = re.sub(r"\s+", " ", name.lower()).strip()
+                    is_amd_gpu = "amd" in name_key or "radeon" in name_key
+                    adlx_identity_safe = (
+                        is_amd_gpu and dev_id.lower() not in self._ambiguous_adlx_device_ids
+                    )
+                    adlx_candidates = (adlx_by_device.get(dev_id.lower(), [])
+                                       if adlx_identity_safe else [])
+                    if not adlx_candidates and adlx_identity_safe:
+                        adlx_candidates = adlx_by_name.get(name_key, [])
+                    adlx_gpu = adlx_candidates.pop(0) if adlx_candidates else {}
+                    adlx_usage = adlx_gpu.get("usage_percent")
+                    adlx_vram = adlx_gpu.get("vram_used_gb")
+                    nvml_gpu = self._nvml_win_cache.get(gpu_index, {})
+                    nvml_usage = nvml_gpu.get("usage_percent")
+                    driver_usage = adlx_usage if adlx_usage is not None else nvml_usage
+                    driver_vram = adlx_vram if adlx_vram is not None else nvml_gpu.get("vram_used_gb")
+                    if driver_vram is not None:
+                        used = min(float(driver_vram), vram_total)
+                    driver_power = adlx_gpu.get("power_watts")
+                    if driver_power is None:
+                        driver_power = nvml_gpu.get("power_watts")
                     gpus.append(GPUMetrics(
                         name=name, luid=luid,
+                        gpu_total_percent=(float(driver_usage)
+                                           if driver_usage is not None else engine_total),
                         gpu_3d_percent=d.get('3d', 0.0),
                         gpu_compute_percent=d.get('compute', 0.0),
                         gpu_copy0_percent=d.get('c0', 0.0),
@@ -1825,6 +2481,7 @@ class HardwareMonitorThread(QThread):
                         gpu_codec_percent=d.get('codec', 0.0),
                         gpu_vram_used_gb=used,
                         gpu_vram_total_gb=vram_total,
+                        gpu_power_watts=driver_power,
                     ))
 
                 if not gpus:
@@ -1834,9 +2491,10 @@ class HardwareMonitorThread(QThread):
                 self._publish(SystemMetrics(
                     cpu_total_percent=cpu_total,
                     cpu_cores=cpu_cores,
-                    ram_total_gb=ram.total / (1024 ** 3),
-                    ram_used_gb=ram.used  / (1024 ** 3),
-                    ram_percent=ram.percent,
+                    cpu_power_watts=self._cpu_power_watts,
+                    ram_total_gb=ram_total_gb,
+                    ram_used_gb=ram_used_gb,
+                    ram_percent=ram_percent,
                     gpus=gpus,
                     igpu_percent=igpu_p,
                     disk_read_mbps=rmb,
@@ -1845,35 +2503,40 @@ class HardwareMonitorThread(QThread):
                     timestamp=datetime.now(),
                 ))
                 self._loop_err_count = 0
-
-                # Lazy WMI connect AFTER publishing, so a slow/blocked WMI
-                # service can never hold back CPU/RAM/disk/PDH data.
-                if wmi is None and WMI_AVAILABLE and time.time() >= wmi_next_try:
-                    wmi_next_try = time.time() + 5.0
-                    _t0 = time.time()
-                    try:
-                        wmi = win32com.client.GetObject("winmgmts:root\\cimv2")  # type: ignore
-                    except Exception as exc:
-                        logger.warning("WMI connect failed — VRAM usage unavailable, "
-                                       "retrying in 5 s: %s", exc)
-                    if wmi is not None and time.time() - _t0 > 2.0:
-                        logger.warning("WMI connect took %.1f s", time.time() - _t0)
             except Exception as exc:
                 self._log_loop_error("Monitor loop error", exc)
-            time.sleep(1.0 / 30.0)
+
+            elapsed = time.monotonic() - loop_started
+            if (elapsed >= 0.25
+                    and time.monotonic() - self._last_slow_loop_warning >= 60.0):
+                logger.warning("Slow Windows telemetry iteration: %.3f s", elapsed)
+                self._last_slow_loop_warning = time.monotonic()
+            next_tick += 1.0 / 30.0
+            delay = next_tick - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                # Do not run a catch-up burst after the machine was saturated.
+                next_tick = time.monotonic()
+
+        self._close_windows_samplers()
+
+    def _close_windows_samplers(self) -> None:
+        """Close native sensors idempotently, preferably in the worker thread."""
+        for attr in ("_adlx", "_pdh", "_pdh_memory", "_pdh_energy"):
+            sampler = getattr(self, attr, None)
+            if sampler is not None:
+                with contextlib.suppress(Exception):
+                    sampler.close()
+                setattr(self, attr, None)
 
     def stop(self) -> None:
         self._running = False
         self.wait()
         if not self._is_linux:
-            if self._pdh is not None:
-                self._pdh.close()
-            if self._com_initialized:
-                try:
-                    pythoncom.CoUninitialize()                          # type: ignore
-                except Exception as exc:
-                    logger.debug("CoUninitialize: %s", exc)
-                self._com_initialized = False
+            # Normally already closed at the end of _run_windows.  This also
+            # covers a monitor object that was constructed but never started.
+            self._close_windows_samplers()
         if NVML_AVAILABLE:
             with contextlib.suppress(Exception):
                 pynvml.nvmlShutdown()                                  # type: ignore
@@ -2354,8 +3017,12 @@ class BaseTile(QFrame):
         """Override in subclass to update a single-value tile."""
         pass
 
-    def update_3d_compute(self, gpu_3d: float, compute: float) -> None:
-        """Override in subclass to update GPU 3D/Compute tile."""
+    def update_power(self, watts: Optional[float]) -> None:
+        """Override in subclass to update a power tile."""
+        pass
+
+    def update_3d_compute(self, total: float, gpu_3d: float, compute: float) -> None:
+        """Override in subclass to update overall GPU + 3D/Compute tile."""
         pass
 
     def update_copy(self, copy0: float, copy1: float) -> None:
@@ -2484,11 +3151,67 @@ class MetricTile(BaseTile):
         self._graph = SparklineWidget(self._color_hex)
         outer.addWidget(self._graph)
 
-    def update_val(self, val: float, text: Optional[str] = None) -> None:
-        self._graph.add_value(val)
+    def update_val(self, value: float, suffix: Optional[str] = None) -> None:
+        self._graph.add_value(value)
         # Use a ~1 s moving average for the number so it stops jittering on
         # bursty workloads; the sparkline graph still reacts instantly.
-        self._val_lbl.setText(text if text else f"{int(self._graph.recent_avg())}%")
+        self._val_lbl.setText(suffix if suffix else f"{int(self._graph.recent_avg())}%")
+
+    def batch_update(self) -> None:
+        self._graph.batch_update()
+
+
+class PowerTile(BaseTile):
+    """Single sparkline for CPU-package or GPU power in watts."""
+
+    def __init__(self, tile_id: str, title: str, color_hex: str,
+                 baseline_watts: float, parent=None) -> None:
+        self._title = title
+        self._color_hex = color_hex
+        self._baseline = max(float(baseline_watts), 1.0)
+        self._peak_watts = self._baseline
+        super().__init__(tile_id, color_hex, parent)
+
+    def _build_content(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(dp(6), dp(5), dp(6), dp(5))
+        outer.setSpacing(dp(2))
+
+        header = QHBoxLayout()
+        self._title_lbl = QLabel(self._title)
+        self._title_lbl.setStyleSheet(
+            f"color: {self._color_hex}; font-size: {font_size(13)}; font-weight: bold;")
+        self._scale_lbl = QLabel(f"Skala {self._peak_watts:.0f} W")
+        self._scale_lbl.setStyleSheet(f"color: #444; font-size: {font_size(10)};")
+        self._value_lbl = QLabel("k.A.")
+        self._value_lbl.setStyleSheet(
+            f"color: {self._color_hex}; font-size: {font_size(14)}; font-weight: bold;")
+        header.addWidget(self._title_lbl)
+        header.addSpacing(dp(6))
+        header.addWidget(self._scale_lbl)
+        header.addStretch()
+        header.addWidget(self._value_lbl)
+        outer.addLayout(header)
+
+        self._graph = SparklineWidget(self._color_hex)
+        outer.addWidget(self._graph)
+
+    def update_power(self, watts: Optional[float]) -> None:
+        if watts is None or not math.isfinite(watts) or watts < 0:
+            # Absence is not a 0 W measurement; leave history untouched.
+            self._value_lbl.setText("k.A.")
+            return
+        value = float(watts)
+        target_peak = max(self._baseline, value * 1.15)
+        if target_peak > self._peak_watts:
+            self._peak_watts = math.ceil(target_peak / 25.0) * 25.0
+        else:
+            # Very slow release keeps the graph scale stable while still
+            # recovering after a temporary over-power spike.
+            self._peak_watts = max(self._baseline, self._peak_watts * 0.9995)
+        self._graph.add_value(min(value / self._peak_watts * 100.0, 100.0))
+        self._value_lbl.setText(f"{value:.0f} W" if value >= 100 else f"{value:.1f} W")
+        self._scale_lbl.setText(f"Skala {self._peak_watts:.0f} W")
 
     def batch_update(self) -> None:
         self._graph.batch_update()
@@ -2569,11 +3292,12 @@ class DriveTile(BaseTile):
         outer.addLayout(w_row)
 
     def update_drive(self, read_mbps: float, write_mbps: float) -> None:
-        # Auto-scale: peak grows immediately, decays at 0.2 % per frame
+        # Auto-scale: peak grows immediately with headroom, then decays slowly.
         peak = max(read_mbps, write_mbps, 1.0)
-        self._peak = max(self._peak * 0.998, peak)
         if peak > self._peak:
-            self._peak = peak * 1.1     # headroom burst
+            self._peak = peak * 1.1
+        else:
+            self._peak = max(1.0, self._peak * 0.998, peak)
 
         r_pct = read_mbps  / self._peak * 100.0
         w_pct = write_mbps / self._peak * 100.0
@@ -2668,12 +3392,11 @@ class GPUCopyTile(BaseTile):
         c1_row.addWidget(self._c1_val)
         outer.addLayout(c1_row)
 
-    def update_copy(self, c0: float, c1: float) -> None:
-        self._c0_graph.add_value(c0)
-        self._c1_graph.add_value(c1)
+    def update_copy(self, copy0: float, copy1: float) -> None:
+        self._c0_graph.add_value(copy0)
+        self._c1_graph.add_value(copy1)
         self._c0_val.setText(f"{int(self._c0_graph.recent_avg())}%")
         self._c1_val.setText(f"{int(self._c1_graph.recent_avg())}%")
-        self._c1_val.setText(f"{int(c1)}%")
 
     def batch_update(self) -> None:
         self._c0_graph.batch_update()
@@ -2742,14 +3465,16 @@ class GPUCodecTile(BaseTile):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GPU 3D / COMPUTE TILE  — two sparklines: 3D engine + Compute/CUDA engine
+# GPU UTILIZATION TILE  — overall load + 3D + Compute/CUDA engines
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class GPU3DComputeTile(BaseTile):
-    """
-    Landscape 3D+Compute tile: two stacked sparklines for the 3D rasterisation
-    engine and the Compute/CUDA engine separately.
-    Layout mirrors GPUCopyTile / DriveTile.  palette[0] = 3D colour.
+    """Overall GPU load plus the WDDM/DRM 3D and compute engine split.
+
+    The overall row is driver-native on AMD (ADLX) and therefore remains
+    accurate for long RDNA4 AI dispatches that Windows exposes to PDH only as
+    occasional compute pulses.  The engine rows stay useful for identifying
+    whether a conventional graphics or compute queue is active.
     """
     def __init__(self, tile_id: str, gpu_name: str,
                  palette: Tuple[str, str, str, str], parent=None) -> None:
@@ -2767,7 +3492,7 @@ class GPU3DComputeTile(BaseTile):
         hdr = QHBoxLayout()
         icon_lbl = QLabel("🎮")
         icon_lbl.setStyleSheet(f"font-size: {font_size(13)};")
-        name_lbl = QLabel(f"{self._gpu_name} · 3D / Compute")
+        name_lbl = QLabel(f"{self._gpu_name} · GPU / 3D / Compute")
         name_lbl.setStyleSheet(
             f"color: {self._palette[0]}; font-size: {font_size(13)}; font-weight: bold;")
         hdr.addWidget(icon_lbl)
@@ -2775,6 +3500,24 @@ class GPU3DComputeTile(BaseTile):
         hdr.addWidget(name_lbl)
         hdr.addStretch()
         outer.addLayout(hdr)
+
+        # ── Overall GPU row ───────────────────────────────────────────────────
+        gpu_row = QHBoxLayout()
+        gpu_row.setSpacing(dp(4))
+        gpu_lbl = QLabel("GPU")
+        gpu_lbl.setStyleSheet(
+            f"color: {self._palette[3]}; font-size: {font_size(12)}; font-weight: bold;")
+        gpu_lbl.setFixedWidth(dp(28))
+        _gpu_h = int(20 * _DP_SCALE) if _DP_SCALE > 0 else 20
+        self._gpu_graph = SparklineWidget(self._palette[3], min_height=_gpu_h)
+        self._gpu_val = QLabel("0%")
+        self._gpu_val.setStyleSheet(f"color: {self._palette[3]}; font-size: {font_size(12)};")
+        self._gpu_val.setFixedWidth(dp(34))
+        self._gpu_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # type: ignore
+        gpu_row.addWidget(gpu_lbl)
+        gpu_row.addWidget(self._gpu_graph)
+        gpu_row.addWidget(self._gpu_val)
+        outer.addLayout(gpu_row)
 
         # ── 3D row ────────────────────────────────────────────────────────────
         d3_row = QHBoxLayout()
@@ -2812,13 +3555,16 @@ class GPU3DComputeTile(BaseTile):
         cm_row.addWidget(self._cm_val)
         outer.addLayout(cm_row)
 
-    def update_3d_compute(self, d3: float, compute: float) -> None:
-        self._d3_graph.add_value(d3)
+    def update_3d_compute(self, total: float, gpu_3d: float, compute: float) -> None:
+        self._gpu_graph.add_value(total)
+        self._d3_graph.add_value(gpu_3d)
         self._cm_graph.add_value(compute)
+        self._gpu_val.setText(f"{int(self._gpu_graph.recent_avg())}%")
         self._d3_val.setText(f"{int(self._d3_graph.recent_avg())}%")
         self._cm_val.setText(f"{int(self._cm_graph.recent_avg())}%")
 
     def batch_update(self) -> None:
+        self._gpu_graph.batch_update()
         self._d3_graph.batch_update()
         self._cm_graph.batch_update()
 
@@ -3014,6 +3760,50 @@ class ResponsiveCoreGrid(QWidget):
 # TILE GRID  — manages draggable, hideable, reorderable tile layout
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _merge_layout_tiles(saved_order: List[str], saved_hidden: List[str],
+                        tile_ids: List[str], default_order: List[str]
+                        ) -> Tuple[List[str], List[str], bool]:
+    """Merge newly introduced tiles without destroying a custom row layout.
+
+    Power tiles are inserted beside their semantic anchor (CPU total or the
+    matching GPU VRAM tile).  If that anchor was hidden, the new tile starts
+    hidden as well.  This makes the v0.8 → v0.9 migration idempotent and avoids
+    dumping all v2.7 metrics at the end of a carefully arranged layout.
+    """
+    order = list(saved_order)
+    hidden = list(dict.fromkeys(saved_hidden))
+    known = {item for item in order if item != '__row__'} | set(hidden)
+    changed = False
+    default_ids = {item for item in default_order if item != '__row__'}
+
+    for tile_id in tile_ids:
+        if tile_id in known:
+            continue
+        anchor = ""
+        if tile_id == "cpu_power":
+            anchor = "cpu_total"
+        else:
+            match = re.fullmatch(r"gpu_(\d+)_power", tile_id)
+            if match:
+                anchor = f"gpu_{match.group(1)}_vram"
+
+        if anchor:
+            if anchor in hidden or anchor not in order:
+                hidden.append(tile_id)
+            else:
+                order.insert(order.index(anchor) + 1, tile_id)
+        elif tile_id in default_ids:
+            order.append(tile_id)
+        else:
+            # Non-default registered tiles must be discoverable through the
+            # Add Tile dialog instead of silently disappearing from both lists.
+            hidden.append(tile_id)
+        known.add(tile_id)
+        changed = True
+
+    return order, hidden, changed
+
+
 class TileGrid(QWidget):
     """
     Hosts all global-metric tiles in a free-form row layout.
@@ -3068,19 +3858,17 @@ class TileGrid(QWidget):
 
         cfg = self._load_config()
         if cfg:
-            saved_order  = [tid for tid in cfg.get('tile_order', [])
-                            if tid == '__row__' or tid in self._tiles]
+            saved_order = [tid for tid in cfg.get('tile_order', [])
+                           if tid == '__row__' or tid in self._tiles]
             saved_hidden = [tid for tid in cfg.get('hidden_tiles', []) if tid in self._tiles]
-            known = set(t for t in saved_order if t != '__row__') | set(saved_hidden)
-            for tid in default_order:
-                if tid not in known:
-                    saved_order.append(tid)
+            saved_order, saved_hidden, _ = _merge_layout_tiles(
+                saved_order, saved_hidden, list(self._tiles), default_order)
             self._tile_order = saved_order
-            self._hidden     = saved_hidden
-            self._min_row_h  = int(cfg.get('min_row_h', self._min_row_h))
+            self._hidden = saved_hidden
+            self._min_row_h = int(cfg.get('min_row_h', self._min_row_h))
         else:
             self._tile_order = list(default_order)
-            self._hidden     = [tid for tid in self._tiles if tid not in default_order]
+            self._hidden = [tid for tid in self._tiles if tid not in default_order]
 
         self._vbox = QVBoxLayout(self)
         self._vbox.setSpacing(dp(6))
@@ -3768,7 +4556,7 @@ def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD  v2.1
+# MAIN DASHBOARD  v2.7
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TricorderDashboard(QMainWindow):
@@ -3811,7 +4599,9 @@ class TricorderDashboard(QMainWindow):
         self.clock_timer.start(1000)
         self._update_clock()
 
-        self.hw_thread = HardwareMonitorThread(drive_info=self._drive_info)
+        self.hw_thread = HardwareMonitorThread(
+            drive_info=self._drive_info, dgpu_info=self.detected_gpus)
+        self._metric_frames = 0
         self.hw_thread.start()
 
         # Poll the monitor thread's latest-value slot at ~30 FPS.  If a UI
@@ -3862,9 +4652,13 @@ class TricorderDashboard(QMainWindow):
             self.has_ht = (self.c_logical == 2 * self.c_physical)
 
         self.num_sockets = 1
+        com_initialized = False
+        wmi = None
+        m = None
         if WMI_AVAILABLE:
             try:
                 pythoncom.CoInitialize()                            # type: ignore
+                com_initialized = True
                 wmi = win32com.client.GetObject("winmgmts:root\\cimv2")  # type: ignore
                 self.num_sockets = max(1, len(list(
                     wmi.ExecQuery("SELECT Name FROM Win32_Processor"))))
@@ -3891,9 +4685,15 @@ class TricorderDashboard(QMainWindow):
                     break
             except Exception:
                 pass
+        m = None
+        wmi = None
+        if com_initialized:
+            with contextlib.suppress(Exception):
+                pythoncom.CoUninitialize()                          # type: ignore
 
         self.detected_gpus: List[Tuple[str, float, str]] = []
         current_platform = platform.system()
+        self.current_platform = current_platform
         if current_platform == 'Linux':
             linux_gpus = _linux_detect_gpus()
             self.has_igpu = any(g.get("is_igpu", False) for g in linux_gpus)
@@ -4106,6 +4906,10 @@ class TricorderDashboard(QMainWindow):
         # ── Row 1: CPU + RAM ──────────────────────────────────────────────────
         reg("cpu_total", MetricTile("cpu_total", "CPU Gesamt",          "#00d4ff"), "CPU Gesamt")
         reg("ram",       MetricTile("ram",       f"{self.ram_type} RAM","#ff007f"), f"{self.ram_type} RAM")
+        if self.current_platform in ("Windows", "Linux"):
+            reg("cpu_power", PowerTile("cpu_power", "CPU · Leistungsaufnahme",
+                                        "#ffcc00", 250.0),
+                "CPU · Leistungsaufnahme")
 
         # ── Row 2: GPU engines ────────────────────────────────────────────────
         row()
@@ -4114,7 +4918,7 @@ class TricorderDashboard(QMainWindow):
             sn  = short_gpu_name(gname)
             reg(f"gpu_{gi}_3d",
                 GPU3DComputeTile(f"gpu_{gi}_3d", sn, pal),
-                f"{sn} · 3D / Compute")
+                f"{sn} · GPU / 3D / Compute")
             reg(f"gpu_{gi}_copy",
                 GPUCopyTile(f"gpu_{gi}_copy", sn, pal),
                 f"{sn} · Copy")
@@ -4124,6 +4928,10 @@ class TricorderDashboard(QMainWindow):
             reg(f"gpu_{gi}_vram",
                 MetricTile(f"gpu_{gi}_vram", f"{sn} · VRAM", pal[3]),
                 f"{sn} · VRAM")
+            reg(f"gpu_{gi}_power",
+                PowerTile(f"gpu_{gi}_power", f"{sn} · Leistungsaufnahme",
+                          pal[2], 350.0),
+                f"{sn} · Leistungsaufnahme")
             if gi < len(self.detected_gpus) - 1:
                 row()   # each GPU on its own row if multiple GPUs
 
@@ -4352,6 +5160,7 @@ class TricorderDashboard(QMainWindow):
             self._update_ui(m)
 
     def _update_ui(self, m: SystemMetrics) -> None:
+        self._metric_frames += 1
         _t = self._tiles.get
 
         # Optimized: direct attribute access instead of isinstance() checks
@@ -4363,6 +5172,9 @@ class TricorderDashboard(QMainWindow):
         w = _t("ram")
         if w:
             w.update_val(m.ram_percent, f"{m.ram_used_gb:.1f}/{m.ram_total_gb:.1f} GB")
+        w = _t("cpu_power")
+        if w:
+            w.update_power(m.cpu_power_watts)
         w = _t("igpu")
         if w:
             w.update_val(m.igpu_percent)
@@ -4370,7 +5182,8 @@ class TricorderDashboard(QMainWindow):
         for i, gm in enumerate(m.gpus):
             w_3d = _t(f"gpu_{i}_3d")
             if w_3d:
-                w_3d.update_3d_compute(gm.gpu_3d_percent, gm.gpu_compute_percent)
+                w_3d.update_3d_compute(
+                    gm.gpu_total_percent, gm.gpu_3d_percent, gm.gpu_compute_percent)
             w_copy = _t(f"gpu_{i}_copy")
             if w_copy:
                 w_copy.update_copy(gm.gpu_copy0_percent, gm.gpu_copy1_percent)
@@ -4382,6 +5195,9 @@ class TricorderDashboard(QMainWindow):
             if w_vram:
                 w_vram.update_val(vp,
                     f"{gm.gpu_vram_used_gb:.1f}/{gm.gpu_vram_total_gb:.0f} GB")
+            w_power = _t(f"gpu_{i}_power")
+            if w_power:
+                w_power.update_power(gm.gpu_power_watts)
 
         for dm in m.drives:
             w = _t(f"drive_{dm.key}")
@@ -4435,16 +5251,24 @@ class TricorderDashboard(QMainWindow):
             self._content_w.setMaximumHeight(self._MAX_WIDGET)          # uncap → tiles use target size
             for _ in range(12):                                   # bounded — converges fast
                 content = self._content_w
-                need = max(content.minimumSizeHint().height(), content.sizeHint().height())
-                have = self._scroll.viewport().height()
+                minimum_hint = content.minimumSizeHint()
+                size_hint = content.sizeHint()
+                need = max(minimum_hint.height() if minimum_hint is not None else 0,
+                           size_hint.height() if size_hint is not None else 0)
+                viewport = self._scroll.viewport()
+                if viewport is None:
+                    break
+                have = viewport.height()
                 delta = need - have
                 if abs(delta) < 3:
                     break
                 target = max(self.height() + delta, self.minimumHeight())
                 try:
-                    avail = self.screen().availableGeometry().height()       # type: ignore[union-attr]
-                    frame = self.frameGeometry().height() - self.height()
-                    target = min(target, avail - frame)
+                    screen = self.screen()
+                    if screen is not None:
+                        avail = screen.availableGeometry().height()
+                        frame = self.frameGeometry().height() - self.height()
+                        target = min(target, avail - frame)
                 except Exception:
                     pass
                 if abs(target - self.height()) < 3:
@@ -4482,7 +5306,8 @@ class TricorderDashboard(QMainWindow):
             self._tile_grid._release_row_pins()
             for _ in range(6):
                 QApplication.processEvents()
-                if not self._scroll.verticalScrollBar().isVisible():
+                scroll_bar = self._scroll.verticalScrollBar()
+                if scroll_bar is None or not scroll_bar.isVisible():
                     break
             self._auto_h = None                                 # user owns the height now
         finally:
@@ -4556,7 +5381,7 @@ class TricorderDashboard(QMainWindow):
 
             data = _load_config_file()
             data['window'] = {
-                'geometry': bytes(self.saveGeometry().toBase64()).decode('ascii'),
+                'geometry': self.saveGeometry().toBase64().data().decode('ascii'),
                 'placement': placement,
             }
             _save_config_file(data)
@@ -4571,6 +5396,16 @@ class TricorderDashboard(QMainWindow):
 
 # ═══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
+    _self_test = "--self-test" in sys.argv
+    if _self_test:
+        # Frozen-artifact CI smoke test: no display server or user interaction,
+        # and never overwrite the developer's real layout/geometry file.
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        _self_test_tmp = os.environ.get("RUNNER_TEMP") or os.environ.get("TEMP") or "/tmp"
+        CONFIG_FILE = Path(_self_test_tmp) / f"system-tricorder-selftest-{os.getpid()}.json"
+        with contextlib.suppress(FileNotFoundError):
+            CONFIG_FILE.unlink()
+
     # ── Crash logging for --noconsole PyInstaller builds ──────────────────────
     # With --noconsole, sys.stderr is redirected to NUL and unhandled exceptions
     # disappear silently.  This hook routes them to ~/.tricorder.log instead.
@@ -4584,7 +5419,7 @@ if __name__ == "__main__":
 
     sys.excepthook = _excepthook
 
-    app = QApplication(sys.argv)
+    app = QApplication([sys.argv[0]] if _self_test else sys.argv)
     app.setApplicationName("System Tricorder")
     app.setWindowIcon(_app_icon())
     app.setStyle("Fusion")
@@ -4594,7 +5429,27 @@ if __name__ == "__main__":
     logging.getLogger("tricorder").debug("DPI scale factor: %.2f", _DP_SCALE)
 
     win = TricorderDashboard()
-    if not win._restore_window_placement():
+    if _self_test:
+        app.setQuitOnLastWindowClosed(False)
+        win.show()
+
+        def _finish_self_test() -> None:
+            ok = (
+                win._metric_frames > 0
+                and f"v{APP_VERSION}" in win.windowTitle()
+                and "cpu_total" in win._tiles
+            )
+            if ok:
+                logger.info("Frozen self-test passed (%d metric frames)", win._metric_frames)
+            else:
+                logger.error("Frozen self-test failed (%d metric frames)", win._metric_frames)
+            win.close()
+            with contextlib.suppress(FileNotFoundError):
+                CONFIG_FILE.unlink()
+            app.exit(0 if ok else 1)
+
+        QTimer.singleShot(3000, _finish_self_test)
+    elif not win._restore_window_placement():
         # No saved geometry: open windowed and auto-fit to content (showEvent
         # schedules _fit_window_to_content) — guarantees no scrollbar on first
         # launch.  The user can still maximise manually if preferred.

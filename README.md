@@ -2,7 +2,7 @@
 
 > A real-time hardware monitoring dashboard for Windows, macOS, and Linux — dark mode, 30 FPS, fully customisable free-form layout.
 
-![Version](https://img.shields.io/badge/version-2.1-00ff88?style=flat-square)
+![Version](https://img.shields.io/badge/version-2.7-00ff88?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
@@ -17,7 +17,7 @@
 
 ## ✨ What it does
 
-System Tricorder gives you a live, graph-based view of your entire system at a glance — CPU, RAM, GPU(s), NPU, iGPU, and per-drive disk I/O — all updating at 30 FPS in a clean dark-mode window.
+System Tricorder gives you a live, graph-based view of your entire system at a glance — CPU, RAM, GPU(s), iGPU, package/board power, and per-drive disk I/O — all updating at 30 FPS in a clean dark-mode window.
 
 Every aspect of the layout is yours to control: arrange tiles into any number of rows with any number of tiles per row, hide what you don't need, restore it later, collapse entire sections. Everything persists across restarts automatically.
 
@@ -41,7 +41,7 @@ python system_tricorder.py
 
 Linux users can alternatively run `./start_linux.sh`. On macOS, install Python with Homebrew (`brew install python`) if the system Python has no working Qt support. Unsigned macOS downloads may require **right-click → Open** once.
 
-> ℹ️ Windows uses WMI/Registry/PDH for hardware counters. Linux uses psutil, lspci, DRM sysfs/fdinfo and optional NVML. macOS currently provides portable CPU, RAM, and disk metrics through psutil; platform-specific GPU metrics are not yet available.
+> ℹ️ Windows uses WMI/Registry only for one-shot inventory, PDH for live WDDM/VRAM/CPU-package counters, AMD ADLX for Radeon load/board power, and NVML for NVIDIA. Linux uses psutil, lspci, DRM sysfs/fdinfo, powercap/hwmon and optional NVML. macOS currently provides portable CPU, RAM, and disk metrics through psutil; platform-specific GPU/power metrics are not yet available.
 
 ---
 
@@ -93,9 +93,9 @@ The global grid has no fixed column count. Each row is independent and can hold 
 **Drag a tile onto the `── new row ──` line** that appears between rows — the tile is pulled out of its current row and placed as the first tile of a brand-new row at that position. This is how you create layouts like:
 
 ```
-CPU  |  RAM
-3D/Compute  |  Copy  |  VRAM
-iGPU  |  NPU
+CPU  |  RAM  |  CPU Watt
+GPU/3D/Compute  |  Copy  |  VRAM  |  GPU Watt
+iGPU
 SSD C:  |  SSD D:  |  SSD E:  |  HDD F:
 ```
 
@@ -126,13 +126,14 @@ Your layout, including all row breaks, is saved to `~/.tricorder_layout.json` on
 | Tile | What it shows | Source |
 |------|--------------|--------|
 | CPU Gesamt | Total CPU utilisation | psutil |
+| CPU · Leistungsaufnahme | CPU package power in watts | Windows Energy Meter/RAPL; Linux powercap |
 | DDR4 / DDR5 RAM | Used / total memory | psutil + WMI type detection |
-| iGPU | Integrated GPU engine utilisation | WMI GPU counters |
-| NPU | Neural Processing Unit utilisation | WMI GPU counters |
-| GPU N · 3D / Compute | Two sparklines: rasterisation + compute/CUDA separately | WMI GPU counters |
-| GPU N · Copy | Two sparklines: Copy Engine 0 + Copy Engine 1 | WMI GPU counters |
-| GPU N · Video Codec | Video Codec Engine utilisation | WMI GPU counters |
-| GPU N · VRAM | Used / total VRAM | WMI + Registry |
+| iGPU | Integrated GPU engine utilisation | Windows PDH; Linux DRM/sysfs |
+| GPU N · GPU / 3D / Compute | Driver-native overall load plus separate rasterisation and compute queues | AMD ADLX / NVML / DRM + PDH/fdinfo |
+| GPU N · Copy | Two sparklines: Copy Engine 0 + Copy Engine 1 | Windows PDH; Linux DRM fdinfo |
+| GPU N · Video Codec | Video Codec Engine utilisation | Windows PDH; Linux DRM fdinfo / NVML |
+| GPU N · VRAM | Used / total VRAM | ADLX/NVML or native PDH/sysfs |
+| GPU N · Leistungsaufnahme | Board power where available; GPU-chip power fallback | AMD ADLX; NVIDIA NVML; Linux hwmon |
 | Drive X | Two sparklines: Read MB/s + Write MB/s | psutil per-disk I/O |
 
 ### CPU Thread Topology (collapsible section)
@@ -167,14 +168,14 @@ Values are shown in MB/s and automatically switch to GB/s for drives exceeding 1
 
 ```json
 {
-  "version": "0.8",
+  "version": "0.9",
   "min_row_h": 130,
   "tile_order": [
-    "cpu_total", "ram",
+    "cpu_total", "ram", "cpu_power",
     "__row__",
-    "gpu_0_3d", "gpu_0_copy", "gpu_0_codec", "gpu_0_vram",
+    "gpu_0_3d", "gpu_0_copy", "gpu_0_codec", "gpu_0_vram", "gpu_0_power",
     "__row__",
-    "igpu", "npu",
+    "igpu",
     "__row__",
     "drive_PhysicalDrive0", "drive_PhysicalDrive1"
   ],
@@ -187,6 +188,19 @@ Delete the file to reset to factory defaults.
 ---
 
 ## 🗂️ Changelog
+
+### v2.7
+
+- **RDNA4-Auslastung wie in AMD Software** — Radeon-Karten werden unter Windows zusätzlich über die offizielle, treiber-native ADLX-Schnittstelle ausgelesen. Der neue `GPU`-Graph bleibt bei langen ComfyUI-/Video-KI-Dispatches korrekt auf Volllast, auch wenn WDDM/Task-Manager nur sporadische Compute-Pulse melden; 3D- und Compute-Engine bleiben als getrennte Diagnosekurven erhalten
+- **GPU-Leistungsaufnahme pro Karte** — neue frei platzierbare Watt-Kachel je dGPU; AMD bevorzugt Total Board Power über ADLX und fällt bei älteren Karten auf GPU-Chip-Leistung zurück, NVIDIA nutzt NVML und Linux nutzt NVML beziehungsweise DRM-hwmon. Nicht unterstützte Sensoren werden ehrlich als `k.A.` statt als falsche `0 W` dargestellt
+- **CPU-Package-Leistung in Watt** — neue CPU-Kachel über Windows Energy Meter/RAPL (`PKG`, ohne PP0/DRAM doppelt zu zählen) sowie Linux powercap; Mehrsockelsysteme werden summiert
+- **Sporadische 1–2-Sekunden-Pausen beseitigt** — Live-WMI wurde vollständig aus dem 30-FPS-Monitorpfad entfernt. Dediziertes VRAM kommt nun direkt aus PDH, ADLX liefert Radeon-VRAM, und WMI bleibt ausschließlich für einmalige Hardware-Inventur
+- **Robuster unter extremer Systemlast** — Disk-I/O wird sinnvoll mit 10 Hz statt 30 Hz abgefragt, Fehler wie Windows `WinError 1450` bleiben auf das betroffene Teilsystem begrenzt, letzte gültige Werte laufen weiter und veraltete ADLX-/Power-Caches verfallen automatisch
+- **Weniger Stotter- und GC-Risiko** — PDH verwendet wiederverwendbare Datenpuffer, der Monitor arbeitet mit einem monotonic Deadline-Takt ohne Catch-up-Bursts und protokolliert ungewöhnlich langsame Telemetrie-Iterationen
+- **Sichere Layout-Migration 0.8 → 0.9** — neue CPU-/GPU-Watt-Kacheln werden neben ihren passenden Kacheln eingefügt, ohne benutzerdefinierte Reihen, versteckte Kacheln, Fensterposition oder Zeilenhöhe zurückzusetzen
+- **Weitere Korrekturen** — doppelte Windows-GPU-Inventur entfernt, AMD-IDs `164E/164F` korrekt als iGPU klassifiziert und die zuvor unerreichbare Headroom-Logik der Laufwerksdiagramme repariert
+- **Release-Härtung** — Windows-EXE enthält nun Dateiversion, Produktversion und Produktname; der plattformübergreifende Release-Build startet jedes eingefrorene Artefakt automatisch mit `--self-test`
+- **Tests** — Smoke-Suite um Watt-Konvertierung, RAPL-Rollover, Linux-hwmon, Windows-NVML-Zuordnung, Layout-Migration, PowerTile-Skalierung, ADLX-Geräte-IDs und Inventory-Reuse erweitert
 
 ### v2.1
 

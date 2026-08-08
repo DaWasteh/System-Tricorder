@@ -1,0 +1,4 @@
+# The legacy main module and README are committed with CRLF. Treat the carriage
+# return as part of the line ending rather than trailing whitespace in reviews.
+*.py whitespace=cr-at-eol
+*.md whitespace=cr-at-eol

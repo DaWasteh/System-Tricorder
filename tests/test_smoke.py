@@ -66,20 +66,20 @@ def test_metric_defaults() -> None:
 
 
 def test_release_versions_are_synchronized() -> None:
-    assert tricorder.APP_VERSION == "2.7.2"
+    assert tricorder.APP_VERSION == "2.7.3"
     assert tricorder.CONFIG_VERSION == "1.0"
     root = Path(tricorder.__file__).parent
     version_info = (root / "assets" / "version_info.txt").read_text(encoding="utf-8")
     for expected in (
-        "filevers=(2, 7, 2, 0)",
-        "prodvers=(2, 7, 2, 0)",
-        "FileVersion', '2.7.2.0'",
-        "ProductVersion', '2.7.2.0'",
+        "filevers=(2, 7, 3, 0)",
+        "prodvers=(2, 7, 3, 0)",
+        "FileVersion', '2.7.3.0'",
+        "ProductVersion', '2.7.3.0'",
     ):
         assert expected in version_info
     readme = (root / "README.md").read_text(encoding="utf-8")
-    assert "version-2.7.2-00ff88" in readme
-    assert "### v2.7.2" in readme
+    assert "version-2.7.3-00ff88" in readme
+    assert "### v2.7.3" in readme
     release_builder = (root / ".github" / "scripts" / "build_release.py").read_text(
         encoding="utf-8")
     assert 'generated_spec_dir = build_dir / "generated-spec"' in release_builder
@@ -383,9 +383,25 @@ def test_tile_rows_expand_vertically_without_blank_bands(
     occupied = sum(row.height() for row in rows) + grid._vbox.spacing()
     assert occupied >= grid.height() - 4
 
+    grid.resize(320, 80)
+    qapp.processEvents()
+    grid._auto_adjust_row_height()
+    qapp.processEvents()
+    compact_occupied = sum(row.height() for row in rows) + grid._vbox.spacing()
+    assert all(row.isVisible() and row.height() > 0 for row in rows)
+    assert compact_occupied <= grid.height() + 4
+
     grid.close()
     grid.deleteLater()
     qapp.processEvents()
+
+
+def test_qt_dpi_uses_device_independent_coordinates(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(tricorder, "_DP_SCALE", 2.0)
+    assert tricorder._init_dp_scale(qapp) == 1.0
+    assert tricorder.dp(24) == 24
 
 
 def test_sparkline_preferred_heights_are_dpi_scaled_once(
@@ -408,25 +424,31 @@ def test_maximised_dashboard_uses_coalesced_fill_layout(
     qapp: QApplication, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(tricorder, "CONFIG_FILE", tmp_path / "layout.json")
+    monkeypatch.setattr(tricorder, "_DP_SCALE", 2.0)
 
     def fake_hardware(self: tricorder.TricorderDashboard) -> None:
-        self.c_physical = 2
-        self.c_logical = 4
+        self.c_physical = 24
+        self.c_logical = 24
         self.num_sockets = 1
         self.is_amd = False
         self.is_hybrid = False
-        self.has_ht = True
+        self.has_ht = False
         self.p_cores = 0
         self.e_cores = 0
-        self.p_threads = 4
+        self.p_threads = 24
         self.e_threads = 0
         self.p_logical = []
         self.e_logical = []
         self.ram_type = "RAM"
-        self.current_platform = "Darwin"
-        self.detected_gpus = []
-        self.has_igpu = False
-        self._drive_info = [("all", "All Drives")]
+        self.current_platform = "Windows"
+        self.detected_gpus = [
+            ("AMD Radeon Test 0", 16.0, "0x1000"),
+            ("AMD Radeon Test 1", 32.0, "0x2000"),
+        ]
+        self.has_igpu = True
+        self._drive_info = [
+            ("drive0", "C:"), ("drive1", "D:"), ("drive2", "E:")
+        ]
 
     monkeypatch.setattr(tricorder.TricorderDashboard, "_analyze_hardware", fake_hardware)
     monkeypatch.setattr(tricorder.HardwareMonitorThread, "start", lambda _self: None)
@@ -466,6 +488,68 @@ def test_maximised_dashboard_uses_coalesced_fill_layout(
         qapp.processEvents()
         assert dashboard._pending_resize_action == "fill"
         dashboard._resize_settle_timer.stop()
+
+        dashboard.resize(640, 360)
+        dashboard._apply_fill_mode()
+        qapp.processEvents()
+        viewport = dashboard._scroll.viewport()
+        assert dashboard.minimumSize().width() == 640
+        assert dashboard.minimumSize().height() == 360
+        assert (dashboard._scroll.verticalScrollBarPolicy()
+                == tricorder.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        assert (dashboard._scroll.horizontalScrollBarPolicy()
+                == tricorder.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        assert not dashboard._scroll.verticalScrollBar().isVisible()
+        assert not dashboard._scroll.horizontalScrollBar().isVisible()
+        assert dashboard._content_w.width() == viewport.width()
+        assert viewport.height() - dashboard._content_w.height() == 2
+        for tile_id in dashboard._tile_grid._tile_order:
+            if tile_id == "__row__":
+                continue
+            tile = dashboard._tiles[tile_id]
+            top_left = tile.mapTo(viewport, tricorder.QPoint(0, 0))
+            assert tile.isVisible() and tile.width() > 0 and tile.height() > 0
+            assert 0 <= top_left.x() < viewport.width()
+            assert top_left.x() + tile.width() <= viewport.width() + 1
+            assert 0 <= top_left.y() < viewport.height()
+            assert top_left.y() + tile.height() <= viewport.height()
+            for graph in tile.findChildren(tricorder.SparklineWidget):
+                graph_pos = graph.mapTo(viewport, tricorder.QPoint(0, 0))
+                assert graph.width() > 0 and graph.height() > 0
+                assert 0 <= graph_pos.x() < viewport.width()
+                assert graph_pos.x() + graph.width() <= viewport.width() + 1
+                assert 0 <= graph_pos.y() < viewport.height()
+                assert graph_pos.y() + graph.height() <= viewport.height() + 1
+        for thread_widget in dashboard.thread_widgets.values():
+            top_left = thread_widget.mapTo(viewport, tricorder.QPoint(0, 0))
+            assert (thread_widget.isVisible() and thread_widget.width() > 0
+                    and thread_widget.height() > 0)
+            assert 0 <= top_left.x() < viewport.width()
+            assert top_left.x() + thread_widget.width() <= viewport.width() + 1
+            assert 0 <= top_left.y() < viewport.height()
+            # Qt may round the final stretched grid row one pixel past the
+            # viewport edge at 200% DPR; no complete row/widget is clipped.
+            assert top_left.y() + thread_widget.height() <= viewport.height() + 1
+
+        dashboard._tile_grid.set_edit_mode(True)
+        dashboard._resize_settle_timer.stop()
+        dashboard._apply_fill_mode()
+        qapp.processEvents()
+        assert dashboard._content_w.width() == viewport.width()
+        assert viewport.height() - dashboard._content_w.height() == 2
+        for row_widget in dashboard._tile_grid._row_widgets:
+            top_left = row_widget.mapTo(viewport, tricorder.QPoint(0, 0))
+            assert (row_widget.isVisible() and row_widget.width() > 0
+                    and row_widget.height() > 0)
+            assert 0 <= top_left.x() < viewport.width()
+            assert top_left.x() + row_widget.width() <= viewport.width() + 1
+            assert 0 <= top_left.y() < viewport.height()
+            assert top_left.y() + row_widget.height() <= viewport.height() + 1
+        dashboard._tile_grid.set_edit_mode(False)
+        dashboard._resize_settle_timer.stop()
+        dashboard._apply_fill_mode()
+        qapp.processEvents()
+
         with monkeypatch.context() as no_nested_events:
             def fail_process_events(*_args: object, **_kwargs: object) -> None:
                 raise AssertionError("responsive fitting must not process nested events")

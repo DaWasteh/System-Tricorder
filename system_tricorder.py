@@ -47,22 +47,17 @@ _DP_SCALE: float = 1.0
 
 
 def _init_dp_scale(app: "QApplication") -> float:
-    """Compute DPI scale factor from Qt's primary screen devicePixelRatio.
+    """Use Qt's native device-independent coordinate system.
 
-    Must be called AFTER QApplication is created.  Returns the scale factor
-    and stores it in the module-level _DP_SCALE variable so that all
-    dp() / font_size() calls throughout the codebase use the correct value.
+    Qt 6 already applies each screen's DPR to widget geometry and fonts.  A
+    second manual devicePixelRatio multiplier made the whole dashboard twice
+    as large at 200% scaling and could not follow per-monitor DPI changes.
+    ``app`` remains part of the API because initialization occurs after the
+    QApplication is created.
     """
+    del app
     global _DP_SCALE
-    try:
-        screen = app.primaryScreen()
-        if screen is not None:
-            scale = screen.devicePixelRatio()  # type: ignore[union-attr]
-            _DP_SCALE = float(scale)
-        else:
-            _DP_SCALE = 1.0
-    except Exception:
-        _DP_SCALE = 1.0
+    _DP_SCALE = 1.0
     return _DP_SCALE
 
 
@@ -95,7 +90,7 @@ def set_font_size(label: "QLabel", pt: float, **kwargs) -> None:
 
 # ── Qt imports ─────────────────────────────────────────────────────────────────
 from PyQt6.QtWidgets import (                                       # type: ignore
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLayout,
     QLabel, QFrame, QGridLayout, QSizePolicy, QPushButton,
     QScrollArea, QDialog, QCheckBox, QDialogButtonBox, QMessageBox,
 )
@@ -137,7 +132,7 @@ except ImportError:
 # ── Layout / window config ────────────────────────────────────────────────────
 CONFIG_FILE = Path.home() / ".tricorder_layout.json"
 CONFIG_VERSION = "1.0"
-APP_VERSION = "2.7.2"
+APP_VERSION = "2.7.3"
 GITHUB_REPO_URL = "https://github.com/DaWasteh/System-Tricorder.git"
 
 
@@ -2732,6 +2727,14 @@ def _get_cpu_topology() -> Optional[dict]:
 # WIDGET PRIMITIVES
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
+def _set_responsive_label_width(label: QLabel, maximum: int) -> None:
+    """Let compact tiles shrink labels instead of forcing horizontal clipping."""
+    label.setMinimumWidth(0)
+    label.setMaximumWidth(dp(maximum))
+    label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+
+
 class SparklineWidget(QWidget):
     """
     Single horizontal sparkline with filled area.
@@ -2748,7 +2751,7 @@ class SparklineWidget(QWidget):
     #: shrunk the rows compressed below that minimum, the sparkline
     #: overflowed its tile and the bottom of the graph -- the 0 % baseline
     #: and every low value -- was silently cut off.)
-    _HARD_MIN_H = 12
+    _HARD_MIN_H = 4
 
     def __init__(self, color_hex: str, history_len: int = 90,
                  min_height: int = 70, parent=None) -> None:
@@ -2855,8 +2858,8 @@ class MasterMetricBox(QFrame):
     """Used exclusively for the CPU core/thread grid.  Not draggable."""
     def __init__(self, title: str, color_hex: str, variant: str = 'standard', parent=None) -> None:
         super().__init__(parent)
-        # DPI-aware sizing
-        self.setMinimumHeight(dp(40))
+        # Keep core boxes compressible so every active core remains on screen.
+        self.setMinimumHeight(0)
         if variant == 'efficiency':
             frame_css = (
                 f"border-top: 1px solid #1a1a28;"
@@ -2939,7 +2942,7 @@ class BaseTile(QFrame):
         self._drag_pos: Optional[QPoint] = None
 
         self.setAcceptDrops(True)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self._apply_frame_style(color_hex, edit=False)
 
         self._build_content()
@@ -3263,11 +3266,11 @@ class DriveTile(BaseTile):
         r_row.setSpacing(dp(4))
         r_lbl = QLabel("R")
         r_lbl.setStyleSheet(f"color: {DRIVE_R_COLOR}; font-size: {font_size(12)}; font-weight: bold;")
-        r_lbl.setFixedWidth(dp(12))
+        _set_responsive_label_width(r_lbl, 12)
         self._r_graph = SparklineWidget(DRIVE_R_COLOR, min_height=24)
         self._r_val   = QLabel("0 MB/s")
         self._r_val.setStyleSheet(f"color: {DRIVE_R_COLOR}; font-size: {font_size(12)};")
-        self._r_val.setFixedWidth(dp(72))
+        _set_responsive_label_width(self._r_val, 72)
         self._r_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)   # type: ignore
         r_row.addWidget(r_lbl)
         r_row.addWidget(self._r_graph)
@@ -3279,11 +3282,11 @@ class DriveTile(BaseTile):
         w_row.setSpacing(dp(4))
         w_lbl = QLabel("W")
         w_lbl.setStyleSheet(f"color: {DRIVE_W_COLOR}; font-size: {font_size(12)}; font-weight: bold;")
-        w_lbl.setFixedWidth(dp(12))
+        _set_responsive_label_width(w_lbl, 12)
         self._w_graph = SparklineWidget(DRIVE_W_COLOR, min_height=24)
         self._w_val   = QLabel("0 MB/s")
         self._w_val.setStyleSheet(f"color: {DRIVE_W_COLOR}; font-size: {font_size(12)};")
-        self._w_val.setFixedWidth(dp(72))
+        _set_responsive_label_width(self._w_val, 72)
         self._w_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)   # type: ignore
         w_row.addWidget(w_lbl)
         w_row.addWidget(self._w_graph)
@@ -3361,11 +3364,11 @@ class GPUCopyTile(BaseTile):
         c0_lbl = QLabel("Cp0")
         c0_lbl.setStyleSheet(
             f"color: {self._palette[1]}; font-size: {font_size(12)}; font-weight: bold;")
-        c0_lbl.setFixedWidth(dp(28))
+        _set_responsive_label_width(c0_lbl, 28)
         self._c0_graph = SparklineWidget(self._palette[1], min_height=24)
         self._c0_val   = QLabel("0%")
         self._c0_val.setStyleSheet(f"color: {self._palette[1]}; font-size: {font_size(12)};")
-        self._c0_val.setFixedWidth(dp(34))
+        _set_responsive_label_width(self._c0_val, 34)
         self._c0_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # type: ignore
         c0_row.addWidget(c0_lbl)
         c0_row.addWidget(self._c0_graph)
@@ -3378,11 +3381,11 @@ class GPUCopyTile(BaseTile):
         c1_lbl = QLabel("Cp1")
         c1_lbl.setStyleSheet(
             f"color: {self._palette[2]}; font-size: {font_size(12)}; font-weight: bold;")
-        c1_lbl.setFixedWidth(dp(28))
+        _set_responsive_label_width(c1_lbl, 28)
         self._c1_graph = SparklineWidget(self._palette[2], min_height=24)
         self._c1_val   = QLabel("0%")
         self._c1_val.setStyleSheet(f"color: {self._palette[2]}; font-size: {font_size(12)};")
-        self._c1_val.setFixedWidth(dp(34))
+        _set_responsive_label_width(self._c1_val, 34)
         self._c1_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # type: ignore
         c1_row.addWidget(c1_lbl)
         c1_row.addWidget(self._c1_graph)
@@ -3440,11 +3443,11 @@ class GPUCodecTile(BaseTile):
         codec_lbl = QLabel("Codec")
         codec_lbl.setStyleSheet(
             f"color: {self._palette[3]}; font-size: {font_size(12)}; font-weight: bold;")
-        codec_lbl.setFixedWidth(dp(48))
+        _set_responsive_label_width(codec_lbl, 48)
         self._codec_graph = SparklineWidget(self._palette[3], min_height=24)
         self._codec_val   = QLabel("0%")
         self._codec_val.setStyleSheet(f"color: {self._palette[3]}; font-size: {font_size(12)};")
-        self._codec_val.setFixedWidth(dp(34))
+        _set_responsive_label_width(self._codec_val, 34)
         self._codec_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # type: ignore
         codec_row.addWidget(codec_lbl)
         codec_row.addWidget(self._codec_graph)
@@ -3498,11 +3501,11 @@ class GPU3DComputeTile(BaseTile):
         d3_lbl = QLabel("3D ")
         d3_lbl.setStyleSheet(
             f"color: {self._palette[0]}; font-size: {font_size(12)}; font-weight: bold;")
-        d3_lbl.setFixedWidth(dp(28))
+        _set_responsive_label_width(d3_lbl, 28)
         self._d3_graph = SparklineWidget(self._palette[0], min_height=24)
         self._d3_val   = QLabel("0%")
         self._d3_val.setStyleSheet(f"color: {self._palette[0]}; font-size: {font_size(12)};")
-        self._d3_val.setFixedWidth(dp(34))
+        _set_responsive_label_width(self._d3_val, 34)
         self._d3_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # type: ignore
         d3_row.addWidget(d3_lbl)
         d3_row.addWidget(self._d3_graph)
@@ -3515,11 +3518,11 @@ class GPU3DComputeTile(BaseTile):
         cm_lbl = QLabel("Cmp")
         cm_lbl.setStyleSheet(
             f"color: {self._palette[1]}; font-size: {font_size(12)}; font-weight: bold;")
-        cm_lbl.setFixedWidth(dp(28))
+        _set_responsive_label_width(cm_lbl, 28)
         self._cm_graph = SparklineWidget(self._palette[1], min_height=24)
         self._cm_val   = QLabel("0%")
         self._cm_val.setStyleSheet(f"color: {self._palette[1]}; font-size: {font_size(12)};")
-        self._cm_val.setFixedWidth(dp(34))
+        _set_responsive_label_width(self._cm_val, 34)
         self._cm_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # type: ignore
         cm_row.addWidget(cm_lbl)
         cm_row.addWidget(self._cm_graph)
@@ -3553,9 +3556,10 @@ class RowDropZone(QWidget):
         self._row_idx = row_idx
         self._hover   = False
         self.setAcceptDrops(True)
-        self.setFixedWidth(dp(28))
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
-        self.setMinimumHeight(dp(40))
+        self.setMinimumWidth(1)
+        self.setMaximumWidth(dp(28))
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        self.setMinimumHeight(1)
 
     def dragEnterEvent(self, event) -> None:                                # type: ignore
         if event.mimeData().hasText():
@@ -3669,17 +3673,21 @@ class ResponsiveCoreGrid(QWidget):
                  min_col_w: int = 120, max_cols: int = 0, parent=None) -> None:
         super().__init__(parent)
         self._columns    = columns
-        self._min_col_w  = dp(min_col_w)  # scale the logical min width
+        # Qt already lays widgets out in device-independent coordinates; using
+        # devicePixelRatio here doubled the wrap threshold on high-DPI screens.
+        self._min_col_w  = max(1, min_col_w)
         self._max_cols   = max_cols   # 0 = no cap
         self._last_cols  = 0
         self._last_rows  = 0
-        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self.setMinimumSize(0, 0)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         for group in columns:
             for w in group:
                 w.setParent(self)
 
         self._grid = QGridLayout(self)
+        self._grid.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
         self._grid.setSpacing(dp(6))
         self._grid.setContentsMargins(0, 0, 0, 0)
         self._do_layout(max(1, len(columns)))   # sensible initial layout
@@ -3693,6 +3701,7 @@ class ResponsiveCoreGrid(QWidget):
             new_cols = min(new_cols, self._max_cols)
         if new_cols != self._last_cols:
             self._do_layout(new_cols)
+        self._update_compact_spacing()
 
     def _do_layout(self, grid_cols: int) -> None:
         self._last_cols = grid_cols
@@ -3718,10 +3727,30 @@ class ResponsiveCoreGrid(QWidget):
                 self._grid.addWidget(w, grid_row_base + ri, grid_col)
 
         total_rows = math.ceil(len(self._columns) / grid_cols) * rows_per_group
+        self._last_rows = total_rows
         for r in range(total_rows):
             self._grid.setRowStretch(r, 1)
         for c in range(grid_cols):
             self._grid.setColumnStretch(c, 1)
+        self._update_compact_spacing()
+
+    def _update_compact_spacing(self) -> None:
+        """Reduce gaps before they can displace active core widgets."""
+        nominal = dp(6)
+        horizontal = nominal
+        vertical = nominal
+        if self._last_cols > 1:
+            horizontal = min(
+                nominal,
+                max(0, (self.width() - self._last_cols) // (self._last_cols - 1)),
+            )
+        if self._last_rows > 1:
+            vertical = min(
+                nominal,
+                max(0, (self.height() - self._last_rows) // (self._last_rows - 1)),
+            )
+        self._grid.setHorizontalSpacing(horizontal)
+        self._grid.setVerticalSpacing(vertical)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3993,10 +4022,10 @@ class TileGrid(QWidget):
         # Scale row heights by DPI — 75/180 are logical px for 100% DPI
         self._min_row_h  = int(75 * _DP_SCALE) if _DP_SCALE > 0 else 75
         self._max_row_h  = int(180 * _DP_SCALE) if _DP_SCALE > 0 else 180
-        # Hard compression floor — well below the tiles' own readable minimum
-        # (~105 px from the sparkline), so it never clips; it only lets the
-        # layout compress rows when the user shrinks the window.
-        self._ROW_FLOOR  = int(48 * _DP_SCALE) if _DP_SCALE > 0 else 48
+        # A visual row must remain present, but it must never force scrolling.
+        # Headers/graphs may become compact in a very small window; every active
+        # tile still receives geometry and grows back continuously with space.
+        self._ROW_FLOOR  = 1
         self._row_widgets: List[QWidget] = []
         self._current_row_h = self._min_row_h  # dynamically adjusted
 
@@ -4050,7 +4079,9 @@ class TileGrid(QWidget):
                 # A read-only home/config target must not prevent app startup.
                 logger.warning("Config migration save failed: %s", exc)
 
+        self.setMinimumSize(0, 0)
         self._vbox = QVBoxLayout(self)
+        self._vbox.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
         self._vbox.setSpacing(dp(6))
         self._vbox.setContentsMargins(0, 0, 0, 0)
         self._relayout()
@@ -4090,6 +4121,7 @@ class TileGrid(QWidget):
                 QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             rw.setMinimumHeight(self._current_row_h)
             hbox = QHBoxLayout(rw)
+            hbox.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
             hbox.setContentsMargins(0, 0, 0, 0)
             hbox.setSpacing(dp(6))
 
@@ -4124,17 +4156,6 @@ class TileGrid(QWidget):
         super().resizeEvent(event)
         self._auto_adjust_row_height()
 
-    def _row_min(self, rw: QWidget) -> int:
-        """Lowest height a row wrapper may be pinned to without clipping its
-        tiles: the row floor, but never below the row's own content minimum.
-        (An explicit setMinimumHeight OVERRIDES the layout-derived minimum;
-        pinning rows to the bare _ROW_FLOOR let the outer layout shrink them
-        below their tiles' minimum height, so the tiles overflowed and the
-        bottom of every sparkline -- the 0 % baseline -- was cut off.)"""
-        lay = rw.layout()
-        content_min = lay.minimumSize().height() if lay is not None else 0
-        return max(self._ROW_FLOOR, content_min)
-
     def _auto_adjust_row_height(self) -> None:
         """Compute an optimal row height from the widget's current height.
 
@@ -4156,30 +4177,38 @@ class TileGrid(QWidget):
             if isinstance(widget, InterRowDropZone)
         ]
         drop_zones = len(drop_zone_widgets)
-        available -= sum(widget.minimumHeight() for widget in drop_zone_widgets)
         item_count = n_rows + drop_zones
-        available -= max(0, item_count - 1) * dp(6)
-        available = max(0, available)
+        gap_count = max(0, item_count - 1)
+        spacing = dp(6)
+        if gap_count:
+            spacing = min(
+                spacing,
+                max(0, (available - item_count) // gap_count),
+            )
+        self._vbox.setSpacing(spacing)
+        available = max(0, available - gap_count * spacing)
+
+        if drop_zone_widgets:
+            drop_height = min(
+                dp(16),
+                max(1, (available - n_rows * self._ROW_FLOOR) // drop_zones),
+            )
+            for widget in drop_zone_widgets:
+                widget.setFixedHeight(drop_height)
+            available = max(0, available - drop_zones * drop_height)
 
         target_h = min(
             self._max_row_h,
             max(int(110 * _DP_SCALE), self._min_row_h),
         )
         per_row = available // n_rows
-        if per_row >= self._min_row_h:
-            ideal = min(target_h, per_row)
-        else:
-            ideal = max(self._ROW_FLOOR, per_row)
+        ideal = max(self._ROW_FLOOR, min(target_h, per_row))
         self._current_row_h = ideal
 
         for rw in self._row_widgets:
             if isinstance(rw, (RowDropZone, InterRowDropZone)):
                 continue
-            minimum = max(
-                self._row_min(rw),
-                ideal if per_row >= self._min_row_h else self._ROW_FLOOR,
-            )
-            rw.setMinimumHeight(minimum)
+            rw.setMinimumHeight(ideal)
             # Never cap an expanding row.  Qt now gives every row an equal
             # share of the available height, so tiles grow continuously in a
             # tall/maximised window instead of leaving gaps or jumping between
@@ -4199,11 +4228,6 @@ class TileGrid(QWidget):
         self._min_row_h = max(int(50 * _DP_SCALE), min(h, int(400 * _DP_SCALE)))
         self._max_row_h = max(int(180 * _DP_SCALE), self._min_row_h)
         self._current_row_h = self._min_row_h
-        for rw in self._row_widgets:
-            if isinstance(rw, InterRowDropZone):
-                continue
-            rw.setMinimumHeight(max(self._current_row_h, self._row_min(rw)))
-            rw.setMaximumHeight(16_777_215)
         self._auto_adjust_row_height()
         self._save_config()
 
@@ -4421,8 +4445,11 @@ class CollapsibleSection(QWidget):
         super().__init__(parent)
         self._collapsed = False
         self._content   = content
+        self.setMinimumSize(0, 0)
+        content.setMinimumSize(0, 0)
 
         layout = QVBoxLayout(self)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
@@ -4772,7 +4799,7 @@ def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD  v2.7.2
+# MAIN DASHBOARD  v2.7.3
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TricorderDashboard(QMainWindow):
@@ -4789,10 +4816,9 @@ class TricorderDashboard(QMainWindow):
 
         self.setWindowTitle(f"System Tricorder v{APP_VERSION}")
         self.setWindowIcon(_app_icon())
-        # Scale minimum size by DPI — 1280×720 is the logical 100% DPI size
-        _min_w = int(1280 * _DP_SCALE) if _DP_SCALE > 0 else 1280
-        _min_h = int(720 * _DP_SCALE) if _DP_SCALE > 0 else 720
-        self.setMinimumSize(_min_w, _min_h)
+        # Qt window coordinates are already device-independent.  Keep only a
+        # compact usability floor; active tiles scale to fit without scrollbars.
+        self.setMinimumSize(640, 360)
         self.setStyleSheet("QMainWindow, QWidget { background-color: #0a0a0f; color: white; }")
 
         self._analyze_hardware()
@@ -4964,6 +4990,7 @@ class TricorderDashboard(QMainWindow):
         root_w  = QWidget()
         self.setCentralWidget(root_w)
         root    = QVBoxLayout(root_w)
+        root.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
         root.setContentsMargins(dp(15), dp(12), dp(15), dp(12))
         root.setSpacing(dp(0))
 
@@ -5039,20 +5066,23 @@ class TricorderDashboard(QMainWindow):
         # ── Scrollable content ────────────────────────────────────────────────
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        # The window auto-fits its content (see _fit_window_to_content), so a
-        # vertical scrollbar is never needed in practice; keep it AsNeeded only
-        # as a safety net for the rare content-exceeds-screen edge case.
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # The dashboard is a scale-to-fit surface: every active tile stays in
+        # the viewport and no scrollbars are introduced at compact sizes.
         self._scroll = scroll
         self._content_w = None   # set below
         scroll.setStyleSheet(
             "QScrollArea { background: transparent; border: none; }"
-            f"QScrollBar:vertical {{ background: #111; width: {dp(8)}px; border: none; }}"
-            f"QScrollBar::handle:vertical {{ background: #333; border-radius: {int(4 * _DP_SCALE)}px; }}"
         )
         content_w = QWidget()
+        content_w.setMinimumSize(0, 0)
+        content_w.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         content_w.setStyleSheet("background: transparent;")
         self._content_w = content_w
         content_layout = QVBoxLayout(content_w)
+        content_layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(0)
         scroll.setWidget(content_w)
@@ -5074,7 +5104,9 @@ class TricorderDashboard(QMainWindow):
         # ── CPU topology section (collapsible) ────────────────────────────────
         cpu_content_w = QWidget()
         cpu_content_w.setStyleSheet("background: transparent;")
+        cpu_content_w.setMinimumSize(0, 0)
         cpu_inner = QVBoxLayout(cpu_content_w)
+        cpu_inner.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
         cpu_inner.setContentsMargins(0, 0, 0, 0)
         cpu_inner.setSpacing(0)
 
@@ -5451,11 +5483,9 @@ class TricorderDashboard(QMainWindow):
     #   • 'auto'  — the APP is sizing the window (first show, or a structural
     #               change like adding/removing a tile or collapsing a section).
     #               The window grows/shrinks to exactly fit the content.
-    #   • 'fill'  — the USER dragged the window edge.  We stop fighting them:
-    #               instead of growing the window back we cap the scroll content
-    #               to the viewport so the layout compresses the tiles down to
-    #               their readable minimum.  Only when even the minimums can't
-    #               fit does the scrollbar appear as a last-resort fallback.
+    #   • 'fill'  — the USER owns the window size.  Content is fixed to the
+    #               viewport and every active tile/core box receives a share of
+    #               that space; scrollbars are never introduced.
     _MAX_WIDGET = 16_777_215   # Qt QWIDGETSIZE_MAX
 
     def _fit_window_to_content(self) -> None:
@@ -5476,9 +5506,11 @@ class TricorderDashboard(QMainWindow):
             return
         self._fitting = True
         self._fit_mode = 'auto'
+        needs_fill = False
         try:
             content = self._content_w
-            content.setMaximumHeight(self._MAX_WIDGET)
+            content.setMinimumSize(0, 0)
+            content.setMaximumSize(self._MAX_WIDGET, self._MAX_WIDGET)
             layout = content.layout()
             if layout is not None:
                 layout.activate()
@@ -5498,13 +5530,34 @@ class TricorderDashboard(QMainWindow):
                         if screen is not None:
                             available = screen.availableGeometry().height()
                             frame = self.frameGeometry().height() - self.height()
-                            target = min(target, available - frame)
+                            screen_target = available - frame
+                            if target > screen_target:
+                                target = screen_target
+                                needs_fill = True
                     except Exception:
                         pass
                     if abs(target - self.height()) >= 3:
                         self.resize(self.width(), target)
         finally:
             self._fitting = False
+        if needs_fill:
+            self._schedule_layout_settle('fill')
+
+    def _sync_content_to_viewport(self) -> None:
+        """Synchronously keep scale-to-fit content inside the viewport."""
+        if self._content_w is None or self._scroll is None:
+            return
+        viewport = self._scroll.viewport()
+        if viewport is None:
+            return
+        viewport_size = viewport.size()
+        # Leave a two-pixel rounding guard so the final stretched grid row is
+        # never placed exactly beyond the viewport's last drawable pixel.
+        content_size = QSize(
+            viewport_size.width(), max(1, viewport_size.height() - 2))
+        self._content_w.setMinimumSize(0, 0)
+        self._content_w.setMaximumSize(content_size)
+        self._content_w.resize(content_size)
 
     def _apply_fill_mode(self) -> None:
         """FILL mode: make the content follow the user-selected viewport.
@@ -5521,11 +5574,12 @@ class TricorderDashboard(QMainWindow):
         self._fitting = True
         self._fit_mode = 'fill'
         try:
-            self._content_w.setMaximumHeight(self._MAX_WIDGET)
+            content = self._content_w
+            self._sync_content_to_viewport()
+            viewport = self._scroll.viewport()
             self._tile_grid._auto_adjust_row_height()
             self._tile_grid.updateGeometry()
-            self._content_w.updateGeometry()
-            viewport = self._scroll.viewport()
+            content.updateGeometry()
             if viewport is not None:
                 viewport.update()
         finally:
@@ -5561,18 +5615,18 @@ class TricorderDashboard(QMainWindow):
 
         state = self.windowState()
         if state & (Qt.WindowState.WindowMaximized | Qt.WindowState.WindowFullScreen):  # type: ignore[operator]
+            self._fit_mode = 'fill'
+            self._sync_content_to_viewport()
             self._schedule_layout_settle('fill')
             return
 
         dh = new_h - old[1]
         dw = new_w - old[0]
-        if dh != 0:
-            # Vertical drag → user owns the viewport dimensions.
+        if dh != 0 or dw != 0:
+            # Any user resize owns both dimensions and scales continuously.
+            self._fit_mode = 'fill'
+            self._sync_content_to_viewport()
             self._schedule_layout_settle('fill')
-        elif dw != 0:
-            # Width-only changes may alter the responsive CPU-grid height.
-            self._schedule_layout_settle(
-                'auto' if self._fit_mode == 'auto' else 'fill')
 
     def changeEvent(self, event) -> None:                                    # type: ignore
         super().changeEvent(event)
@@ -5580,6 +5634,8 @@ class TricorderDashboard(QMainWindow):
                 and hasattr(self, '_resize_settle_timer')):
             # Window-state transitions can arrive before or after resizeEvent
             # depending on the platform.  Handle both paths idempotently.
+            self._fit_mode = 'fill'
+            self._sync_content_to_viewport()
             self._schedule_layout_settle('fill')
 
     def showEvent(self, event) -> None:                                      # type: ignore

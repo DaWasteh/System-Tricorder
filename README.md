@@ -2,7 +2,7 @@
 
 > A real-time hardware monitoring dashboard for Windows, macOS, and Linux — dark mode, 30 FPS, fully customisable free-form layout.
 
-![Version](https://img.shields.io/badge/version-2.7.2-00ff88?style=flat-square)
+![Version](https://img.shields.io/badge/version-2.7.3-00ff88?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
@@ -191,6 +191,16 @@ Delete the file to reset to factory defaults.
 ---
 
 ## 🗂️ Changelog
+
+### v2.7.3
+
+- **Kompaktes 640×360-Fenster** — die Mindestgröße verwendet nun kleine logische Qt-Koordinaten und wird nicht mehr zusätzlich mit dem Monitor-DPR vervielfacht
+- **Keine Scrollbars, alle aktiven Kacheln bleiben sichtbar** — Inhalt, globale Tile-Reihen und CPU-Core-Grid werden bei jeder Fenstergröße in den Viewport eingepasst; aktive Widgets erhalten stets sichtbare Geometrie und wachsen beim Vergrößern automatisch wieder mit
+- **Horizontales und vertikales Scale-to-fit** — feste Labelbreiten wurden durch responsive Maximalbreiten ersetzt, Grid-Abstände schrumpfen bei Platzmangel und auch 24 CPU-Widgets sowie mehrere GPU-/Drive-Kacheln bleiben innerhalb des kompakten Viewports
+- **Edit-Modus bleibt vollständig bedienbar** — Reihen- und Zwischenreihen-Drop-Zonen skalieren dynamisch mit, statt bei kleinem Fenster den Platz der eigentlichen Tiles zu verdrängen
+- **Saubere Qt-High-DPI-Nutzung** — Qt 6 übernimmt die native geräteunabhängige Skalierung ohne zweite manuelle DPR-Multiplikation; dadurch bleibt die Größe auch auf 4K- und Multi-Monitor-Systemen konsistent
+- **Kontinuierliches Resizing ohne Clipping** — der Inhalt folgt dem Viewport bereits während des Ziehens; wenn Auto-Fit an die verfügbare Bildschirmhöhe stößt, wechselt das Dashboard automatisch in den scrollbarfreien Fill-Modus
+- **Erweiterte Regressionstests** — ein 200-%-DPI-Stresstest prüft bei 640×360 zwei GPUs, drei Laufwerke, 24 CPU-Widgets, alle Sparkline-Grenzen, maximiert/Vollbild, Edit-Modus, wiederhergestellte Geometrie und dauerhaft deaktivierte Scrollbars
 
 ### v2.7.2
 

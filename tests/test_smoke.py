@@ -66,20 +66,20 @@ def test_metric_defaults() -> None:
 
 
 def test_release_versions_are_synchronized() -> None:
-    assert tricorder.APP_VERSION == "2.7.1"
+    assert tricorder.APP_VERSION == "2.7.2"
     assert tricorder.CONFIG_VERSION == "1.0"
     root = Path(tricorder.__file__).parent
     version_info = (root / "assets" / "version_info.txt").read_text(encoding="utf-8")
     for expected in (
-        "filevers=(2, 7, 1, 0)",
-        "prodvers=(2, 7, 1, 0)",
-        "FileVersion', '2.7.1.0'",
-        "ProductVersion', '2.7.1.0'",
+        "filevers=(2, 7, 2, 0)",
+        "prodvers=(2, 7, 2, 0)",
+        "FileVersion', '2.7.2.0'",
+        "ProductVersion', '2.7.2.0'",
     ):
         assert expected in version_info
     readme = (root / "README.md").read_text(encoding="utf-8")
-    assert "version-2.7.1-00ff88" in readme
-    assert "### v2.7.1" in readme
+    assert "version-2.7.2-00ff88" in readme
+    assert "### v2.7.2" in readme
     release_builder = (root / ".github" / "scripts" / "build_release.py").read_text(
         encoding="utf-8")
     assert 'generated_spec_dir = build_dir / "generated-spec"' in release_builder
@@ -353,6 +353,148 @@ def test_tile_grid_repairs_and_persists_layout(
 
     grid.deleteLater()
     qapp.processEvents()
+
+
+def test_tile_rows_expand_vertically_without_blank_bands(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(tricorder, "CONFIG_FILE", tmp_path / "layout.json")
+    tile_ids = ("cpu_total", "ram", "gpu_total", "gpu_vram")
+    tiles = {
+        tile_id: tricorder.MetricTile(tile_id, tile_id, "#00ff88")
+        for tile_id in tile_ids
+    }
+    grid = tricorder.TileGrid(
+        tiles,
+        {tile_id: tile_id for tile_id in tile_ids},
+        ["cpu_total", "ram", "__row__", "gpu_total", "gpu_vram"],
+    )
+    grid.resize(1000, 800)
+    grid.show()
+    qapp.processEvents()
+    grid._auto_adjust_row_height()
+    qapp.processEvents()
+
+    rows = grid._row_widgets
+    assert len(rows) == 2
+    assert all(row.maximumHeight() == tricorder.TricorderDashboard._MAX_WIDGET
+               for row in rows)
+    assert all(row.height() > grid._max_row_h for row in rows)
+    occupied = sum(row.height() for row in rows) + grid._vbox.spacing()
+    assert occupied >= grid.height() - 4
+
+    grid.close()
+    grid.deleteLater()
+    qapp.processEvents()
+
+
+def test_sparkline_preferred_heights_are_dpi_scaled_once(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(tricorder, "_DP_SCALE", 2.0)
+    core = tricorder.MasterMetricBox("P-Core 0", "#00d4ff")
+    drive = tricorder.DriveTile("drive_test", "C:")
+
+    assert core.graph._pref_h == 36
+    assert drive._r_graph._pref_h == 48
+    assert drive._w_graph._pref_h == 48
+
+    core.deleteLater()
+    drive.deleteLater()
+    qapp.processEvents()
+
+
+def test_maximised_dashboard_uses_coalesced_fill_layout(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(tricorder, "CONFIG_FILE", tmp_path / "layout.json")
+
+    def fake_hardware(self: tricorder.TricorderDashboard) -> None:
+        self.c_physical = 2
+        self.c_logical = 4
+        self.num_sockets = 1
+        self.is_amd = False
+        self.is_hybrid = False
+        self.has_ht = True
+        self.p_cores = 0
+        self.e_cores = 0
+        self.p_threads = 4
+        self.e_threads = 0
+        self.p_logical = []
+        self.e_logical = []
+        self.ram_type = "RAM"
+        self.current_platform = "Darwin"
+        self.detected_gpus = []
+        self.has_igpu = False
+        self._drive_info = [("all", "All Drives")]
+
+    monkeypatch.setattr(tricorder.TricorderDashboard, "_analyze_hardware", fake_hardware)
+    monkeypatch.setattr(tricorder.HardwareMonitorThread, "start", lambda _self: None)
+    monkeypatch.setattr(tricorder.HardwareMonitorThread, "stop", lambda _self: None)
+
+    dashboard = tricorder.TricorderDashboard()
+    try:
+        dashboard._schedule_layout_settle("auto")
+        dashboard._schedule_layout_settle("fill")
+        assert dashboard._resize_settle_timer.isSingleShot()
+        assert dashboard._resize_settle_timer.interval() == 50
+        assert dashboard._resize_settle_timer.isActive()
+        assert dashboard._pending_resize_action == "fill"
+        dashboard._resize_settle_timer.stop()
+
+        dashboard._pending_resize_action = "auto"
+        dashboard.showMaximized()
+        qapp.processEvents()
+        assert dashboard._pending_resize_action == "fill"
+
+        dashboard._resize_settle_timer.stop()
+        dashboard._settle_responsive_layout()
+        qapp.processEvents()
+        assert dashboard._fit_mode == "fill"
+        assert all(
+            row.maximumHeight() == dashboard._MAX_WIDGET
+            for row in dashboard._tile_grid._row_widgets
+        )
+
+        dashboard._pending_resize_action = "auto"
+        dashboard.showFullScreen()
+        qapp.processEvents()
+        assert dashboard._pending_resize_action == "fill"
+
+        dashboard._pending_resize_action = "auto"
+        dashboard.showNormal()
+        qapp.processEvents()
+        assert dashboard._pending_resize_action == "fill"
+        dashboard._resize_settle_timer.stop()
+        with monkeypatch.context() as no_nested_events:
+            def fail_process_events(*_args: object, **_kwargs: object) -> None:
+                raise AssertionError("responsive fitting must not process nested events")
+
+            no_nested_events.setattr(
+                tricorder.QApplication, "processEvents", fail_process_events)
+            dashboard._fit_window_to_content()
+
+        dashboard.resize(1350, 900)
+        qapp.processEvents()
+    finally:
+        dashboard.close()
+        dashboard.deleteLater()
+        qapp.processEvents()
+
+    restored = tricorder.TricorderDashboard()
+    try:
+        assert restored._restore_window_placement()
+        qapp.processEvents()
+        assert restored._fit_mode == "fill"
+        restored_size = restored.size()
+        restored._resize_settle_timer.stop()
+        restored._settle_responsive_layout()
+        qapp.processEvents()
+        assert restored.size() == restored_size
+    finally:
+        restored.close()
+        restored.deleteLater()
+        qapp.processEvents()
 
 
 def test_layout_saves_preserve_temporarily_absent_hardware(

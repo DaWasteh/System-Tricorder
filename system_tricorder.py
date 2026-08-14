@@ -99,7 +99,9 @@ from PyQt6.QtWidgets import (                                       # type: igno
     QLabel, QFrame, QGridLayout, QSizePolicy, QPushButton,
     QScrollArea, QDialog, QCheckBox, QDialogButtonBox, QMessageBox,
 )
-from PyQt6.QtCore  import Qt, QTimer, pyqtSignal, QThread, QMimeData, QPoint, QSize, QByteArray  # type: ignore
+from PyQt6.QtCore  import (  # type: ignore
+    Qt, QEvent, QTimer, pyqtSignal, QThread, QMimeData, QPoint, QSize, QByteArray,
+)
 from PyQt6.QtGui   import (                                         # type: ignore
     QColor, QPainter, QPainterPath, QPen, QBrush, QDrag, QPixmap, QIcon,
 )
@@ -135,7 +137,7 @@ except ImportError:
 # ── Layout / window config ────────────────────────────────────────────────────
 CONFIG_FILE = Path.home() / ".tricorder_layout.json"
 CONFIG_VERSION = "1.0"
-APP_VERSION = "2.7.1"
+APP_VERSION = "2.7.2"
 GITHUB_REPO_URL = "https://github.com/DaWasteh/System-Tricorder.git"
 
 
@@ -2904,8 +2906,7 @@ class MasterMetricBox(QFrame):
         header.addWidget(self.val_lbl)
         layout.addLayout(header)
 
-        _spark_min_h = int(18 * _DP_SCALE) if _DP_SCALE > 0 else 18
-        self.graph = SparklineWidget(color_hex, min_height=_spark_min_h)
+        self.graph = SparklineWidget(color_hex, min_height=18)
         layout.addWidget(self.graph)
 
     def update_val(self, val: float, text: Optional[str] = None) -> None:
@@ -3263,8 +3264,7 @@ class DriveTile(BaseTile):
         r_lbl = QLabel("R")
         r_lbl.setStyleSheet(f"color: {DRIVE_R_COLOR}; font-size: {font_size(12)}; font-weight: bold;")
         r_lbl.setFixedWidth(dp(12))
-        _r_graph_h = int(24 * _DP_SCALE) if _DP_SCALE > 0 else 24
-        self._r_graph = SparklineWidget(DRIVE_R_COLOR, min_height=_r_graph_h)
+        self._r_graph = SparklineWidget(DRIVE_R_COLOR, min_height=24)
         self._r_val   = QLabel("0 MB/s")
         self._r_val.setStyleSheet(f"color: {DRIVE_R_COLOR}; font-size: {font_size(12)};")
         self._r_val.setFixedWidth(dp(72))
@@ -3280,8 +3280,7 @@ class DriveTile(BaseTile):
         w_lbl = QLabel("W")
         w_lbl.setStyleSheet(f"color: {DRIVE_W_COLOR}; font-size: {font_size(12)}; font-weight: bold;")
         w_lbl.setFixedWidth(dp(12))
-        _w_graph_h = int(24 * _DP_SCALE) if _DP_SCALE > 0 else 24
-        self._w_graph = SparklineWidget(DRIVE_W_COLOR, min_height=_w_graph_h)
+        self._w_graph = SparklineWidget(DRIVE_W_COLOR, min_height=24)
         self._w_val   = QLabel("0 MB/s")
         self._w_val.setStyleSheet(f"color: {DRIVE_W_COLOR}; font-size: {font_size(12)};")
         self._w_val.setFixedWidth(dp(72))
@@ -3363,8 +3362,7 @@ class GPUCopyTile(BaseTile):
         c0_lbl.setStyleSheet(
             f"color: {self._palette[1]}; font-size: {font_size(12)}; font-weight: bold;")
         c0_lbl.setFixedWidth(dp(28))
-        _c0_h = int(24 * _DP_SCALE) if _DP_SCALE > 0 else 24
-        self._c0_graph = SparklineWidget(self._palette[1], min_height=_c0_h)
+        self._c0_graph = SparklineWidget(self._palette[1], min_height=24)
         self._c0_val   = QLabel("0%")
         self._c0_val.setStyleSheet(f"color: {self._palette[1]}; font-size: {font_size(12)};")
         self._c0_val.setFixedWidth(dp(34))
@@ -3381,8 +3379,7 @@ class GPUCopyTile(BaseTile):
         c1_lbl.setStyleSheet(
             f"color: {self._palette[2]}; font-size: {font_size(12)}; font-weight: bold;")
         c1_lbl.setFixedWidth(dp(28))
-        _c1_h = int(24 * _DP_SCALE) if _DP_SCALE > 0 else 24
-        self._c1_graph = SparklineWidget(self._palette[2], min_height=_c1_h)
+        self._c1_graph = SparklineWidget(self._palette[2], min_height=24)
         self._c1_val   = QLabel("0%")
         self._c1_val.setStyleSheet(f"color: {self._palette[2]}; font-size: {font_size(12)};")
         self._c1_val.setFixedWidth(dp(34))
@@ -3444,8 +3441,7 @@ class GPUCodecTile(BaseTile):
         codec_lbl.setStyleSheet(
             f"color: {self._palette[3]}; font-size: {font_size(12)}; font-weight: bold;")
         codec_lbl.setFixedWidth(dp(48))
-        _codec_h = int(24 * _DP_SCALE) if _DP_SCALE > 0 else 24
-        self._codec_graph = SparklineWidget(self._palette[3], min_height=_codec_h)
+        self._codec_graph = SparklineWidget(self._palette[3], min_height=24)
         self._codec_val   = QLabel("0%")
         self._codec_val.setStyleSheet(f"color: {self._palette[3]}; font-size: {font_size(12)};")
         self._codec_val.setFixedWidth(dp(34))
@@ -3503,8 +3499,7 @@ class GPU3DComputeTile(BaseTile):
         d3_lbl.setStyleSheet(
             f"color: {self._palette[0]}; font-size: {font_size(12)}; font-weight: bold;")
         d3_lbl.setFixedWidth(dp(28))
-        _d3_h = int(24 * _DP_SCALE) if _DP_SCALE > 0 else 24
-        self._d3_graph = SparklineWidget(self._palette[0], min_height=_d3_h)
+        self._d3_graph = SparklineWidget(self._palette[0], min_height=24)
         self._d3_val   = QLabel("0%")
         self._d3_val.setStyleSheet(f"color: {self._palette[0]}; font-size: {font_size(12)};")
         self._d3_val.setFixedWidth(dp(34))
@@ -3521,8 +3516,7 @@ class GPU3DComputeTile(BaseTile):
         cm_lbl.setStyleSheet(
             f"color: {self._palette[1]}; font-size: {font_size(12)}; font-weight: bold;")
         cm_lbl.setFixedWidth(dp(28))
-        _cm_h = int(24 * _DP_SCALE) if _DP_SCALE > 0 else 24
-        self._cm_graph = SparklineWidget(self._palette[1], min_height=_cm_h)
+        self._cm_graph = SparklineWidget(self._palette[1], min_height=24)
         self._cm_val   = QLabel("0%")
         self._cm_val.setStyleSheet(f"color: {self._palette[1]}; font-size: {font_size(12)};")
         self._cm_val.setFixedWidth(dp(34))
@@ -3980,9 +3974,9 @@ class TileGrid(QWidget):
     Auto-scaling
     ────────────
     The row height is automatically computed from the available vertical space.
-    When many rows are visible the height shrinks (down to _min_row_h); when
-    few rows are visible it grows (up to _max_row_h).  This keeps the global
-    section compact on small screens and spacious on large ones.
+    When many rows are visible the preferred minimum shrinks; when space is
+    available, every row expands equally with its section.  This keeps the
+    global section compact on small screens and gap-free on tall windows.
     """
 
     layout_changed = pyqtSignal()   # emitted after every _relayout()
@@ -4029,6 +4023,7 @@ class TileGrid(QWidget):
             self._tile_order = saved_order
             self._hidden = saved_hidden
             self._min_row_h = int(cfg.get('min_row_h', self._min_row_h))
+            self._max_row_h = max(self._max_row_h, self._min_row_h)
             layout_changed = layout_changed or merged
         else:
             # A window-only config is not a custom layout.  Preserve the exact
@@ -4091,6 +4086,8 @@ class TileGrid(QWidget):
         for row_idx, row_tiles in enumerate(rows):
             rw = QWidget(self)
             rw.setStyleSheet("background: transparent;")
+            rw.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             rw.setMinimumHeight(self._current_row_h)
             hbox = QHBoxLayout(rw)
             hbox.setContentsMargins(0, 0, 0, 0)
@@ -4138,57 +4135,56 @@ class TileGrid(QWidget):
         content_min = lay.minimumSize().height() if lay is not None else 0
         return max(self._ROW_FLOOR, content_min)
 
-    def _release_row_pins(self) -> None:
-        """Drop the fixed min/max height on every row so the layout may compress
-        the tiles toward their readable minimum when the window is shrunk.
-        Counterpart to the 'ample' branch of _auto_adjust_row_height."""
-        for rw in self._row_widgets:
-            rw.setMinimumHeight(self._row_min(rw))
-            rw.setMaximumHeight(16_777_215)
-
     def _auto_adjust_row_height(self) -> None:
         """Compute an optimal row height from the widget's current height.
 
-        Uses a target row height that favours compact layouts for various aspect ratios.
-        The actual height is computed as min(target, available / n_rows) so rows
-        shrink when there are many of them but grow when space allows.
-        All constants are DPI-scaled.
+        Uses a DPI-scaled preferred minimum that favours compact layouts.  Row
+        wrappers retain an expanding size policy and no maximum-height pin, so
+        Qt divides surplus vertical space evenly without blank bands.
         """
         rows = self._parse_rows()
         n_rows = len(rows)
         if n_rows == 0:
             return
-        # Available height: subtract vbox spacing and edit-mode drop zones
+        # Available height: subtract layout spacing and fixed edit drop zones.
+        # The row wrappers themselves stay vertically expanding: pinning their
+        # maximum height to the preferred target made QVBoxLayout distribute
+        # surplus height as large blank bands between tiles.
         available = self.height()
-        drop_zones = 0
-        if self._edit_mode:
-            # 1 before first row + 2 per existing row (after + sep)
-            drop_zones = 1 + 2 * n_rows
-        available -= drop_zones * int(4 * _DP_SCALE)          # drop-zone height
-        available -= (n_rows + drop_zones) * dp(6)  # vbox spacing
+        drop_zone_widgets = [
+            widget for widget in self._row_widgets
+            if isinstance(widget, InterRowDropZone)
+        ]
+        drop_zones = len(drop_zone_widgets)
+        available -= sum(widget.minimumHeight() for widget in drop_zone_widgets)
+        item_count = n_rows + drop_zones
+        available -= max(0, item_count - 1) * dp(6)
         available = max(0, available)
-        # Target: aim for ~110 px per row (compact for 16:9), DPI-scaled, but allow up to _max_row_h
-        target_h = min(self._max_row_h, max(int(110 * _DP_SCALE), self._min_row_h))
+
+        target_h = min(
+            self._max_row_h,
+            max(int(110 * _DP_SCALE), self._min_row_h),
+        )
         per_row = available // n_rows
         if per_row >= self._min_row_h:
-            # Ample space → fix every row at the target height.
             ideal = min(target_h, per_row)
-            self._current_row_h = ideal
-            for rw in self._row_widgets:
-                pin = max(ideal, self._row_min(rw))
-                rw.setMinimumHeight(pin)
-                rw.setMaximumHeight(pin)
         else:
-            # Tight space (user shrank the window) → UNPIN the rows so Qt's
-            # layout engine compresses the tiles down toward their readable
-            # minimum (the sparkline height).  We only cap growth, never force
-            # a height, so tiles shrink gracefully and the scrollbar appears
-            # solely as a last-resort fallback when even the minimums can't fit.
             ideal = max(self._ROW_FLOOR, per_row)
-            self._current_row_h = ideal
-            for rw in self._row_widgets:
-                rw.setMinimumHeight(self._row_min(rw))
-                rw.setMaximumHeight(16_777_215)   # no cap → layout compresses freely
+        self._current_row_h = ideal
+
+        for rw in self._row_widgets:
+            if isinstance(rw, (RowDropZone, InterRowDropZone)):
+                continue
+            minimum = max(
+                self._row_min(rw),
+                ideal if per_row >= self._min_row_h else self._ROW_FLOOR,
+            )
+            rw.setMinimumHeight(minimum)
+            # Never cap an expanding row.  Qt now gives every row an equal
+            # share of the available height, so tiles grow continuously in a
+            # tall/maximised window instead of leaving gaps or jumping between
+            # fixed-height states.
+            rw.setMaximumHeight(16_777_215)
 
     # ── Edit mode ─────────────────────────────────────────────────────────────
 
@@ -4201,10 +4197,14 @@ class TileGrid(QWidget):
         """Adjust minimum row height — tiles shrink/grow vertically."""
         # Clamp to DPI-scaled bounds
         self._min_row_h = max(int(50 * _DP_SCALE), min(h, int(400 * _DP_SCALE)))
-        self._current_row_h = max(self._min_row_h, self._current_row_h)
+        self._max_row_h = max(int(180 * _DP_SCALE), self._min_row_h)
+        self._current_row_h = self._min_row_h
         for rw in self._row_widgets:
-            rw.setMinimumHeight(self._current_row_h)
-            rw.setMaximumHeight(self._current_row_h)
+            if isinstance(rw, InterRowDropZone):
+                continue
+            rw.setMinimumHeight(max(self._current_row_h, self._row_min(rw)))
+            rw.setMaximumHeight(16_777_215)
+        self._auto_adjust_row_height()
         self._save_config()
 
     @property
@@ -4772,7 +4772,7 @@ def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD  v2.7.1
+# MAIN DASHBOARD  v2.7.2
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TricorderDashboard(QMainWindow):
@@ -4805,8 +4805,13 @@ class TricorderDashboard(QMainWindow):
         # Auto-fit state (see _fit_window_to_content / _apply_fill_mode).
         self._fitting: bool = False
         self._fit_mode: str = 'auto'      # 'auto' (window tracks content) | 'fill' (user-controlled)
-        self._auto_h: Optional[int] = None
         self._last_size: Optional[Tuple[int, int]] = None
+        self._restored_window_geometry = False
+        self._pending_resize_action = 'fill'
+        self._resize_settle_timer = QTimer(self)
+        self._resize_settle_timer.setSingleShot(True)
+        self._resize_settle_timer.setInterval(50)
+        self._resize_settle_timer.timeout.connect(self._settle_responsive_layout)
 
         self._setup_ui()
 
@@ -5090,12 +5095,11 @@ class TricorderDashboard(QMainWindow):
 
         # Sections collapsing/expanding changes the content's natural height —
         # re-fit the window so no scrollbar appears.
-        global_section.collapsed_changed.connect(self._fit_window_to_content)
-        cpu_section.collapsed_changed.connect(self._fit_window_to_content)
+        global_section.collapsed_changed.connect(self._schedule_content_refit)
+        cpu_section.collapsed_changed.connect(self._schedule_content_refit)
         # Tile grid structural changes (add/remove/move/cols/reset) all funnel
         # through TileGrid._relayout, which emits layout_changed.
-        self._tile_grid.layout_changed.connect(
-            lambda: QTimer.singleShot(0, self._fit_window_to_content))
+        self._tile_grid.layout_changed.connect(self._schedule_content_refit)
 
         self._default_tile_order = default_order
 
@@ -5458,10 +5462,10 @@ class TricorderDashboard(QMainWindow):
         """AUTO mode: grow the window so it exactly fits all content — no scrollbar.
 
         Used on first show and after structural changes (add/remove/move tile,
-        column change, section collapse/expand).  Uncaps the content height,
-        then iteratively resizes the window so the viewport matches the content's
-        natural height.  The sparkline tiles keep their target size; only the
-        window adapts.  Skipped for maximised / fullscreen windows.
+        column change, section collapse/expand).  The coalescing timer lets Qt
+        settle first, so one size-hint pass is sufficient and no nested event
+        processing can re-enter the resize path.  Skipped for maximised or
+        fullscreen windows.
         """
         if getattr(self, '_fitting', False):
             return
@@ -5473,100 +5477,126 @@ class TricorderDashboard(QMainWindow):
         self._fitting = True
         self._fit_mode = 'auto'
         try:
-            self._content_w.setMaximumHeight(self._MAX_WIDGET)          # uncap → tiles use target size
-            for _ in range(12):                                   # bounded — converges fast
-                content = self._content_w
-                minimum_hint = content.minimumSizeHint()
-                size_hint = content.sizeHint()
-                need = max(minimum_hint.height() if minimum_hint is not None else 0,
-                           size_hint.height() if size_hint is not None else 0)
-                viewport = self._scroll.viewport()
-                if viewport is None:
-                    break
-                have = viewport.height()
-                delta = need - have
-                if abs(delta) < 3:
-                    break
-                target = max(self.height() + delta, self.minimumHeight())
-                try:
-                    screen = self.screen()
-                    if screen is not None:
-                        avail = screen.availableGeometry().height()
-                        frame = self.frameGeometry().height() - self.height()
-                        target = min(target, avail - frame)
-                except Exception:
-                    pass
-                if abs(target - self.height()) < 3:
-                    break
-                self.resize(self.width(), target)
-                QApplication.processEvents()      # let row-height / core-grid reflow settle
-            self._auto_h = self.height()         # remember what we set → detect user drag
+            content = self._content_w
+            content.setMaximumHeight(self._MAX_WIDGET)
+            layout = content.layout()
+            if layout is not None:
+                layout.activate()
+            minimum_hint = content.minimumSizeHint()
+            size_hint = content.sizeHint()
+            need = max(
+                minimum_hint.height() if minimum_hint is not None else 0,
+                size_hint.height() if size_hint is not None else 0,
+            )
+            viewport = self._scroll.viewport()
+            if viewport is not None:
+                delta = need - viewport.height()
+                if abs(delta) >= 3:
+                    target = max(self.height() + delta, self.minimumHeight())
+                    try:
+                        screen = self.screen()
+                        if screen is not None:
+                            available = screen.availableGeometry().height()
+                            frame = self.frameGeometry().height() - self.height()
+                            target = min(target, available - frame)
+                    except Exception:
+                        pass
+                    if abs(target - self.height()) >= 3:
+                        self.resize(self.width(), target)
         finally:
             self._fitting = False
 
     def _apply_fill_mode(self) -> None:
-        """FILL mode: the user resized the window — let tiles compress, no grow.
+        """FILL mode: make the content follow the user-selected viewport.
 
-        We do NOT cap the content or fight the user.  We only release the tile
-        rows' fixed-height pins so Qt's scroll-area widget resizing
-        (``widgetResizable``) can compress the expanding tiles down to their own
-        readable minimum (the sparkline height) Б─■ never below it, so nothing
-        clips.  The window stays at the user-chosen size; the vertical scrollbar
-        appears solely as a last-resort fallback when the tiles' minimums no
-        longer fit ("too many tiles to keep reasonably visible").
+        This mode also applies to maximised and fullscreen windows.  Releasing
+        row maximums lets the global tiles share all available vertical space;
+        no nested event processing is needed, which avoids re-entrant resize
+        storms and visible flicker while a window edge is being dragged.
         """
         if getattr(self, '_fitting', False):
             return
         if self._content_w is None or self._scroll is None:
             return
-        st = self.windowState()
-        if st & (Qt.WindowState.WindowMaximized | Qt.WindowState.WindowFullScreen):   # type: ignore[operator]
-            return
         self._fitting = True
         self._fit_mode = 'fill'
         try:
-            # Release row pins so the content's minimum height drops and the
-            # scroll area can shrink the widget to the viewport (compressing
-            # tiles to their readable minimum instead of scrolling).
-            self._tile_grid._release_row_pins()
-            for _ in range(6):
-                QApplication.processEvents()
-                scroll_bar = self._scroll.verticalScrollBar()
-                if scroll_bar is None or not scroll_bar.isVisible():
-                    break
-            self._auto_h = None                                 # user owns the height now
+            self._content_w.setMaximumHeight(self._MAX_WIDGET)
+            self._tile_grid._auto_adjust_row_height()
+            self._tile_grid.updateGeometry()
+            self._content_w.updateGeometry()
+            viewport = self._scroll.viewport()
+            if viewport is not None:
+                viewport.update()
         finally:
             self._fitting = False
 
+    def _schedule_layout_settle(self, action: str) -> None:
+        """Coalesce resize bursts into one non-reentrant layout update."""
+        self._pending_resize_action = action
+        self._resize_settle_timer.start()
+
+    def _schedule_content_refit(self) -> None:
+        state = self.windowState()
+        maximised = bool(
+            state
+            & (Qt.WindowState.WindowMaximized
+               | Qt.WindowState.WindowFullScreen)  # type: ignore[operator]
+        )
+        self._schedule_layout_settle('fill' if maximised else 'auto')
+
+    def _settle_responsive_layout(self) -> None:
+        if self._pending_resize_action == 'auto':
+            self._fit_window_to_content()
+        else:
+            self._apply_fill_mode()
+
     def resizeEvent(self, event) -> None:                                    # type: ignore
         super().resizeEvent(event)
-        if getattr(self, '_fitting', False):
-            return
-        st = self.windowState()
-        if st & (Qt.WindowState.WindowMaximized | Qt.WindowState.WindowFullScreen):   # type: ignore[operator]
-            return
         new_w, new_h = event.size().width(), event.size().height()
         old = getattr(self, '_last_size', None)
         self._last_size = (new_w, new_h)
-        if old is None:
+        if getattr(self, '_fitting', False) or old is None:
             return
+
+        state = self.windowState()
+        if state & (Qt.WindowState.WindowMaximized | Qt.WindowState.WindowFullScreen):  # type: ignore[operator]
+            self._schedule_layout_settle('fill')
+            return
+
         dh = new_h - old[1]
         dw = new_w - old[0]
         if dh != 0:
-            # Vertical drag → user is taking control: tiles adapt (no grow-back).
-            QTimer.singleShot(0, self._apply_fill_mode)
+            # Vertical drag → user owns the viewport dimensions.
+            self._schedule_layout_settle('fill')
         elif dw != 0:
-            # Width-only change → CPU grid reflowed and content height changed.
-            # In auto mode re-grow to the new natural height; in fill mode just
-            # re-cap so the recompressed tiles match the new width.
-            QTimer.singleShot(0, self._fit_window_to_content
-                              if self._fit_mode == 'auto' else self._apply_fill_mode)
+            # Width-only changes may alter the responsive CPU-grid height.
+            self._schedule_layout_settle(
+                'auto' if self._fit_mode == 'auto' else 'fill')
 
-    def showEvent(self, event) -> None:                                    # type: ignore
+    def changeEvent(self, event) -> None:                                    # type: ignore
+        super().changeEvent(event)
+        if (event.type() == QEvent.Type.WindowStateChange
+                and hasattr(self, '_resize_settle_timer')):
+            # Window-state transitions can arrive before or after resizeEvent
+            # depending on the platform.  Handle both paths idempotently.
+            self._schedule_layout_settle('fill')
+
+    def showEvent(self, event) -> None:                                      # type: ignore
         super().showEvent(event)
-        # Defer one event-loop tick so the layout has settled before measuring.
-        self._fit_mode = 'auto'
-        QTimer.singleShot(0, self._fit_window_to_content)
+        state = self.windowState()
+        maximised = bool(
+            state
+            & (Qt.WindowState.WindowMaximized
+               | Qt.WindowState.WindowFullScreen)  # type: ignore[operator]
+        )
+        # A valid restored geometry belongs to the user and must not be resized
+        # back to the content hint during startup.  Only a first launch without
+        # saved placement uses auto-fit.
+        preserve_geometry = self._restored_window_geometry
+        self._restored_window_geometry = False
+        self._fit_mode = 'fill' if maximised or preserve_geometry else 'auto'
+        self._schedule_layout_settle(self._fit_mode)
 
     def _restore_window_placement(self) -> bool:
         """Restore the last Windows window position/size/mode from config."""
@@ -5581,6 +5611,7 @@ class TricorderDashboard(QMainWindow):
             if geometry.isEmpty() or not self.restoreGeometry(geometry):
                 return False
 
+            self._restored_window_geometry = True
             placement = win_cfg.get('placement', 'normal')
             if placement == 'fullscreen':
                 self.showFullScreen()

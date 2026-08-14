@@ -2,7 +2,7 @@
 
 > A real-time hardware monitoring dashboard for Windows, macOS, and Linux — dark mode, 30 FPS, fully customisable free-form layout.
 
-![Version](https://img.shields.io/badge/version-2.7.1-00ff88?style=flat-square)
+![Version](https://img.shields.io/badge/version-2.7.2-00ff88?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
@@ -191,6 +191,15 @@ Delete the file to reset to factory defaults.
 ---
 
 ## 🗂️ Changelog
+
+### v2.7.2
+
+- **Kacheln skalieren vertikal ohne Leerbänder** — Tile-Reihen behalten keine feste Maximalhöhe mehr, sondern teilen sich den verfügbaren Platz gleichmäßig; hohe, maximierte und echte Vollbildfenster werden damit vollständig und ohne große Zwischenräume genutzt
+- **Maximieren/Vollbild zuverlässig behandelt** — Fensterzustandswechsel laufen nun immer durch den responsiven Fill-Pfad; auch ein Wechsel zwischen normal, maximiert und Vollbild aktualisiert die Kachelgeometrie korrekt
+- **Flimmern beim Skalieren beseitigt** — schnelle Resize-Ereignisse werden über einen Single-Shot-Timer zusammengeführt und die bisherigen verschachtelten `QApplication.processEvents()`-Schleifen entfernt, sodass kein re-entrantes Layout-Pingpong mehr entsteht
+- **Korrekte 4K-/High-DPI-Höhen** — bevorzugte Sparkline-Höhen werden nur noch einmal skaliert und wachsen bei 200 % DPI nicht mehr versehentlich auf das Vierfache
+- **Gespeicherte Fenstergröße bleibt erhalten** — eine gültig wiederhergestellte normale Fenstergeometrie wird beim Start nicht mehr unmittelbar durch Auto-Fit überschrieben
+- **Regressionstests** — neue Offscreen-Tests prüfen lückenlose vertikale Verteilung, maximierte und Vollbild-Zustände, zusammengefasste Resize-Aktualisierungen, flimmerfreien Auto-Fit ohne verschachtelte Events, High-DPI-Skalierung und wiederhergestellte Fenstergeometrie
 
 ### v2.7.1
 

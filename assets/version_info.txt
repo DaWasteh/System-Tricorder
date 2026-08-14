@@ -1,7 +1,7 @@
 VSVersionInfo(
     ffi=FixedFileInfo(
-        filevers=(2, 7, 1, 0),
-        prodvers=(2, 7, 1, 0),
+        filevers=(2, 7, 2, 0),
+        prodvers=(2, 7, 2, 0),
         mask=0x3F,
         flags=0x0,
         OS=0x40004,
@@ -16,12 +16,12 @@ VSVersionInfo(
                 [
                     StringStruct('CompanyName', 'System Tricorder Contributors'),
                     StringStruct('FileDescription', 'System Tricorder hardware monitor'),
-                    StringStruct('FileVersion', '2.7.1.0'),
+                    StringStruct('FileVersion', '2.7.2.0'),
                     StringStruct('InternalName', 'system_tricorder'),
                     StringStruct('LegalCopyright', 'Copyright (c) 2026 System Tricorder Contributors'),
                     StringStruct('OriginalFilename', 'system_tricorder.exe'),
                     StringStruct('ProductName', 'System Tricorder'),
-                    StringStruct('ProductVersion', '2.7.1.0'),
+                    StringStruct('ProductVersion', '2.7.2.0'),
                 ],
             )
         ]),

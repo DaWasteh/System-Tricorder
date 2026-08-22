@@ -2,7 +2,7 @@
 
 > A real-time hardware monitoring dashboard for Windows, macOS, and Linux — dark mode, 30 FPS, fully customisable free-form layout.
 
-![Version](https://img.shields.io/badge/version-2.7.3-00ff88?style=flat-square)
+![Version](https://img.shields.io/badge/version-2.7.4-00ff88?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
@@ -77,7 +77,7 @@ Press **⬇ Update** to check GitHub for a newer version and install it via a fa
 |--------|--------|
 | **＋ Add Tile** | Opens a checklist of all hidden tiles so you can restore any of them |
 | **‹ / ›** | Decrease / increase the minimum row height |
-| **↺ Reset** | Restores the factory default layout, including its default row breaks |
+| **↺ Reset** | Restores the factory tile order, row breaks, visibility, and row height |
 | **✔ Fertig** | Leave edit mode — layout is saved automatically |
 
 ### Update control
@@ -128,7 +128,7 @@ Your layout, including all row breaks, is saved to `~/.tricorder_layout.json` on
 | Tile | What it shows | Source |
 |------|--------------|--------|
 | CPU Gesamt | Total CPU utilisation | psutil |
-| CPU · Leistungsaufnahme | CPU package power in watts | Windows Energy Meter/RAPL; Linux powercap |
+| CPU · Leistungsaufnahme | CPU package/socket power in watts; AMD core-power fallback | Windows Energy Meter/RAPL; Linux powercap |
 | DDR4 / DDR5 RAM | Used / total memory | psutil + WMI type detection |
 | iGPU | Integrated GPU engine utilisation | Windows PDH; Linux DRM/sysfs |
 | GPU N · GPU | Driver-native overall utilisation | AMD ADLX / NVML / DRM |
@@ -172,7 +172,7 @@ Values are shown in MB/s and automatically switch to GB/s for drives exceeding 1
 ```json
 {
   "version": "1.0",
-  "min_row_h": 130,
+  "min_row_h": 75,
   "tile_order": [
     "cpu_total", "ram", "cpu_power",
     "__row__",
@@ -186,11 +186,18 @@ Values are shown in MB/s and automatically switch to GB/s for drives exceeding 1
 }
 ```
 
-Delete the file to reset to factory defaults.
+Use **Edit Layout → Reset** for the factory tile layout. Deleting the file additionally discards the saved window placement.
 
 ---
 
 ## 🗂️ Changelog
+
+### v2.7.4
+
+- **Layout-Reset entspricht wieder dem Werkslayout** — der Reset-Button behält die `__row__`-Trenner des Default-Layouts, setzt minimale und maximale Zeilenhöhe auf die Startwerte zurück und entfernt bewusst veraltete Layoutreste vorübergehend abwesender Hardware
+- **AMD-Ryzen-Leistungsaufnahme erweitert** — Windows-Energy-Meter-Instanzen wie `Current Socket Power`, `Socket Power`, `CPU Power` und `Apu Power` werden zusätzlich zu `RAPL_PackageN_PKG` erkannt; auf Zen-Systemen ohne nutzbaren Package-Zähler werden die per-Core-RAPL-Werte summiert
+- **Keine doppelt gezählten Leistungsdomänen** — ein gültiger Package-/Socket-Wert hat immer Vorrang; PP0, DRAM und Core-Zähler werden nie zu einem bereits vollständigen Package-Wert addiert, und dauerhaft ungültige Nullwerte bleiben ehrlich `k.A.`
+- **Regressionstests und Windows-Build** — neue Tests vergleichen den internen Reset mit einem config-freien Start und prüfen die bekannten AMD-Zählernamen sowie den Core-Fallback; die lokale Onefile-EXE wurde mit Version 2.7.4.0 neu gebaut und per isoliertem Self-Test geprüft
 
 ### v2.7.3
 

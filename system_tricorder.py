@@ -132,7 +132,7 @@ except ImportError:
 # ── Layout / window config ────────────────────────────────────────────────────
 CONFIG_FILE = Path.home() / ".tricorder_layout.json"
 CONFIG_VERSION = "1.0"
-APP_VERSION = "2.7.3"
+APP_VERSION = "2.7.4"
 GITHUB_REPO_URL = "https://github.com/DaWasteh/System-Tricorder.git"
 
 
@@ -936,18 +936,53 @@ class _PdhEnergySampler(_PdhArraySampler):
 
 
 def _cpu_package_power_from_pdh(rows: List[Tuple[str, float]]) -> Optional[float]:
-    """Convert Energy Meter RAPL package values from milliwatts to watts.
+    """Convert Windows Energy Meter package/socket power to watts.
 
-    ``PKG`` already includes cores/uncore/iGPU.  Summing PP0/PP1/DRAM with it
-    would double-count power, so only one PKG channel per socket is used.  A
-    PP0-only system is left unsupported because core power is not package power.
+    Windows exposes Intel package counters as ``RAPL_PackageN_PKG``.  AMD
+    firmware uses several names across Ryzen generations (for example
+    ``CPU Power``, ``Socket Power`` or ``Current Socket Power``), and some Zen
+    systems expose only per-core RAPL channels.  Prefer exactly one whole-
+    package family and never add PP0/DRAM or core rows to a package value.
     """
-    package_mw = [value for name, value in rows
-                  if re.fullmatch(r"rapl_package\d+_pkg", name) and value >= 0]
-    if package_mw:
-        return sum(package_mw) / 1000.0
-    # PP0 is core-domain power, not package power.  Showing it under a CPU
-    # package label would be misleading, so unsupported is preferable.
+    normalized: List[Tuple[str, float]] = []
+    for raw_name, raw_value in rows:
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value) or value <= 0:
+            continue
+        name = re.sub(r"#\d+$", "", str(raw_name).strip().lower())
+        name = re.sub(r"[^a-z0-9]+", "_", name).strip("_")
+        normalized.append((name, value))
+
+    # Each entry is a priority tier.  Multiple rows in one tier represent
+    # multiple sockets; aliases from lower tiers must not be added as they can
+    # describe the same physical package and would double-count it.
+    package_tiers = (
+        lambda name: re.fullmatch(r"rapl_package\d+_pkg", name) is not None,
+        lambda name: name == "current_socket_power",
+        lambda name: name == "current_socket_energy",
+        lambda name: name == "socket_power",
+        lambda name: name == "cpu_package_power",
+        lambda name: name == "cpu_power",
+        lambda name: name == "apu_power",
+        lambda name: name == "apu_energy",
+    )
+    for matches in package_tiers:
+        package_mw = [value for name, value in normalized if matches(name)]
+        if package_mw:
+            return sum(package_mw) / 1000.0
+
+    # Several AMD Ryzen implementations publish one CORE row per physical core
+    # but no usable package row.  Their sum is a truthful CPU-core fallback;
+    # keep it separate from PKG/PP0/DRAM so no domain is counted twice.
+    core_mw = [
+        value for name, value in normalized
+        if re.fullmatch(r"rapl_package\d+_core\d+_core", name)
+    ]
+    if core_mw:
+        return sum(core_mw) / 1000.0
     return None
 
 
@@ -3983,6 +4018,12 @@ def _preserve_dormant_layout(active_order: List[str], active_hidden: List[str],
     return persisted_order, persisted_hidden
 
 
+def _factory_tile_row_heights() -> Tuple[int, int]:
+    """Return the same row-height bounds used by a config-free launch."""
+    scale = _DP_SCALE if _DP_SCALE > 0 else 1.0
+    return int(75 * scale), int(180 * scale)
+
+
 class TileGrid(QWidget):
     """
     Hosts all global-metric tiles in a free-form row layout.
@@ -4019,9 +4060,8 @@ class TileGrid(QWidget):
         self._tiles      = tiles
         self._tile_names = tile_names
         self._edit_mode  = False
-        # Scale row heights by DPI — 75/180 are logical px for 100% DPI
-        self._min_row_h  = int(75 * _DP_SCALE) if _DP_SCALE > 0 else 75
-        self._max_row_h  = int(180 * _DP_SCALE) if _DP_SCALE > 0 else 180
+        # Scale row heights by DPI — 75/180 are logical px for 100% DPI.
+        self._min_row_h, self._max_row_h = _factory_tile_row_heights()
         # A visual row must remain present, but it must never force scrolling.
         # Headers/graphs may become compact in a very small window; every active
         # tile still receives geometry and grows back continuously with space.
@@ -4345,19 +4385,25 @@ class TileGrid(QWidget):
     def _load_config() -> dict:
         return _load_config_file()
 
-    def _save_config(self) -> None:
+    def _save_config(self, *, preserve_dormant: bool = True) -> None:
         try:
             data = _load_config_file()
-            stored_order = data.get('tile_order', [])
-            stored_hidden = data.get('hidden_tiles', [])
-            if not isinstance(stored_order, list):
-                stored_order = []
-            if not isinstance(stored_hidden, list):
-                stored_hidden = []
-            persisted_order, persisted_hidden = _preserve_dormant_layout(
-                self._tile_order, self._hidden, stored_order, stored_hidden,
-                set(self._tiles),
-            )
+            if preserve_dormant:
+                stored_order = data.get('tile_order', [])
+                stored_hidden = data.get('hidden_tiles', [])
+                if not isinstance(stored_order, list):
+                    stored_order = []
+                if not isinstance(stored_hidden, list):
+                    stored_hidden = []
+                persisted_order, persisted_hidden = _preserve_dormant_layout(
+                    self._tile_order, self._hidden, stored_order, stored_hidden,
+                    set(self._tiles),
+                )
+            else:
+                # A factory reset intentionally discards dormant hardware state,
+                # matching a config-free launch instead of resurrecting old rows.
+                persisted_order = list(self._tile_order)
+                persisted_hidden = list(self._hidden)
             data.update({
                 'min_row_h': self._min_row_h,
                 'tile_order': persisted_order,
@@ -4368,12 +4414,20 @@ class TileGrid(QWidget):
             logger.warning("Config save failed: %s", exc)
 
     def reset_layout(self, default_order: List[str]) -> None:
-        """Restore the factory layout, including its default row breaks."""
-        self._tile_order = [tid for tid in default_order if tid in self._tiles]
-        self._hidden     = [tid for tid in self._tiles if tid not in self._tile_order]
-        self._min_row_h  = 130
+        """Restore exactly the tile state used by a config-free launch."""
+        self._tile_order = [
+            tile_id for tile_id in default_order
+            if tile_id == '__row__' or tile_id in self._tiles
+        ]
+        self._hidden = [
+            tile_id for tile_id in self._tiles
+            if tile_id not in self._tile_order
+        ]
+        self._min_row_h, self._max_row_h = _factory_tile_row_heights()
+        self._current_row_h = self._min_row_h
         self._relayout()
-        self._save_config()
+        self._auto_adjust_row_height()
+        self._save_config(preserve_dormant=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4799,7 +4853,7 @@ def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD  v2.7.3
+# MAIN DASHBOARD  v2.7.4
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TricorderDashboard(QMainWindow):

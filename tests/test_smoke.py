@@ -66,20 +66,20 @@ def test_metric_defaults() -> None:
 
 
 def test_release_versions_are_synchronized() -> None:
-    assert tricorder.APP_VERSION == "2.7.3"
+    assert tricorder.APP_VERSION == "2.7.4"
     assert tricorder.CONFIG_VERSION == "1.0"
     root = Path(tricorder.__file__).parent
     version_info = (root / "assets" / "version_info.txt").read_text(encoding="utf-8")
     for expected in (
-        "filevers=(2, 7, 3, 0)",
-        "prodvers=(2, 7, 3, 0)",
-        "FileVersion', '2.7.3.0'",
-        "ProductVersion', '2.7.3.0'",
+        "filevers=(2, 7, 4, 0)",
+        "prodvers=(2, 7, 4, 0)",
+        "FileVersion', '2.7.4.0'",
+        "ProductVersion', '2.7.4.0'",
     ):
         assert expected in version_info
     readme = (root / "README.md").read_text(encoding="utf-8")
-    assert "version-2.7.3-00ff88" in readme
-    assert "### v2.7.3" in readme
+    assert "version-2.7.4-00ff88" in readme
+    assert "### v2.7.4" in readme
     release_builder = (root / ".github" / "scripts" / "build_release.py").read_text(
         encoding="utf-8")
     assert 'generated_spec_dir = build_dir / "generated-spec"' in release_builder
@@ -103,6 +103,40 @@ def test_cpu_package_power_uses_pkg_without_double_counting() -> None:
     assert tricorder._cpu_package_power_from_pdh(rows) == pytest.approx(92.5)
     assert tricorder._cpu_package_power_from_pdh([
         ("rapl_package0_pp0", 31_000.0)
+    ]) is None
+
+
+def test_cpu_power_supports_amd_socket_names_and_core_fallback() -> None:
+    assert tricorder._cpu_package_power_from_pdh([
+        ("Current Socket Power", 87_500.0),
+        ("RAPL_Package0_Core0_CORE", 20_000.0),
+        ("RAPL_Package0_Core1_CORE", 21_000.0),
+    ]) == pytest.approx(87.5)
+    assert tricorder._cpu_package_power_from_pdh([
+        ("CPU Power", 65_250.0),
+    ]) == pytest.approx(65.25)
+    assert tricorder._cpu_package_power_from_pdh([
+        ("Apu Power", 28_000.0),
+    ]) == pytest.approx(28.0)
+    for alias in (
+        "Socket Power", "Current Socket Energy",
+        "CPU Package Power", "Apu Energy",
+    ):
+        assert tricorder._cpu_package_power_from_pdh([
+            (alias, 42_000.0),
+        ]) == pytest.approx(42.0)
+
+    # Some Zen systems, including reported Ryzen 5000 configurations, expose
+    # only one Energy Meter power row per physical core.
+    assert tricorder._cpu_package_power_from_pdh([
+        ("RAPL_Package0_Core0_CORE", 11_500.0),
+        ("RAPL_Package0_Core1_CORE", 12_500.0),
+        ("RAPL_Package0_Core2_CORE", 13_000.0),
+        ("RAPL_Package0_Core3_CORE", 14_000.0),
+    ]) == pytest.approx(51.0)
+    assert tricorder._cpu_package_power_from_pdh([
+        ("Current Socket Power", 0.0),
+        ("RAPL_Package0_Core0_CORE", 0.0),
     ]) is None
 
 
@@ -350,6 +384,48 @@ def test_tile_grid_repairs_and_persists_layout(
     assert saved["version"] == "1.0"
     assert saved["tile_order"] == default_order
     assert saved["window"]["placement"] == "normal"
+
+    grid.deleteLater()
+    qapp.processEvents()
+
+
+def test_reset_layout_matches_config_free_factory(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "layout.json"
+    config_path.write_text(json.dumps({
+        "version": "1.0",
+        "min_row_h": 360,
+        "tile_order": ["optional", "__row__", "cpu_total", "ghost_gpu"],
+        "hidden_tiles": ["ram"],
+        "window": {"geometry": "saved", "placement": "normal"},
+    }), encoding="utf-8")
+    monkeypatch.setattr(tricorder, "CONFIG_FILE", config_path)
+
+    default_order = ["cpu_total", "ram", "__row__", "gpu_total"]
+    tile_ids = ("cpu_total", "ram", "gpu_total", "optional")
+    tiles = {
+        tile_id: tricorder.MetricTile(tile_id, tile_id, "#00ff88")
+        for tile_id in tile_ids
+    }
+    grid = tricorder.TileGrid(
+        tiles, {tile_id: tile_id for tile_id in tile_ids}, default_order)
+
+    grid.reset_layout(default_order)
+
+    factory_min, factory_max = tricorder._factory_tile_row_heights()
+    assert grid._tile_order == default_order
+    assert grid._parse_rows() == [["cpu_total", "ram"], ["gpu_total"]]
+    assert grid._hidden == ["optional"]
+    assert grid._min_row_h == factory_min
+    assert grid._max_row_h == factory_max
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["tile_order"] == default_order
+    assert saved["hidden_tiles"] == ["optional"]
+    assert saved["min_row_h"] == factory_min
+    assert saved["window"]["placement"] == "normal"
+    assert "ghost_gpu" not in saved["tile_order"]
 
     grid.deleteLater()
     qapp.processEvents()

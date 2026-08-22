@@ -68,23 +68,23 @@ def test_metric_defaults() -> None:
 
 
 def test_release_versions_are_synchronized() -> None:
-    assert tricorder.APP_VERSION == "2.7.5"
+    assert tricorder.APP_VERSION == "2.7.6"
     assert tricorder.CONFIG_VERSION == "1.0"
     root = Path(tricorder.__file__).parent
     version_info = (root / "assets" / "version_info.txt").read_text(encoding="utf-8")
     for expected in (
-        "filevers=(2, 7, 5, 0)",
-        "prodvers=(2, 7, 5, 0)",
-        "FileVersion', '2.7.5.0'",
-        "ProductVersion', '2.7.5.0'",
+        "filevers=(2, 7, 6, 0)",
+        "prodvers=(2, 7, 6, 0)",
+        "FileVersion', '2.7.6.0'",
+        "ProductVersion', '2.7.6.0'",
     ):
         assert expected in version_info
     readme = (root / "README.md").read_text(encoding="utf-8")
-    assert "version-2.7.5-00ff88" in readme
-    assert "### v2.7.5" in readme
+    assert "version-2.7.6-00ff88" in readme
+    assert "### v2.7.6" in readme
     if os.name == "nt":
         assert tricorder._windows_file_version(
-            root / "dist" / "system_tricorder.exe") == (2, 7, 5, 0)
+            root / "dist" / "system_tricorder.exe") == (2, 7, 6, 0)
     release_builder = (root / ".github" / "scripts" / "build_release.py").read_text(
         encoding="utf-8")
     assert 'generated_spec_dir = build_dir / "generated-spec"' in release_builder
@@ -96,6 +96,18 @@ def test_gpu_palettes() -> None:
     for palette in tricorder.GPU_PALETTES:
         assert len(palette) == 4
         assert all(color.startswith("#") for color in palette)
+
+
+def test_color_and_clock_helpers() -> None:
+    assert tricorder._normalise_color_hex("#AbC") == "#aabbcc"
+    assert tricorder._normalise_color_hex("rgb(1, 2, 3)") is None
+    assert tricorder._normalise_color_hex("not-a-colour") is None
+    assert tricorder._normalise_color_hex(None) is None
+    assert tricorder._normalise_theme("LIGHT") == "light"
+    assert tricorder._normalise_theme("unknown") == "dark"
+    assert tricorder._clock_display_mode(1400) == "inline"
+    assert tricorder._clock_display_mode(1100) == "stacked"
+    assert tricorder._clock_display_mode(800) == "time-only"
 
 
 def test_cpu_package_power_uses_pkg_without_double_counting() -> None:
@@ -270,6 +282,85 @@ def qapp() -> QApplication:
     return app
 
 
+def test_tile_custom_colors_update_every_graph_and_reset(
+    qapp: QApplication,
+) -> None:
+    tricorder._set_active_theme("dark")
+    palette = tricorder.GPU_PALETTES[0]
+    tiles = [
+        tricorder.MetricTile("metric", "Metric", "#00d4ff"),
+        tricorder.PowerTile("power", "Power", "#ffcc00", 250.0),
+        tricorder.DriveTile("drive", "C:"),
+        tricorder.GPUCopyTile("copy", "GPU", palette),
+        tricorder.GPUCodecTile("codec", "GPU", palette),
+        tricorder.GPU3DComputeTile("engines", "GPU", palette),
+    ]
+    graph_groups = [
+        [tiles[0]._graph],
+        [tiles[1]._graph],
+        [tiles[2]._r_graph, tiles[2]._w_graph],
+        [tiles[3]._c0_graph, tiles[3]._c1_graph],
+        [tiles[4]._codec_graph],
+        [tiles[5]._d3_graph, tiles[5]._cm_graph],
+    ]
+    tiles[0]._graph.add_value(37.0)
+    history_before = list(tiles[0]._graph.history)
+
+    for tile, graphs in zip(tiles, graph_groups, strict=True):
+        tile.set_custom_color("#123456")
+        assert tile.custom_color == "#123456"
+        assert all(graph.color.name() == "#123456" for graph in graphs)
+    assert list(tiles[0]._graph.history) == history_before
+
+    for tile in tiles:
+        tile.set_custom_color(None)
+        assert tile.custom_color is None
+    assert tiles[0]._graph.color.name() == "#00d4ff"
+    assert tiles[2]._r_graph.color.name() == tricorder.DRIVE_R_COLOR
+    assert tiles[2]._w_graph.color.name() == tricorder.DRIVE_W_COLOR
+    assert tiles[3]._c0_graph.color.name() == palette[1]
+    assert tiles[3]._c1_graph.color.name() == palette[2]
+    assert tiles[5]._d3_graph.color.name() == palette[0]
+    assert tiles[5]._cm_graph.color.name() == palette[1]
+
+    # Exact user-entered HEX colours must not be contrast-remapped by Lightmode.
+    tricorder._set_active_theme("light")
+    tiles[0].set_custom_color("#00ff88")
+    assert "#00ff88" in tiles[0].styleSheet()
+    assert "#00ff88" in tiles[0]._title_lbl.styleSheet()
+    tricorder._set_active_theme("dark")
+    tricorder._apply_theme_tree(tiles[0])
+    tricorder._set_active_theme("light")
+    tricorder._apply_theme_tree(tiles[0])
+    assert "#00ff88" in tiles[0].styleSheet()
+    assert tiles[0]._graph.color.name() == "#00ff88"
+    tricorder._set_active_theme("dark")
+
+    for tile in tiles:
+        tile.deleteLater()
+    qapp.processEvents()
+
+
+def test_color_picker_forces_spectrum_rgb_hex_dialog(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del qapp
+    seen: dict[str, bool] = {}
+
+    def fake_exec(dialog: tricorder.QColorDialog) -> tricorder.QDialog.DialogCode:
+        seen["non_native"] = dialog.testOption(
+            tricorder.QColorDialog.ColorDialogOption.DontUseNativeDialog)
+        seen["no_alpha"] = not dialog.testOption(
+            tricorder.QColorDialog.ColorDialogOption.ShowAlphaChannel)
+        return tricorder.QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(tricorder.QColorDialog, "exec", fake_exec)
+    tile = tricorder.MetricTile("cpu_total", "CPU", "#00d4ff")
+    tile._choose_custom_color()
+    assert seen == {"non_native": True, "no_alpha": True}
+    tile.deleteLater()
+
+
 def test_gpu_total_and_engine_tiles_are_separate(qapp: QApplication) -> None:
     palette = tricorder.GPU_PALETTES[0]
     total = tricorder.MetricTile("gpu_0_total", "Test GPU · GPU", palette[3])
@@ -389,6 +480,47 @@ def test_tile_grid_repairs_and_persists_layout(
     assert saved["version"] == "1.0"
     assert saved["tile_order"] == default_order
     assert saved["window"]["placement"] == "normal"
+
+    grid.deleteLater()
+    qapp.processEvents()
+
+
+def test_tile_colors_persist_and_keep_dormant_hardware(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "layout.json"
+    config_path.write_text(json.dumps({
+        "version": "1.0",
+        "tile_order": ["cpu_total"],
+        "hidden_tiles": [],
+        "tile_colors": {
+            "cpu_total": "#ABCDEF",
+            "drive_PhysicalDrive9": "#112233",
+            "broken": "not-a-colour",
+        },
+    }), encoding="utf-8")
+    monkeypatch.setattr(tricorder, "CONFIG_FILE", config_path)
+
+    tile = tricorder.MetricTile("cpu_total", "CPU", "#00d4ff")
+    grid = tricorder.TileGrid(
+        {"cpu_total": tile}, {"cpu_total": "CPU"}, ["cpu_total"])
+    assert tile.custom_color == "#abcdef"
+    assert tile._graph.color.name() == "#abcdef"
+
+    grid.set_min_row_h(160)
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["tile_colors"] == {
+        "cpu_total": "#abcdef",
+        "drive_PhysicalDrive9": "#112233",
+    }
+
+    grid._on_color_change("cpu_total", "#fedcba")
+    assert tile._graph.color.name() == "#fedcba"
+    grid._on_color_reset("cpu_total")
+    assert tile.custom_color is None
+    assert tile._graph.color.name() == "#00d4ff"
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["tile_colors"] == {"drive_PhysicalDrive9": "#112233"}
 
     grid.deleteLater()
     qapp.processEvents()
@@ -1282,6 +1414,71 @@ def test_windows_nvml_wddm_mapping_and_power(
     assert monitor._nvml_wddm_handles[0] is handle
     assert tricorder._read_nvml_power_watts(handle) == pytest.approx(425.0)
     monitor.stop()
+
+
+def test_theme_dropdown_and_responsive_date_persist(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "layout.json"
+    config_path.write_text(json.dumps({
+        "version": "1.0",
+        "theme": "light",
+    }), encoding="utf-8")
+    monkeypatch.setattr(tricorder.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(tricorder, "CONFIG_FILE", config_path)
+    monkeypatch.setattr(tricorder, "_get_cpu_topology", lambda: None)
+    monkeypatch.setattr(tricorder, "build_drive_info", lambda: [])
+    monkeypatch.setattr(tricorder.HardwareMonitorThread, "start", lambda self: None)
+    monkeypatch.setattr(tricorder.HardwareMonitorThread, "stop", lambda self: None)
+
+    dashboard = tricorder.TricorderDashboard()
+    try:
+        assert dashboard._theme == "light"
+        assert dashboard._theme_combo.currentData() == "light"
+        assert "#eef2f6" in dashboard.styleSheet()
+        assert "#ffffff" in dashboard._tiles["cpu_total"].styleSheet()
+
+        graph = dashboard._tiles["cpu_total"]._graph
+        graph._grid_cache = (1, 1, tricorder.QPixmap(1, 1))
+        dashboard._apply_theme_selection("dark", persist=True)
+        assert dashboard._theme_combo.currentData() == "dark"
+        assert "#0a0a0f" in dashboard.styleSheet()
+        assert graph._grid_cache is None
+        dashboard._apply_theme_selection("light", persist=True)
+        assert "#eef2f6" in dashboard.styleSheet()
+        saved = json.loads(config_path.read_text(encoding="utf-8"))
+        assert saved["theme"] == "light"
+        assert saved["tile_order"]
+
+        dashboard._update_clock()
+        assert dashboard._time_lbl.text().count(":") == 2
+        dashboard._update_clock_layout(1400)
+        time_index = dashboard._clock_grid.indexOf(dashboard._time_lbl)
+        date_index = dashboard._clock_grid.indexOf(dashboard._date_lbl)
+        assert dashboard._clock_grid.getItemPosition(time_index)[:2] == (0, 0)
+        assert dashboard._clock_grid.getItemPosition(date_index)[:2] == (0, 1)
+        assert not dashboard._date_lbl.isHidden()
+
+        dashboard._update_clock_layout(1100)
+        date_index = dashboard._clock_grid.indexOf(dashboard._date_lbl)
+        assert dashboard._clock_grid.getItemPosition(date_index)[:2] == (1, 0)
+        assert not dashboard._date_lbl.isHidden()
+
+        dashboard._update_clock_layout(800)
+        assert dashboard._clock_grid.indexOf(dashboard._time_lbl) >= 0
+        assert dashboard._date_lbl.isHidden()
+        assert dashboard._title_lbl.isHidden()
+        assert dashboard._time_lbl.minimumWidth() >= 135
+        dashboard._btn_edit.setChecked(True)
+        assert dashboard._btn_update.isHidden()
+        assert dashboard._btn_edit.text() == "✔"
+        dashboard._btn_edit.setChecked(False)
+        assert not dashboard._btn_update.isHidden()
+    finally:
+        dashboard.close()
+        dashboard.deleteLater()
+        tricorder._set_active_theme("dark")
+        qapp.processEvents()
 
 
 def test_dashboard_constructs_headlessly(

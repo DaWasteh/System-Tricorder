@@ -98,14 +98,16 @@ def set_font_size(label: "QLabel", pt: float, **kwargs) -> None:
 # ── Qt imports ─────────────────────────────────────────────────────────────────
 from PyQt6.QtWidgets import (                                       # type: ignore
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLayout,
-    QLabel, QFrame, QGridLayout, QSizePolicy, QPushButton,
+    QLabel, QFrame, QGridLayout, QSizePolicy, QPushButton, QComboBox,
     QScrollArea, QDialog, QCheckBox, QDialogButtonBox, QMessageBox,
+    QColorDialog, QMenu,
 )
 from PyQt6.QtCore  import (  # type: ignore
     Qt, QEvent, QTimer, pyqtSignal, QThread, QMimeData, QPoint, QSize, QByteArray,
 )
 from PyQt6.QtGui   import (                                         # type: ignore
     QColor, QPainter, QPainterPath, QPen, QBrush, QDrag, QPixmap, QIcon,
+    QAction,
 )
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -139,7 +141,7 @@ except ImportError:
 # ── Layout / window config ────────────────────────────────────────────────────
 CONFIG_FILE = Path.home() / ".tricorder_layout.json"
 CONFIG_VERSION = "1.0"
-APP_VERSION = "2.7.5"
+APP_VERSION = "2.7.6"
 GITHUB_REPO = "DaWasteh/System-Tricorder"
 GITHUB_REPO_URL = f"https://github.com/{GITHUB_REPO}.git"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}"
@@ -156,6 +158,179 @@ _UPDATE_ALLOWED_HOSTS = frozenset({
     "objects.githubusercontent.com",
     "release-assets.githubusercontent.com",
 })
+
+# Theme state is established from the external config before dashboard widgets
+# are built.  Dark CSS remains the canonical source so switching repeatedly
+# never accumulates lossy colour substitutions.
+_ACTIVE_THEME = "dark"
+_LIGHT_STYLE_REPLACEMENTS = {
+    "#0a0a0f": "#eef2f6",
+    "#0e0e18": "#f6f8fb",
+    "#121218": "#ffffff",
+    "#0d0d1c": "#f8fafc",
+    "#0c0c16": "#f4f7fa",
+    "#1a1a28": "#d5dce4",
+    "#1a1a22": "#d5dce4",
+    "#1e1e2e": "#e3e8ee",
+    "#2a2a3a": "#d8e0e8",
+    "#2e2e3e": "#ced8e2",
+    "#2a2a1a": "#fff2b3",
+    "#3a3a2a": "#b4a24b",
+    "#1a2a1a": "#e8f4ec",
+    "#2a3a2a": "#d8eadf",
+    "#2a4a2a": "#aec8b8",
+    "#336633": "#3b7251",
+    "#00ff88": "#008f4d",
+    "#00aa55": "#007a3e",
+    "#00d4ff": "#007f9f",
+    "#00ffcc": "#007f70",
+    "#ffcc00": "#8a6900",
+    "#ffdd55": "#8a7500",
+    "#444444": "#697582",
+    "#ffffff": "#1f2933",
+    "#fff": "#1f2933",
+    "#ccc": "#344050",
+    "#aaa": "#52606d",
+    "#888": "#52606d",
+    "#555": "#637080",
+    "#444": "#697582",
+    "#333": "#6b7785",
+    "#222": "#cbd3dc",
+}
+_THEME_PAINT_COLORS = {
+    "dark": {
+        "graph_bg": "#0c0c14",
+        "graph_grid": "#282834",
+        "drop_border": "#2a3a2a",
+        "drop_text": "#2a4a2a",
+    },
+    "light": {
+        "graph_bg": "#f7f9fc",
+        "graph_grid": "#d9e0e8",
+        "drop_border": "#b8c5bd",
+        "drop_text": "#71877a",
+    },
+}
+
+
+def _normalise_theme(value: Any) -> str:
+    return "light" if str(value).strip().lower() == "light" else "dark"
+
+
+def _set_active_theme(theme: str) -> str:
+    global _ACTIVE_THEME
+    _ACTIVE_THEME = _normalise_theme(theme)
+    return _ACTIVE_THEME
+
+
+def _theme_color(name: str) -> str:
+    return _THEME_PAINT_COLORS[_ACTIVE_THEME][name]
+
+
+def _themed_css(css: str, protected_colors: Tuple[str, ...] = ()) -> str:
+    """Render canonical dark CSS for the active light/dark theme.
+
+    User-entered RGB/HEX accents are protected so Lightmode never changes an
+    explicitly requested colour, even when it equals one of the factory hues.
+    """
+    if _ACTIVE_THEME == "dark" or not css:
+        return css
+    rendered = css
+    placeholders: Dict[str, str] = {}
+    for index, raw_color in enumerate(protected_colors):
+        color = _normalise_color_hex(raw_color)
+        if color is None:
+            continue
+        placeholder = f"__tricorder_user_color_{index}__"
+        rendered = re.sub(
+            re.escape(color) + r"(?![0-9a-fA-F])", placeholder, rendered,
+            flags=re.IGNORECASE,
+        )
+        placeholders[placeholder] = color
+
+    sources = sorted(_LIGHT_STYLE_REPLACEMENTS, key=len, reverse=True)
+    pattern = re.compile(
+        "|".join(re.escape(source) + r"(?![0-9a-fA-F])"
+                 for source in sources),
+        flags=re.IGNORECASE,
+    )
+    rendered = pattern.sub(
+        lambda match: _LIGHT_STYLE_REPLACEMENTS[match.group(0).lower()], rendered)
+    rendered = re.sub(r"\bwhite\b", "#1f2933", rendered, flags=re.IGNORECASE)
+    for placeholder, color in placeholders.items():
+        rendered = rendered.replace(placeholder, color)
+    return rendered
+
+
+def _set_themed_style(widget: QWidget, dark_css: str,
+                      protected_colors: Tuple[str, ...] = ()) -> None:
+    """Store drift-free canonical CSS and apply its active-theme rendering."""
+    widget.setProperty("_tricorder_dark_stylesheet", dark_css)
+    widget.setProperty("_tricorder_protected_colors", list(protected_colors))
+    widget.setStyleSheet(_themed_css(dark_css, protected_colors))
+
+
+def _apply_theme_tree(root: QWidget) -> None:
+    """Re-theme existing widgets, rich text and custom-painted graph caches."""
+    for widget in [root, *root.findChildren(QWidget)]:
+        base_css = widget.property("_tricorder_dark_stylesheet")
+        if not isinstance(base_css, str):
+            base_css = widget.styleSheet()
+            widget.setProperty("_tricorder_dark_stylesheet", base_css)
+        protected = widget.property("_tricorder_protected_colors")
+        protected_colors = tuple(
+            color for color in protected if isinstance(color, str)
+        ) if isinstance(protected, list) else ()
+        if base_css:
+            widget.setStyleSheet(_themed_css(base_css, protected_colors))
+
+        if isinstance(widget, QLabel):
+            text = widget.text()
+            base_text = widget.property("_tricorder_dark_rich_text")
+            if not isinstance(base_text, str) and "<" in text and "color:" in text:
+                base_text = text
+                widget.setProperty("_tricorder_dark_rich_text", base_text)
+            if isinstance(base_text, str):
+                widget.setText(_themed_css(base_text))
+
+        invalidate_theme = getattr(widget, "_invalidate_theme", None)
+        if callable(invalidate_theme):
+            invalidate_theme()
+    root.update()
+
+
+def _normalise_color_hex(value: Any) -> Optional[str]:
+    """Return a validated opaque ``#rrggbb`` colour or ``None``."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    color = QColor(value.strip())
+    if not color.isValid():
+        return None
+    return color.name(QColor.NameFormat.HexRgb).lower()
+
+
+def _clock_display_mode(width: int) -> str:
+    """Choose inline, stacked or hidden-date clock layout for a window width."""
+    if width < 900:
+        return "time-only"
+    if width < 1300:
+        return "stacked"
+    return "inline"
+
+
+def _set_windows_titlebar_theme(window: QMainWindow, theme: str) -> None:
+    """Synchronise the native Windows title bar with the selected theme."""
+    if platform.system() != "Windows":
+        return
+    value = ctypes.c_int(1 if _normalise_theme(theme) == "dark" else 0)
+    for attribute in (20, 19):
+        try:
+            result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                int(window.winId()), attribute, ctypes.byref(value), 4)
+            if result == 0:
+                break
+        except Exception:
+            break
 
 
 def _resource_path(relative_path: str) -> Path:
@@ -2827,6 +3002,17 @@ class SparklineWidget(QWidget):
         tight -- instead of overflowing (and clipping) the parent tile."""
         return QSize(dp(120), self._pref_h)
 
+    def set_color(self, color_hex: str) -> None:
+        """Change only the rendering colour; metric history stays intact."""
+        color = QColor(color_hex)
+        if color.isValid() and color != self.color:
+            self.color = color
+            self.update()
+
+    def _invalidate_theme(self) -> None:
+        self._grid_cache = None
+        self.update()
+
     def add_value(self, value: float) -> None:
         self.history.append(value)
         # Mark dirty but defer update - parent will batch-call update() once
@@ -2855,9 +3041,9 @@ class SparklineWidget(QWidget):
         if self._grid_cache and self._grid_cache[0] == w and self._grid_cache[1] == h:
             return self._grid_cache[2]
         px = QPixmap(w, h)
-        px.fill(QColor(12, 12, 20))
+        px.fill(QColor(_theme_color("graph_bg")))
         p = QPainter(px)
-        p.setPen(QPen(QColor(40, 40, 52), 1))
+        p.setPen(QPen(QColor(_theme_color("graph_grid")), 1))
         # Time axis: fixed, DPI-scaled pitch.
         pitch = dp(25)
         for x in range(pitch, w, pitch):
@@ -2983,16 +3169,20 @@ class BaseTile(QFrame):
     Provides drag-to-reorder and edit-mode × button.
     Subclass and implement _build_content().
     """
-    move_requested     = pyqtSignal(str, str, bool)  # (src_id, target_id, insert_before)
-    remove_requested   = pyqtSignal(str)              # tile_id
-    rowbreak_requested = pyqtSignal(str)              # tile_id — toggle row-break before this tile
+    move_requested       = pyqtSignal(str, str, bool)  # (src_id, target_id, insert_before)
+    remove_requested     = pyqtSignal(str)              # tile_id
+    rowbreak_requested   = pyqtSignal(str)              # tile_id — toggle row-break before this tile
+    color_requested      = pyqtSignal(str, str)         # (tile_id, #rrggbb)
+    color_reset_requested = pyqtSignal(str)             # tile_id
 
     _BTN_SIZE = 18  # logical pixels — scaled in __init__
 
     def __init__(self, tile_id: str, color_hex: str, parent=None) -> None:
         super().__init__(parent)
         self.tile_id      = tile_id
-        self._color_hex   = color_hex
+        self._default_color_hex = _normalise_color_hex(color_hex) or "#00ff88"
+        self._custom_color_hex: Optional[str] = None
+        self._color_hex   = self._default_color_hex
         self._edit_mode   = False
         self._drop_hl     = False
         self._drop_before = True
@@ -3008,7 +3198,7 @@ class BaseTile(QFrame):
         _btn_size = dp(self._BTN_SIZE)
         self._btn_x = QPushButton("×", self)
         self._btn_x.setFixedSize(_btn_size, _btn_size)
-        self._btn_x.setStyleSheet(f"""
+        _set_themed_style(self._btn_x, f"""
             QPushButton {{
                 background: #880000; color: #fff;
                 border-radius: {int(9 * _DP_SCALE)}px; font-size: {font_size(11)}; font-weight: bold;
@@ -3031,7 +3221,7 @@ class BaseTile(QFrame):
         _br = int(9 * _DP_SCALE)
         _fs = font_size(9)
         if self._rowbreak_active:
-            self._btn_rn.setStyleSheet(f"""
+            _set_themed_style(self._btn_rn, f"""
                 QPushButton {{
                     background: #00aa55; color: #fff;
                     border-radius: {_br}px; font-size: {_fs}; font-weight: bold;
@@ -3039,7 +3229,7 @@ class BaseTile(QFrame):
                 QPushButton:hover {{ background: #00ff88; color: #000; }}
             """)
         else:
-            self._btn_rn.setStyleSheet(f"""
+            _set_themed_style(self._btn_rn, f"""
                 QPushButton {{
                     background: #1a2a1a; color: #336633;
                     border-radius: {_br}px; font-size: {_fs}; font-weight: bold;
@@ -3055,7 +3245,9 @@ class BaseTile(QFrame):
 
     def _apply_frame_style(self, accent: str, edit: bool) -> None:
         border_side = "#3a3a2a" if edit else "#222"
-        self.setStyleSheet(f"""
+        protected = (
+            (accent,) if self._custom_color_hex is not None and not edit else ())
+        _set_themed_style(self, f"""
             QFrame {{
                 background-color: #121218;
                 border: 1px solid {border_side};
@@ -3064,7 +3256,7 @@ class BaseTile(QFrame):
             }}
             QLabel      {{ background: transparent; border: none; }}
             QPushButton {{ background: transparent; border: none; }}
-        """)
+        """, protected)
 
     def _build_content(self) -> None:
         """Override in subclass to populate the tile layout."""
@@ -3098,14 +3290,78 @@ class BaseTile(QFrame):
         """Override in subclass to update GPU Video Codec Engine tile."""
         pass
 
+    @property
+    def custom_color(self) -> Optional[str]:
+        return self._custom_color_hex
+
+    def _accent_protection(self) -> Tuple[str, ...]:
+        return ((self._custom_color_hex,)
+                if self._custom_color_hex is not None else ())
+
+    def set_custom_color(self, color_hex: Optional[str]) -> None:
+        """Apply or reset this tile's persisted user-selected accent."""
+        normalised = _normalise_color_hex(color_hex) if color_hex is not None else None
+        if color_hex is not None and normalised is None:
+            return
+        self._custom_color_hex = normalised
+        self._color_hex = normalised or self._default_color_hex
+        self._apply_accent_colors()
+
+    def _apply_accent_colors(self) -> None:
+        """Apply the active accent; subclasses update their labels/graphs too."""
+        accent = "#ffdd55" if self._edit_mode else self._color_hex
+        self._apply_frame_style(accent, edit=self._edit_mode)
+
+    def _choose_custom_color(self) -> None:
+        dialog = QColorDialog(QColor(self._color_hex), self)
+        dialog.setWindowTitle("Kachelfarbe auswählen")
+        # Qt's non-native picker guarantees the spectrum plus RGB and HTML/HEX
+        # inputs on every supported OS; native platform dialogs do not.
+        dialog.setOption(
+            QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        dialog.setOption(
+            QColorDialog.ColorDialogOption.ShowAlphaChannel, False)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected = _normalise_color_hex(
+            dialog.selectedColor().name(QColor.NameFormat.HexRgb))
+        if selected is not None:
+            self.color_requested.emit(self.tile_id, selected)
+
+    def contextMenuEvent(self, event) -> None:                              # type: ignore
+        if not self._edit_mode:
+            super().contextMenuEvent(event)
+            return
+        menu = QMenu(self)
+        _set_themed_style(menu, """
+            QMenu { background: #1e1e2e; color: #ccc; border: 1px solid #333; }
+            QMenu::item { padding: 6px 18px; }
+            QMenu::item:selected { background: #2e2e3e; color: #fff; }
+            QMenu::item:disabled { color: #555; }
+        """)
+        choose = QAction("🎨  Farbe ändern …", menu)
+        choose.setToolTip("Farbspektrum mit RGB- und HEX-Eingabe")
+        menu.addAction(choose)
+        reset = QAction("↺  Standardfarbe", menu)
+        reset.setEnabled(self._custom_color_hex is not None)
+        menu.addAction(reset)
+        selected = menu.exec(event.globalPos())
+        if selected is choose:
+            self._choose_custom_color()
+        elif selected is reset:
+            self.color_reset_requested.emit(self.tile_id)
+        event.accept()
+
     # ── Edit mode ──────────────────────────────────────────────────────────────
     def set_edit_mode(self, enabled: bool) -> None:
         self._edit_mode = enabled
         self._btn_x.setVisible(enabled)
         self._btn_rn.setVisible(enabled)
         self.setCursor(Qt.CursorShape.SizeAllCursor if enabled else Qt.CursorShape.ArrowCursor)  # type: ignore
-        accent = "#ffdd55" if enabled else self._color_hex
-        self._apply_frame_style(accent, edit=enabled)
+        self.setToolTip(
+            "Ziehen zum Verschieben · Rechtsklick für Farbe"
+            if enabled else "")
+        self._apply_accent_colors()
 
     def resizeEvent(self, event) -> None:                                   # type: ignore
         super().resizeEvent(event)
@@ -3212,6 +3468,15 @@ class MetricTile(BaseTile):
         self._graph = SparklineWidget(self._color_hex)
         outer.addWidget(self._graph)
 
+    def _apply_accent_colors(self) -> None:
+        super()._apply_accent_colors()
+        _set_themed_style(
+            self._title_lbl,
+            f"color: {self._color_hex}; font-size: {font_size(13)}; font-weight: bold;",
+            self._accent_protection(),
+        )
+        self._graph.set_color(self._color_hex)
+
     def update_val(self, value: float, suffix: Optional[str] = None) -> None:
         self._graph.add_value(value)
         # Use a ~1 s moving average for the number so it stops jittering on
@@ -3256,6 +3521,20 @@ class PowerTile(BaseTile):
 
         self._graph = SparklineWidget(self._color_hex)
         outer.addWidget(self._graph)
+
+    def _apply_accent_colors(self) -> None:
+        super()._apply_accent_colors()
+        _set_themed_style(
+            self._title_lbl,
+            f"color: {self._color_hex}; font-size: {font_size(13)}; font-weight: bold;",
+            self._accent_protection(),
+        )
+        _set_themed_style(
+            self._value_lbl,
+            f"color: {self._color_hex}; font-size: {font_size(14)}; font-weight: bold;",
+            self._accent_protection(),
+        )
+        self._graph.set_color(self._color_hex)
 
     def update_power(self, watts: Optional[float]) -> None:
         if watts is None or not math.isfinite(watts) or watts < 0:
@@ -3306,14 +3585,14 @@ class DriveTile(BaseTile):
         hdr = QHBoxLayout()
         icon_lbl = QLabel("💾")
         icon_lbl.setStyleSheet(f"font-size: {font_size(12)};")
-        name_lbl = QLabel(self._label)
-        name_lbl.setStyleSheet(
+        self._name_lbl = QLabel(self._label)
+        self._name_lbl.setStyleSheet(
             f"color: {DRIVE_R_COLOR}; font-size: {font_size(13)}; font-weight: bold;")
         self._peak_lbl = QLabel("↑100 MB/s")
         self._peak_lbl.setStyleSheet(f"color: #444; font-size: {font_size(11)};")
         hdr.addWidget(icon_lbl)
         hdr.addSpacing(dp(3))
-        hdr.addWidget(name_lbl)
+        hdr.addWidget(self._name_lbl)
         hdr.addStretch()
         hdr.addWidget(self._peak_lbl)
         outer.addLayout(hdr)
@@ -3321,15 +3600,16 @@ class DriveTile(BaseTile):
         # ── Read row ──────────────────────────────────────────────────────────
         r_row = QHBoxLayout()
         r_row.setSpacing(dp(4))
-        r_lbl = QLabel("R")
-        r_lbl.setStyleSheet(f"color: {DRIVE_R_COLOR}; font-size: {font_size(12)}; font-weight: bold;")
-        _set_responsive_label_width(r_lbl, 12)
+        self._r_lbl = QLabel("R")
+        self._r_lbl.setStyleSheet(
+            f"color: {DRIVE_R_COLOR}; font-size: {font_size(12)}; font-weight: bold;")
+        _set_responsive_label_width(self._r_lbl, 12)
         self._r_graph = SparklineWidget(DRIVE_R_COLOR, min_height=24)
         self._r_val   = QLabel("0 MB/s")
         self._r_val.setStyleSheet(f"color: {DRIVE_R_COLOR}; font-size: {font_size(12)};")
         _set_responsive_label_width(self._r_val, 72)
         self._r_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)   # type: ignore
-        r_row.addWidget(r_lbl)
+        r_row.addWidget(self._r_lbl)
         r_row.addWidget(self._r_graph)
         r_row.addWidget(self._r_val)
         outer.addLayout(r_row)
@@ -3337,18 +3617,41 @@ class DriveTile(BaseTile):
         # ── Write row ─────────────────────────────────────────────────────────
         w_row = QHBoxLayout()
         w_row.setSpacing(dp(4))
-        w_lbl = QLabel("W")
-        w_lbl.setStyleSheet(f"color: {DRIVE_W_COLOR}; font-size: {font_size(12)}; font-weight: bold;")
-        _set_responsive_label_width(w_lbl, 12)
+        self._w_lbl = QLabel("W")
+        self._w_lbl.setStyleSheet(
+            f"color: {DRIVE_W_COLOR}; font-size: {font_size(12)}; font-weight: bold;")
+        _set_responsive_label_width(self._w_lbl, 12)
         self._w_graph = SparklineWidget(DRIVE_W_COLOR, min_height=24)
         self._w_val   = QLabel("0 MB/s")
         self._w_val.setStyleSheet(f"color: {DRIVE_W_COLOR}; font-size: {font_size(12)};")
         _set_responsive_label_width(self._w_val, 72)
         self._w_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)   # type: ignore
-        w_row.addWidget(w_lbl)
+        w_row.addWidget(self._w_lbl)
         w_row.addWidget(self._w_graph)
         w_row.addWidget(self._w_val)
         outer.addLayout(w_row)
+
+    def _apply_accent_colors(self) -> None:
+        super()._apply_accent_colors()
+        read_color = self._color_hex
+        write_color = self._color_hex if self._custom_color_hex else DRIVE_W_COLOR
+        _set_themed_style(
+            self._name_lbl,
+            f"color: {read_color}; font-size: {font_size(13)}; font-weight: bold;",
+            self._accent_protection(),
+        )
+        for label, color, bold in (
+            (self._r_lbl, read_color, True),
+            (self._r_val, read_color, False),
+            (self._w_lbl, write_color, True),
+            (self._w_val, write_color, False),
+        ):
+            weight = " font-weight: bold;" if bold else ""
+            _set_themed_style(
+                label, f"color: {color}; font-size: {font_size(12)};{weight}",
+                self._accent_protection())
+        self._r_graph.set_color(read_color)
+        self._w_graph.set_color(write_color)
 
     def update_drive(self, read_mbps: float, write_mbps: float) -> None:
         # Auto-scale: peak grows immediately with headroom, then decays slowly.
@@ -3406,28 +3709,28 @@ class GPUCopyTile(BaseTile):
         hdr = QHBoxLayout()
         icon_lbl = QLabel("📋")
         icon_lbl.setStyleSheet(f"font-size: {font_size(13)};")
-        name_lbl = QLabel(f"{self._gpu_name} · Copy")
-        name_lbl.setStyleSheet(
+        self._name_lbl = QLabel(f"{self._gpu_name} · Copy")
+        self._name_lbl.setStyleSheet(
             f"color: {self._palette[1]}; font-size: {font_size(13)}; font-weight: bold;")
         hdr.addWidget(icon_lbl)
         hdr.addSpacing(dp(3))
-        hdr.addWidget(name_lbl)
+        hdr.addWidget(self._name_lbl)
         hdr.addStretch()
         outer.addLayout(hdr)
 
         # ── Copy0 row ─────────────────────────────────────────────────────────
         c0_row = QHBoxLayout()
         c0_row.setSpacing(dp(4))
-        c0_lbl = QLabel("Cp0")
-        c0_lbl.setStyleSheet(
+        self._c0_lbl = QLabel("Cp0")
+        self._c0_lbl.setStyleSheet(
             f"color: {self._palette[1]}; font-size: {font_size(12)}; font-weight: bold;")
-        _set_responsive_label_width(c0_lbl, 28)
+        _set_responsive_label_width(self._c0_lbl, 28)
         self._c0_graph = SparklineWidget(self._palette[1], min_height=24)
         self._c0_val   = QLabel("0%")
         self._c0_val.setStyleSheet(f"color: {self._palette[1]}; font-size: {font_size(12)};")
         _set_responsive_label_width(self._c0_val, 34)
         self._c0_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # type: ignore
-        c0_row.addWidget(c0_lbl)
+        c0_row.addWidget(self._c0_lbl)
         c0_row.addWidget(self._c0_graph)
         c0_row.addWidget(self._c0_val)
         outer.addLayout(c0_row)
@@ -3435,19 +3738,41 @@ class GPUCopyTile(BaseTile):
         # ── Copy1 row ─────────────────────────────────────────────────────────
         c1_row = QHBoxLayout()
         c1_row.setSpacing(dp(4))
-        c1_lbl = QLabel("Cp1")
-        c1_lbl.setStyleSheet(
+        self._c1_lbl = QLabel("Cp1")
+        self._c1_lbl.setStyleSheet(
             f"color: {self._palette[2]}; font-size: {font_size(12)}; font-weight: bold;")
-        _set_responsive_label_width(c1_lbl, 28)
+        _set_responsive_label_width(self._c1_lbl, 28)
         self._c1_graph = SparklineWidget(self._palette[2], min_height=24)
         self._c1_val   = QLabel("0%")
         self._c1_val.setStyleSheet(f"color: {self._palette[2]}; font-size: {font_size(12)};")
         _set_responsive_label_width(self._c1_val, 34)
         self._c1_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # type: ignore
-        c1_row.addWidget(c1_lbl)
+        c1_row.addWidget(self._c1_lbl)
         c1_row.addWidget(self._c1_graph)
         c1_row.addWidget(self._c1_val)
         outer.addLayout(c1_row)
+
+    def _apply_accent_colors(self) -> None:
+        super()._apply_accent_colors()
+        color0 = self._color_hex if self._custom_color_hex else self._palette[1]
+        color1 = self._color_hex if self._custom_color_hex else self._palette[2]
+        _set_themed_style(
+            self._name_lbl,
+            f"color: {color0}; font-size: {font_size(13)}; font-weight: bold;",
+            self._accent_protection(),
+        )
+        for label, color, bold in (
+            (self._c0_lbl, color0, True),
+            (self._c0_val, color0, False),
+            (self._c1_lbl, color1, True),
+            (self._c1_val, color1, False),
+        ):
+            weight = " font-weight: bold;" if bold else ""
+            _set_themed_style(
+                label, f"color: {color}; font-size: {font_size(12)};{weight}",
+                self._accent_protection())
+        self._c0_graph.set_color(color0)
+        self._c1_graph.set_color(color1)
 
     def update_copy(self, copy0: float, copy1: float) -> None:
         self._c0_graph.add_value(copy0)
@@ -3485,31 +3810,46 @@ class GPUCodecTile(BaseTile):
         hdr = QHBoxLayout()
         icon_lbl = QLabel("🎬")
         icon_lbl.setStyleSheet(f"font-size: {font_size(13)};")
-        name_lbl = QLabel(f"{self._gpu_name} · Video Codec")
-        name_lbl.setStyleSheet(
+        self._name_lbl = QLabel(f"{self._gpu_name} · Video Codec")
+        self._name_lbl.setStyleSheet(
             f"color: {self._palette[3]}; font-size: {font_size(13)}; font-weight: bold;")
         hdr.addWidget(icon_lbl)
         hdr.addSpacing(dp(3))
-        hdr.addWidget(name_lbl)
+        hdr.addWidget(self._name_lbl)
         hdr.addStretch()
         outer.addLayout(hdr)
 
         # ── Codec row ─────────────────────────────────────────────────────────
         codec_row = QHBoxLayout()
         codec_row.setSpacing(dp(4))
-        codec_lbl = QLabel("Codec")
-        codec_lbl.setStyleSheet(
+        self._codec_lbl = QLabel("Codec")
+        self._codec_lbl.setStyleSheet(
             f"color: {self._palette[3]}; font-size: {font_size(12)}; font-weight: bold;")
-        _set_responsive_label_width(codec_lbl, 48)
+        _set_responsive_label_width(self._codec_lbl, 48)
         self._codec_graph = SparklineWidget(self._palette[3], min_height=24)
         self._codec_val   = QLabel("0%")
         self._codec_val.setStyleSheet(f"color: {self._palette[3]}; font-size: {font_size(12)};")
         _set_responsive_label_width(self._codec_val, 34)
         self._codec_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # type: ignore
-        codec_row.addWidget(codec_lbl)
+        codec_row.addWidget(self._codec_lbl)
         codec_row.addWidget(self._codec_graph)
         codec_row.addWidget(self._codec_val)
         outer.addLayout(codec_row)
+
+    def _apply_accent_colors(self) -> None:
+        super()._apply_accent_colors()
+        for label, size, bold in (
+            (self._name_lbl, 13, True),
+            (self._codec_lbl, 12, True),
+            (self._codec_val, 12, False),
+        ):
+            weight = " font-weight: bold;" if bold else ""
+            _set_themed_style(
+                label,
+                f"color: {self._color_hex}; font-size: {font_size(size)};{weight}",
+                self._accent_protection(),
+            )
+        self._codec_graph.set_color(self._color_hex)
 
     def update_codec(self, codec: float) -> None:
         self._codec_graph.add_value(codec)
@@ -3543,28 +3883,28 @@ class GPU3DComputeTile(BaseTile):
         hdr = QHBoxLayout()
         icon_lbl = QLabel("🎮")
         icon_lbl.setStyleSheet(f"font-size: {font_size(13)};")
-        name_lbl = QLabel(f"{self._gpu_name} · 3D / Compute")
-        name_lbl.setStyleSheet(
+        self._name_lbl = QLabel(f"{self._gpu_name} · 3D / Compute")
+        self._name_lbl.setStyleSheet(
             f"color: {self._palette[0]}; font-size: {font_size(13)}; font-weight: bold;")
         hdr.addWidget(icon_lbl)
         hdr.addSpacing(dp(3))
-        hdr.addWidget(name_lbl)
+        hdr.addWidget(self._name_lbl)
         hdr.addStretch()
         outer.addLayout(hdr)
 
         # ── 3D row ────────────────────────────────────────────────────────────
         d3_row = QHBoxLayout()
         d3_row.setSpacing(dp(4))
-        d3_lbl = QLabel("3D ")
-        d3_lbl.setStyleSheet(
+        self._d3_lbl = QLabel("3D ")
+        self._d3_lbl.setStyleSheet(
             f"color: {self._palette[0]}; font-size: {font_size(12)}; font-weight: bold;")
-        _set_responsive_label_width(d3_lbl, 28)
+        _set_responsive_label_width(self._d3_lbl, 28)
         self._d3_graph = SparklineWidget(self._palette[0], min_height=24)
         self._d3_val   = QLabel("0%")
         self._d3_val.setStyleSheet(f"color: {self._palette[0]}; font-size: {font_size(12)};")
         _set_responsive_label_width(self._d3_val, 34)
         self._d3_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # type: ignore
-        d3_row.addWidget(d3_lbl)
+        d3_row.addWidget(self._d3_lbl)
         d3_row.addWidget(self._d3_graph)
         d3_row.addWidget(self._d3_val)
         outer.addLayout(d3_row)
@@ -3572,19 +3912,41 @@ class GPU3DComputeTile(BaseTile):
         # ── Compute row ───────────────────────────────────────────────────────
         cm_row = QHBoxLayout()
         cm_row.setSpacing(dp(4))
-        cm_lbl = QLabel("Cmp")
-        cm_lbl.setStyleSheet(
+        self._cm_lbl = QLabel("Cmp")
+        self._cm_lbl.setStyleSheet(
             f"color: {self._palette[1]}; font-size: {font_size(12)}; font-weight: bold;")
-        _set_responsive_label_width(cm_lbl, 28)
+        _set_responsive_label_width(self._cm_lbl, 28)
         self._cm_graph = SparklineWidget(self._palette[1], min_height=24)
         self._cm_val   = QLabel("0%")
         self._cm_val.setStyleSheet(f"color: {self._palette[1]}; font-size: {font_size(12)};")
         _set_responsive_label_width(self._cm_val, 34)
         self._cm_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)  # type: ignore
-        cm_row.addWidget(cm_lbl)
+        cm_row.addWidget(self._cm_lbl)
         cm_row.addWidget(self._cm_graph)
         cm_row.addWidget(self._cm_val)
         outer.addLayout(cm_row)
+
+    def _apply_accent_colors(self) -> None:
+        super()._apply_accent_colors()
+        color_3d = self._color_hex if self._custom_color_hex else self._palette[0]
+        color_compute = self._color_hex if self._custom_color_hex else self._palette[1]
+        _set_themed_style(
+            self._name_lbl,
+            f"color: {color_3d}; font-size: {font_size(13)}; font-weight: bold;",
+            self._accent_protection(),
+        )
+        for label, color, bold in (
+            (self._d3_lbl, color_3d, True),
+            (self._d3_val, color_3d, False),
+            (self._cm_lbl, color_compute, True),
+            (self._cm_val, color_compute, False),
+        ):
+            weight = " font-weight: bold;" if bold else ""
+            _set_themed_style(
+                label, f"color: {color}; font-size: {font_size(12)};{weight}",
+                self._accent_protection())
+        self._d3_graph.set_color(color_3d)
+        self._cm_graph.set_color(color_compute)
 
     def update_3d_compute(self, gpu_3d: float, compute: float) -> None:
         self._d3_graph.add_value(gpu_3d)
@@ -3647,10 +4009,12 @@ class RowDropZone(QWidget):
             p.drawRoundedRect(self.rect().adjusted(2, 2, -2, -2), 4, 4)
             p.setPen(QColor("#ffdd55"))
         else:
-            p.setPen(QPen(QColor("#2a3a2a"), 1, Qt.PenStyle.DashLine))      # type: ignore
+            p.setPen(QPen(QColor(_theme_color("drop_border")), 1,
+                          Qt.PenStyle.DashLine))      # type: ignore
             p.drawRoundedRect(self.rect().adjusted(2, 2, -2, -2), 4, 4)
-            p.setPen(QColor("#2a4a2a"))
-        p.setPen(QColor("#444444") if self._hover else QColor("#2a4a2a"))
+            p.setPen(QColor(_theme_color("drop_text")))
+        p.setPen(QColor("#444444") if self._hover
+                 else QColor(_theme_color("drop_text")))
         p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "+")                # type: ignore
 
 
@@ -3703,7 +4067,8 @@ class InterRowDropZone(QWidget):
             p.setPen(QColor("#ffdd55"))
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "── new row ──")  # type: ignore
         else:
-            p.setPen(QPen(QColor("#2a3a2a"), 1, Qt.PenStyle.DashLine))          # type: ignore
+            p.setPen(QPen(QColor(_theme_color("drop_border")), 1,
+                          Qt.PenStyle.DashLine))          # type: ignore
             p.drawLine(4, y, self.width() - 4, y)
 
 
@@ -4096,12 +4461,31 @@ class TileGrid(QWidget):
             t.move_requested.connect(self._on_move)
             t.remove_requested.connect(self._on_hide)
             t.rowbreak_requested.connect(self._on_rowbreak)
+            t.color_requested.connect(self._on_color_change)
+            t.color_reset_requested.connect(self._on_color_reset)
 
         cfg = self._load_config()
         raw_order = cfg.get('tile_order')
         raw_hidden = cfg.get('hidden_tiles', [])
+        raw_tile_colors = cfg.get('tile_colors', {})
         has_saved_layout = isinstance(raw_order, list)
         layout_changed = cfg.get('version') != CONFIG_VERSION
+
+        self._tile_colors: Dict[str, str] = {}
+        if not isinstance(raw_tile_colors, dict):
+            raw_tile_colors = {}
+            layout_changed = True
+        for raw_id, raw_color in raw_tile_colors.items():
+            color = _normalise_color_hex(raw_color)
+            if (not isinstance(raw_id, str) or not raw_id
+                    or len(raw_id) > 256 or color is None):
+                layout_changed = True
+                continue
+            self._tile_colors[raw_id] = color
+        for tile_id, tile in self._tiles.items():
+            color = self._tile_colors.get(tile_id)
+            if color is not None:
+                tile.set_custom_color(color)
         if not isinstance(raw_hidden, list):
             raw_hidden = []
             layout_changed = True
@@ -4134,6 +4518,7 @@ class TileGrid(QWidget):
                 'min_row_h': self._min_row_h,
                 'tile_order': persisted_order,
                 'hidden_tiles': persisted_hidden,
+                'tile_colors': self._tile_colors,
             })
             try:
                 _save_config_file(cfg)
@@ -4374,6 +4759,23 @@ class TileGrid(QWidget):
         return [(tid, self._tile_names.get(tid, tid))
                 for tid in self._hidden if tid != '__row__']
 
+    def _on_color_change(self, tile_id: str, color_hex: str) -> None:
+        tile = self._tiles.get(tile_id)
+        color = _normalise_color_hex(color_hex)
+        if tile is None or color is None:
+            return
+        tile.set_custom_color(color)
+        self._tile_colors[tile_id] = color
+        self._save_config()
+
+    def _on_color_reset(self, tile_id: str) -> None:
+        tile = self._tiles.get(tile_id)
+        if tile is None:
+            return
+        tile.set_custom_color(None)
+        self._tile_colors.pop(tile_id, None)
+        self._save_config()
+
     # ── Row-break helpers ─────────────────────────────────────────────────────
 
     def _cleanup_rowbreaks(self) -> None:
@@ -4426,10 +4828,25 @@ class TileGrid(QWidget):
                 # matching a config-free launch instead of resurrecting old rows.
                 persisted_order = list(self._tile_order)
                 persisted_hidden = list(self._hidden)
+            stored_colors = data.get('tile_colors', {})
+            persisted_colors: Dict[str, str] = {}
+            if isinstance(stored_colors, dict):
+                for tile_id, raw_color in stored_colors.items():
+                    color = _normalise_color_hex(raw_color)
+                    if (isinstance(tile_id, str) and tile_id
+                            and len(tile_id) <= 256 and color is not None):
+                        persisted_colors[tile_id] = color
+            for tile_id, tile in self._tiles.items():
+                if tile.custom_color is None:
+                    persisted_colors.pop(tile_id, None)
+                else:
+                    persisted_colors[tile_id] = tile.custom_color
+            self._tile_colors = persisted_colors
             data.update({
                 'min_row_h': self._min_row_h,
                 'tile_order': persisted_order,
                 'hidden_tiles': persisted_hidden,
+                'tile_colors': persisted_colors,
             })
             _save_config_file(data)
         except Exception as exc:
@@ -4465,7 +4882,7 @@ class AddTilesDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Add Tiles")
         self.setMinimumWidth(300)
-        self.setStyleSheet("""
+        _set_themed_style(self, """
             QDialog   { background: #0e0e18; color: white; }
             QCheckBox { color: #ccc; padding: 4px 0; font-size: 12px; }
             QCheckBox::indicator          { width: 14px; height: 14px; }
@@ -4488,7 +4905,8 @@ class AddTilesDialog(QDialog):
             layout.addWidget(QLabel("All tiles are already visible."))
         else:
             lbl = QLabel("Select tiles to restore:")
-            lbl.setStyleSheet("color: #888; font-size: 11px; font-weight: bold;")
+            _set_themed_style(
+                lbl, "color: #888; font-size: 11px; font-weight: bold;")
             layout.addWidget(lbl)
             layout.addSpacing(4)
             for tid, name in hidden:
@@ -5445,7 +5863,7 @@ def section_label(html: str) -> QLabel:
 def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
     btn = QPushButton(text)
     btn.setCheckable(checkable)
-    btn.setStyleSheet(f"""
+    _set_themed_style(btn, f"""
         QPushButton {{
             background: #1e1e2e; color: #aaa;
             border: 1px solid #333; border-radius: {int(5 * _DP_SCALE)}px;
@@ -5459,27 +5877,41 @@ def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD  v2.7.5
+# MAIN DASHBOARD  v2.7.6
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TricorderDashboard(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
 
-        # Dark title-bar on Windows
-        try:
-            import ctypes
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                int(self.winId()), 20, ctypes.byref(ctypes.c_int(1)), 4)
-        except Exception:
-            pass
+        self._theme = _set_active_theme(
+            _load_config_file().get('theme', 'dark'))
+        _set_windows_titlebar_theme(self, self._theme)
 
         self.setWindowTitle(f"System Tricorder v{APP_VERSION}")
         self.setWindowIcon(_app_icon())
         # Qt window coordinates are already device-independent.  Keep only a
         # compact usability floor; active tiles scale to fit without scrollbars.
         self.setMinimumSize(640, 360)
-        self.setStyleSheet("QMainWindow, QWidget { background-color: #0a0a0f; color: white; }")
+        _set_themed_style(self, """
+            QMainWindow, QWidget {
+                background-color: #0a0a0f;
+                color: white;
+            }
+            QComboBox {
+                background: #1e1e2e; color: #aaa;
+                border: 1px solid #333; border-radius: 5px;
+                padding: 4px 8px;
+            }
+            QComboBox:hover { background: #2a2a3a; color: #fff; }
+            QComboBox QAbstractItemView {
+                background: #1e1e2e; color: #ccc;
+                selection-background-color: #2e2e3e;
+            }
+            QToolTip {
+                background: #1e1e2e; color: #ccc; border: 1px solid #333;
+            }
+        """)
 
         self._analyze_hardware()
 
@@ -5500,6 +5932,8 @@ class TricorderDashboard(QMainWindow):
         self._resize_settle_timer.timeout.connect(self._settle_responsive_layout)
 
         self._setup_ui()
+        _apply_theme_tree(self)
+        self._update_clock_layout(self.width())
 
         self.clock_timer = QTimer(self)
         self.clock_timer.timeout.connect(self._update_clock)
@@ -5642,7 +6076,86 @@ class TricorderDashboard(QMainWindow):
     # ── Clock ──────────────────────────────────────────────────────────────────
 
     def _update_clock(self) -> None:
-        self._clock_lbl.setText(datetime.now().strftime("%H:%M:%S     %d.%m.%Y"))
+        now = datetime.now()
+        self._time_lbl.setText(now.strftime("%H:%M:%S"))
+        self._date_lbl.setText(now.strftime("%d.%m.%Y"))
+
+    def _update_header_responsiveness(self, width: int) -> None:
+        """Keep the clock and edit actions usable in the compact header."""
+        if not hasattr(self, '_theme_combo'):
+            return
+        compact = width < 1050
+        editing = self._btn_edit.isChecked()
+        self._title_lbl.setVisible(not compact)
+        self._info_lbl.setVisible(width >= 1200)
+        self._btn_update.setVisible(not (compact and editing))
+        self._btn_edit.setText(
+            ("✔" if editing else "✏")
+            if compact else ("✔  Fertig" if editing else "✏  Edit Layout"))
+        self._btn_add.setText("＋" if compact else "＋  Add Tile")
+        self._btn_reset.setText("↺" if compact else "↺  Reset")
+        self._theme_combo.setMinimumWidth(dp(88 if compact else 0))
+        self._theme_combo.setMaximumWidth(dp(95 if compact else 105))
+        self._clock_panel.setMinimumWidth(dp(135 if compact else 0))
+        self._time_lbl.setMinimumWidth(dp(135 if compact else 0))
+        _set_themed_style(
+            self._time_lbl,
+            f"font-size: {font_size(30 if compact else 34)}; font-weight: bold; "
+            "color: #888; font-family: Consolas; background: transparent;",
+        )
+        self._update_cols_label()
+
+    def _update_clock_layout(self, width: int) -> None:
+        """Move the date below the clock, then hide it as width gets tight."""
+        if not hasattr(self, '_clock_grid'):
+            return
+        self._update_header_responsiveness(width)
+        mode = _clock_display_mode(width)
+        if getattr(self, '_clock_display_mode', None) == mode:
+            return
+        self._clock_display_mode = mode
+        self._clock_grid.removeWidget(self._time_lbl)
+        self._clock_grid.removeWidget(self._date_lbl)
+        self._clock_grid.addWidget(self._time_lbl, 0, 0)
+        self._clock_grid.setAlignment(
+            self._time_lbl,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+        )
+        if mode == "inline":
+            self._clock_grid.addWidget(self._date_lbl, 0, 1)
+            self._date_lbl.show()
+        elif mode == "stacked":
+            self._clock_grid.addWidget(self._date_lbl, 1, 0)
+            self._date_lbl.show()
+        else:
+            self._date_lbl.hide()
+        if mode != "time-only":
+            self._clock_grid.setAlignment(
+                self._date_lbl,
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            )
+        self._clock_panel.updateGeometry()
+
+    def _on_theme_changed(self, _index: int) -> None:
+        theme = self._theme_combo.currentData()
+        self._apply_theme_selection(str(theme), persist=True)
+
+    def _apply_theme_selection(self, theme: str, *, persist: bool) -> None:
+        self._theme = _set_active_theme(theme)
+        combo_index = self._theme_combo.findData(self._theme)
+        if combo_index >= 0 and combo_index != self._theme_combo.currentIndex():
+            self._theme_combo.blockSignals(True)
+            self._theme_combo.setCurrentIndex(combo_index)
+            self._theme_combo.blockSignals(False)
+        _set_windows_titlebar_theme(self, self._theme)
+        _apply_theme_tree(self)
+        if persist:
+            try:
+                data = _load_config_file()
+                data['theme'] = self._theme
+                _save_config_file(data)
+            except Exception as exc:
+                logger.warning("Theme save failed: %s", exc)
 
     # ── UI setup ───────────────────────────────────────────────────────────────
 
@@ -5663,13 +6176,13 @@ class TricorderDashboard(QMainWindow):
         hdr.addWidget(icon_lbl)
         hdr.addSpacing(dp(10))
 
-        title = QLabel(
+        self._title_lbl = QLabel(
             "System Tricorder  "
             f"<span style='font-size: {font_size(18)}; color:#00aa55;'>v{APP_VERSION}</span>"
         )
-        title.setStyleSheet(
+        self._title_lbl.setStyleSheet(
             f"font-size: {font_size(28)}; font-weight: bold; color: #00ff88; background: transparent;")
-        hdr.addWidget(title)
+        hdr.addWidget(self._title_lbl)
         hdr.addSpacing(dp(16))
 
         sock_txt  = f"  ·  {self.num_sockets}× Socket" if self.num_sockets > 1 else ""
@@ -5678,16 +6191,18 @@ class TricorderDashboard(QMainWindow):
             cpu_hint += f"  ·  {self.p_cores}P + {self.e_cores}E"
         elif self.has_ht:
             cpu_hint += "  ·  HT"
-        info = QLabel(cpu_hint)
-        info.setStyleSheet(
+        self._info_lbl = QLabel(cpu_hint)
+        self._info_lbl.setStyleSheet(
             f"font-size: {font_size(11)}; color: #444; background: transparent; padding-top: {dp(12)}px;")
-        hdr.addWidget(info)
+        hdr.addWidget(self._info_lbl)
 
         hdr.addStretch()
 
         # ── Edit-mode toolbar ─────────────────────────────────────────────────
         self._btn_update = _toolbar_btn("⬇  Update")
         self._btn_edit  = _toolbar_btn("✏  Edit Layout", checkable=True)
+        self._btn_edit.setToolTip(
+            "Kacheln verschieben; per Rechtsklick Farbe über RGB/HEX wählen")
         self._btn_add   = _toolbar_btn("＋  Add Tile")
         self._btn_minus = _toolbar_btn("‹")
         self._btn_plus  = _toolbar_btn("›")
@@ -5713,13 +6228,40 @@ class TricorderDashboard(QMainWindow):
                   self._btn_minus, self._cols_lbl, self._btn_plus,
                   self._btn_reset):
             hdr.addWidget(w)
-        hdr.addSpacing(dp(20))
 
-        self._clock_lbl = QLabel()
-        self._clock_lbl.setStyleSheet(
-            f"font-size: {font_size(36)}; font-weight: bold; color: #888; "
+        self._theme_combo = QComboBox()
+        self._theme_combo.addItem("Darkmode", "dark")
+        self._theme_combo.addItem("Lightmode", "light")
+        self._theme_combo.setToolTip("Farbschema auswählen")
+        self._theme_combo.setMaximumWidth(dp(105))
+        theme_index = self._theme_combo.findData(self._theme)
+        self._theme_combo.setCurrentIndex(max(0, theme_index))
+        self._theme_combo.currentIndexChanged.connect(self._on_theme_changed)
+        hdr.addSpacing(dp(8))
+        hdr.addWidget(self._theme_combo)
+        hdr.addSpacing(dp(12))
+
+        self._clock_panel = QWidget()
+        self._clock_panel.setStyleSheet("background: transparent;")
+        self._clock_panel.setSizePolicy(
+            QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Preferred)
+        self._clock_grid = QGridLayout(self._clock_panel)
+        self._clock_grid.setContentsMargins(0, 0, 0, 0)
+        self._clock_grid.setHorizontalSpacing(dp(10))
+        self._clock_grid.setVerticalSpacing(0)
+        self._time_lbl = QLabel()
+        self._time_lbl.setStyleSheet(
+            f"font-size: {font_size(34)}; font-weight: bold; color: #888; "
             "font-family: Consolas; background: transparent;")
-        hdr.addWidget(self._clock_lbl)
+        self._date_lbl = QLabel()
+        self._date_lbl.setStyleSheet(
+            f"font-size: {font_size(17)}; font-weight: bold; color: #555; "
+            "font-family: Consolas; background: transparent;")
+        self._time_lbl.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._date_lbl.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        hdr.addWidget(self._clock_panel)
         root.addLayout(hdr)
         root.addSpacing(dp(10))
 
@@ -6025,7 +6567,7 @@ class TricorderDashboard(QMainWindow):
         self._cols_lbl.setVisible(active)
         self._btn_reset.setVisible(active)
         self._update_cols_label()
-        self._btn_edit.setText("✔  Fertig" if active else "✏  Edit Layout")
+        self._update_header_responsiveness(self.width())
 
     def _on_add_tiles(self) -> None:
         hidden = self._tile_grid.hidden_tiles()
@@ -6040,7 +6582,10 @@ class TricorderDashboard(QMainWindow):
         self._update_cols_label()
 
     def _update_cols_label(self) -> None:
-        self._cols_lbl.setText(f"Zeilenhöhe {self._tile_grid._min_row_h}px")
+        row_height = self._tile_grid._min_row_h
+        self._cols_lbl.setText(
+            f"{row_height}px" if self.width() < 1050
+            else f"Zeilenhöhe {row_height}px")
 
     def _on_reset_layout(self) -> None:
         self._tile_grid.reset_layout(self._default_tile_order)
@@ -6337,6 +6882,7 @@ class TricorderDashboard(QMainWindow):
     def resizeEvent(self, event) -> None:                                    # type: ignore
         super().resizeEvent(event)
         new_w, new_h = event.size().width(), event.size().height()
+        self._update_clock_layout(new_w)
         old = getattr(self, '_last_size', None)
         self._last_size = (new_w, new_h)
         if getattr(self, '_fitting', False) or old is None:

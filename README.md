@@ -1,8 +1,8 @@
 # 📊 System Tricorder
 
-> A real-time hardware monitoring dashboard for Windows, macOS, and Linux — dark mode, 30 FPS, fully customisable free-form layout.
+> A real-time hardware monitoring dashboard for Windows, macOS, and Linux — Light-/Darkmode, 30 FPS, fully customisable free-form layout.
 
-![Version](https://img.shields.io/badge/version-2.7.5-00ff88?style=flat-square)
+![Version](https://img.shields.io/badge/version-2.7.6-00ff88?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
@@ -17,9 +17,9 @@
 
 ## ✨ What it does
 
-System Tricorder gives you a live, graph-based view of your entire system at a glance — CPU, RAM, GPU(s), iGPU, package/board power, and per-drive disk I/O — all updating at 30 FPS in a clean dark-mode window.
+System Tricorder gives you a live, graph-based view of your entire system at a glance — CPU, RAM, GPU(s), iGPU, package/board power, and per-drive disk I/O — all updating at 30 FPS in a clean Light- or Darkmode window.
 
-Every aspect of the layout is yours to control: arrange tiles into any number of rows with any number of tiles per row, hide what you don't need, restore it later, collapse entire sections. Everything persists across restarts automatically.
+Every aspect of the layout is yours to control: arrange tiles into any number of rows with any number of tiles per row, choose an individual colour for every tile, hide what you don't need, restore it later, and collapse entire sections. Everything persists across restarts automatically.
 
 ---
 
@@ -58,7 +58,7 @@ The package is written to `release/`. The bundled application uses `assets/Syste
 
 ## 🎛️ Edit Mode — Customising your layout
 
-Press **✏ Edit Layout** in the toolbar to enter edit mode. All tiles highlight with a yellow accent border and gain two overlay buttons.
+Press **✏ Edit Layout** in the toolbar to enter edit mode. All tiles highlight with a yellow accent border and gain two overlay buttons. **Right-click any tile** to choose its own colour from a spectrum with explicit RGB and HEX input, or restore its factory colour.
 
 Press **⬇ Update** to install the newest GitHub version. Git checkouts continue to use a safe fast-forward pull; a standalone Windows EXE downloads and verifies the matching release asset before replacing itself; a standalone Python copy updates its script, requirements, and runtime PNG from the immutable release tag. Your local layout/settings file (`~/.tricorder_layout.json`) is stored outside every installation and is never overwritten.
 
@@ -70,6 +70,7 @@ Press **⬇ Update** to install the newest GitHub version. Git checkouts continu
 |--------|----------|--------|
 | **×** | top-right | Hide the tile (moved to the hidden pool, not deleted) |
 | **↵** | top-left | Toggle a row break before this tile — green = break active |
+| **Right-click** | anywhere on tile | Open colour actions; choose via spectrum/RGB/HEX or reset to the factory colour |
 
 ### Toolbar controls (visible in edit mode)
 
@@ -79,6 +80,8 @@ Press **⬇ Update** to install the newest GitHub version. Git checkouts continu
 | **‹ / ›** | Decrease / increase the minimum row height |
 | **↺ Reset** | Restores the factory tile order, row breaks, visibility, and row height |
 | **✔ Fertig** | Leave edit mode — layout is saved automatically |
+
+The always-visible **Darkmode / Lightmode** dropdown switches the complete dashboard theme immediately and remembers the selection. At narrower window widths the date first moves below the time and then disappears, while the clock itself remains visible.
 
 ### Update control
 
@@ -176,6 +179,7 @@ Values are shown in MB/s and automatically switch to GB/s for drives exceeding 1
 ```json
 {
   "version": "1.0",
+  "theme": "dark",
   "min_row_h": 75,
   "tile_order": [
     "cpu_total", "ram", "cpu_power",
@@ -186,7 +190,12 @@ Values are shown in MB/s and automatically switch to GB/s for drives exceeding 1
     "__row__",
     "drive_PhysicalDrive0", "drive_PhysicalDrive1"
   ],
-  "hidden_tiles": []
+  "hidden_tiles": [],
+  "tile_colors": {
+    "cpu_total": "#8a5cff",
+    "gpu_0_total": "#ff3366",
+    "drive_PhysicalDrive1": "#00aaff"
+  }
 }
 ```
 
@@ -195,6 +204,15 @@ Use **Edit Layout → Reset** for the factory tile layout. Deleting the file add
 ---
 
 ## 🗂️ Changelog
+
+### v2.7.6
+
+- **Individuelle Farben pro Kachel** — im Edit-Modus öffnet ein Rechtsklick auf CPU-, RAM-, GPU-, iGPU-, Watt- oder Laufwerkskacheln ein Farbspektrum mit RGB- und HEX-Eingabe; jede Kachel kann separat auf ihre Standardfarbe zurückgesetzt werden
+- **Farben dauerhaft und hardwarefest gespeichert** — `tile_colors` liegt zusammen mit dem Layout außerhalb der Installation; Einstellungen für zeitweise getrennte GPUs oder SSDs bleiben bei späteren Layoutänderungen erhalten
+- **Lightmode-/Darkmode-Dropdown** — das Farbschema lässt sich jederzeit direkt in der Kopfzeile wechseln und wird über Neustarts hinweg gespeichert; Panels, Graphen, Raster, Dialoge, Edit-Zonen und der native Windows-Titelbalken wechseln gemeinsam
+- **Responsive Uhr mit Datum** — bei mittlerer Fensterbreite rutscht das Datum unter die Uhrzeit, bei kompakten Fenstern verschwindet nur das Datum und die Uhr bleibt sichtbar
+- **Regressionstests erweitert** — Farbnormalisierung, RGB/HEX-Dialog, alle Kacheltypen, Reset, persistente und dormant Hardwarefarben, driftfreier Themewechsel, Graph-Cache sowie alle drei Datumszustände werden automatisiert geprüft
+- **Windows-Build 2.7.6.0** — Onefile-EXE, Dateimetadaten, Frozen-Self-Test und Release-Artefakt wurden für v2.7.6 aktualisiert
 
 ### v2.7.5
 

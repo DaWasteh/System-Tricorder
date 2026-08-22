@@ -1,5 +1,7 @@
+import hashlib
 import json
 import os
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -66,20 +68,23 @@ def test_metric_defaults() -> None:
 
 
 def test_release_versions_are_synchronized() -> None:
-    assert tricorder.APP_VERSION == "2.7.4"
+    assert tricorder.APP_VERSION == "2.7.5"
     assert tricorder.CONFIG_VERSION == "1.0"
     root = Path(tricorder.__file__).parent
     version_info = (root / "assets" / "version_info.txt").read_text(encoding="utf-8")
     for expected in (
-        "filevers=(2, 7, 4, 0)",
-        "prodvers=(2, 7, 4, 0)",
-        "FileVersion', '2.7.4.0'",
-        "ProductVersion', '2.7.4.0'",
+        "filevers=(2, 7, 5, 0)",
+        "prodvers=(2, 7, 5, 0)",
+        "FileVersion', '2.7.5.0'",
+        "ProductVersion', '2.7.5.0'",
     ):
         assert expected in version_info
     readme = (root / "README.md").read_text(encoding="utf-8")
-    assert "version-2.7.4-00ff88" in readme
-    assert "### v2.7.4" in readme
+    assert "version-2.7.5-00ff88" in readme
+    assert "### v2.7.5" in readme
+    if os.name == "nt":
+        assert tricorder._windows_file_version(
+            root / "dist" / "system_tricorder.exe") == (2, 7, 5, 0)
     release_builder = (root / ".github" / "scripts" / "build_release.py").read_text(
         encoding="utf-8")
     assert 'generated_spec_dir = build_dir / "generated-spec"' in release_builder
@@ -712,6 +717,382 @@ def test_layout_migration_save_failure_does_not_block_startup(
 
     grid.deleteLater()
     qapp.processEvents()
+
+
+def test_update_version_url_and_git_blob_validation() -> None:
+    assert tricorder._version_tuple("v2.7.5") == (2, 7, 5)
+    assert tricorder._version_tuple("2.7") == (2, 7, 0)
+    assert tricorder._version_tuple("v2.7.5-rc1") is None
+    assert tricorder._git_blob_sha(b"hello") == "b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0"
+
+    assert tricorder._validate_update_url(
+        "https://api.github.com/repos/DaWasteh/System-Tricorder/releases/latest"
+    ).startswith("https://")
+    for rejected in (
+        "http://github.com/DaWasteh/System-Tricorder",
+        "https://evil.example/SystemTricorder.exe",
+        "https://user:secret@github.com/SystemTricorder.exe",
+        "https://github.com:444/SystemTricorder.exe",
+    ):
+        with pytest.raises(RuntimeError):
+            tricorder._validate_update_url(rejected)
+
+
+def test_bounded_download_checks_size_and_sha256(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    payload = b"verified update payload"
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.headers = {"Content-Length": str(len(payload))}
+            self._sent = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def geturl(self) -> str:
+            return "https://raw.githubusercontent.com/DaWasteh/System-Tricorder/v2.7.5/test.bin"
+
+        def read(self, _size: int = -1) -> bytes:
+            if self._sent:
+                return b""
+            self._sent = True
+            return payload
+
+    attempts = 0
+
+    def flaky_urlopen(*_args: object, **_kwargs: object) -> FakeResponse:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ConnectionResetError("transient GitHub reset")
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        tricorder.urllib.request, "urlopen", flaky_urlopen)
+    monkeypatch.setattr(tricorder.time, "sleep", lambda _seconds: None)
+    worker = tricorder.UpdateWorker()
+    destination = tmp_path / "update.bin"
+    expected_hash = hashlib.sha256(payload).hexdigest()
+    assert worker._download_to_path(
+        "https://raw.githubusercontent.com/DaWasteh/System-Tricorder/v2.7.5/test.bin",
+        destination,
+        expected_size=len(payload),
+        max_size=1024,
+        expected_sha256=expected_hash,
+    ) == expected_hash
+    assert destination.read_bytes() == payload
+    assert attempts == 2
+
+    bad_destination = tmp_path / "bad.bin"
+    with pytest.raises(RuntimeError, match="SHA-256"):
+        worker._download_to_path(
+            "https://raw.githubusercontent.com/DaWasteh/System-Tricorder/v2.7.5/test.bin",
+            bad_destination,
+            expected_size=len(payload),
+            max_size=1024,
+            expected_sha256="0" * 64,
+        )
+    assert not bad_destination.exists()
+    worker.deleteLater()
+
+
+def test_successful_frozen_update_removes_only_expected_backup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    executable = tmp_path / "SystemTricorder.exe"
+    backup = Path(str(executable) + ".previous")
+    executable.write_bytes(b"new")
+    backup.write_bytes(b"old")
+    unrelated = tmp_path / "keep.previous"
+    unrelated.write_bytes(b"keep")
+    monkeypatch.setattr(tricorder.sys, "executable", str(executable))
+    monkeypatch.setattr(tricorder.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(tricorder.platform, "system", lambda: "Windows")
+
+    tricorder._cleanup_previous_exe_backup()
+
+    assert not backup.exists()
+    assert unrelated.read_bytes() == b"keep"
+
+
+def test_git_checkout_discovery_ignores_unrelated_parent_repo(tmp_path: Path) -> None:
+    root = tmp_path / "unrelated"
+    start = root / "downloads" / "tricorder"
+    (root / ".git").mkdir(parents=True)
+    start.mkdir(parents=True)
+    assert tricorder._find_git_checkout(start) is None
+    (root / "system_tricorder.py").write_text(
+        "# unrelated project with the same filename\n", encoding="utf-8")
+    assert tricorder._find_git_checkout(start) is None
+
+    (root / "system_tricorder.py").write_text(
+        "# DaWasteh/System-Tricorder\n"
+        "class UpdateWorker(QThread):\n    pass\n"
+        "class TricorderDashboard(QMainWindow):\n    pass\n",
+        encoding="utf-8",
+    )
+    assert tricorder._find_git_checkout(start) == root
+
+
+def test_standalone_exe_helper_is_rollback_capable() -> None:
+    script = tricorder._build_standalone_exe_update_bat(
+        Path("C:/Benutzer/Jörg/SystemTricorder.exe"),
+        Path("C:/Benutzer/Jörg/Temp/system-tricorder-update-1/release.exe"),
+        42,
+        Path("C:/Benutzer/Jörg/Temp/release-update.log"),
+    )
+    assert 'set "BACKUP=%EXE%.previous"' in script
+    assert 'copy /Y /B "%UPDATE%" "%NEW%"' in script
+    assert 'move /Y "%EXE%" "%BACKUP%"' in script
+    assert 'move /Y "%BACKUP%" "%EXE%"' in script
+    assert 'start "" "%EXE%"' in script
+    assert "git pull" not in script
+    assert "PyInstaller" not in script
+    with pytest.raises(ValueError, match="unsafe"):
+        tricorder._build_standalone_exe_update_bat(
+            Path("C:/Users/100%/SystemTricorder.exe"),
+            Path("C:/Temp/update.exe"), 42, Path("C:/Temp/update.log"),
+        )
+
+
+def _write_source_update_fixture(root: Path, version: str) -> None:
+    (root / "assets").mkdir(parents=True, exist_ok=True)
+    (root / "system_tricorder.py").write_text(
+        f'APP_VERSION = "{version}"\nclass UpdateWorker(QThread):\n    pass\n',
+        encoding="utf-8",
+    )
+    (root / "requirements.txt").write_text(
+        f"PyQt6>=6.11.0\npsutil>=7.2.2\n# fixture {version}\n",
+        encoding="utf-8",
+    )
+    (root / "assets" / "SystemTricorder.png").write_bytes(
+        b"\x89PNG\r\n\x1a\n" + version.encode("ascii"))
+
+
+def test_source_update_install_is_atomic_and_rolls_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    install = tmp_path / "install"
+    staging = tmp_path / "staging"
+    _write_source_update_fixture(install, "2.7.4")
+    _write_source_update_fixture(staging, "2.7.5")
+    os.chmod(install / "system_tricorder.py", 0o755)
+    original_mode = tricorder.stat.S_IMODE(
+        (install / "system_tricorder.py").stat().st_mode)
+    before = {
+        relative: (install / relative).read_bytes()
+        for relative in tricorder._UPDATE_SOURCE_FILES
+    }
+
+    original_replace = Path.replace
+
+    def fail_final_png_replace(self: Path, target: Path) -> Path:
+        if self.name.startswith(".SystemTricorder.png.update-"):
+            raise OSError("simulated final replace failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_final_png_replace)
+    with pytest.raises(OSError, match="simulated"):
+        tricorder._install_staged_source_files(staging, install)
+    assert {
+        relative: (install / relative).read_bytes()
+        for relative in tricorder._UPDATE_SOURCE_FILES
+    } == before
+    assert not list(install.rglob("*.backup-*"))
+    assert not list(install.rglob("*.update-*"))
+
+    monkeypatch.setattr(Path, "replace", original_replace)
+    assert tricorder._install_staged_source_files(staging, install)
+    assert 'APP_VERSION = "2.7.5"' in (
+        install / "system_tricorder.py").read_text(encoding="utf-8")
+    assert (install / "assets" / "SystemTricorder.png").read_bytes().endswith(
+        b"2.7.5")
+    assert tricorder.stat.S_IMODE(
+        (install / "system_tricorder.py").stat().st_mode) == original_mode
+
+
+def test_source_backup_cleanup_failure_does_not_mix_versions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    install = tmp_path / "install"
+    staging = tmp_path / "staging"
+    _write_source_update_fixture(install, "2.7.4")
+    _write_source_update_fixture(staging, "2.7.5")
+    original_unlink = Path.unlink
+
+    def fail_one_backup(self: Path, missing_ok: bool = False) -> None:
+        if self.name.startswith(".requirements.txt.backup-") and self.exists():
+            raise OSError("simulated backup cleanup failure")
+        original_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_one_backup)
+    assert tricorder._install_staged_source_files(staging, install)
+    assert 'APP_VERSION = "2.7.5"' in (
+        install / "system_tricorder.py").read_text(encoding="utf-8")
+    assert "fixture 2.7.5" in (
+        install / "requirements.txt").read_text(encoding="utf-8")
+    assert (install / "assets" / "SystemTricorder.png").read_bytes().endswith(
+        b"2.7.5")
+    assert list(install.rglob(".requirements.txt.backup-*"))
+
+
+def test_source_release_stage_verifies_tagged_git_blobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = {
+        "system_tricorder.py": (
+            b'APP_VERSION = "2.7.5"\nclass UpdateWorker(QThread):\n    pass\n'),
+        "requirements.txt": b"PyQt6>=6.11.0\npsutil>=7.2.2\n",
+        "assets/SystemTricorder.png": b"\x89PNG\r\n\x1a\nnew-icon",
+    }
+    worker = tricorder.UpdateWorker()
+
+    def relative_from_url(url: str) -> str:
+        decoded = tricorder.urllib.parse.unquote(url)
+        return next(relative for relative in files if relative in decoded)
+
+    def fake_json(url: str, timeout: int = 30) -> dict:
+        del timeout
+        relative = relative_from_url(url)
+        data = files[relative]
+        return {
+            "type": "file",
+            "path": relative,
+            "size": len(data),
+            "sha": tricorder._git_blob_sha(data),
+            "download_url": (
+                "https://raw.githubusercontent.com/DaWasteh/"
+                f"System-Tricorder/v2.7.5/{relative}"
+            ),
+        }
+
+    def fake_download(
+        url: str, destination: Path, *, expected_size: int,
+        max_size: int, expected_sha256: str = "", timeout: int = 120,
+    ) -> str:
+        del max_size, expected_sha256, timeout
+        data = files[relative_from_url(url)]
+        assert expected_size == len(data)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+        return hashlib.sha256(data).hexdigest()
+
+    monkeypatch.setattr(worker, "_request_json", fake_json)
+    monkeypatch.setattr(worker, "_download_to_path", fake_download)
+    staging = worker._stage_source_release("v2.7.5", (2, 7, 5))
+    try:
+        for relative, expected in files.items():
+            assert (staging / relative).read_bytes() == expected
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+        worker.deleteLater()
+
+
+def test_non_git_updater_dispatches_exe_and_python_release_paths(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del qapp
+    release = {"tag_name": "v2.7.5", "assets": []}
+    monkeypatch.setattr(tricorder, "APP_VERSION", "2.7.4")
+    monkeypatch.setattr(tricorder, "_find_git_checkout", lambda _start: None)
+
+    exe_worker = tricorder.UpdateWorker()
+    monkeypatch.setattr(
+        exe_worker, "_latest_release", lambda: (release, "v2.7.5", (2, 7, 5)))
+    monkeypatch.setattr(tricorder.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(tricorder.sys, "frozen", True, raising=False)
+
+    def fake_prepare(_release: dict, tag: str, _version: tuple[int, int, int]) -> None:
+        exe_worker.prepared_exe_update = "C:/Temp/verified.exe"
+        exe_worker.target_version = tag
+
+    monkeypatch.setattr(exe_worker, "_prepare_standalone_exe_update", fake_prepare)
+    ok, message = exe_worker._check_and_install()
+    assert ok and "Verifiziertes GitHub-Release v2.7.5" in message
+    assert exe_worker.prepared_exe_update.endswith("verified.exe")
+
+    source_worker = tricorder.UpdateWorker()
+    monkeypatch.setattr(
+        source_worker, "_latest_release", lambda: (release, "v2.7.5", (2, 7, 5)))
+    monkeypatch.delattr(tricorder.sys, "frozen", raising=False)
+
+    def fake_source_install(tag: str, _version: tuple[int, int, int]) -> None:
+        source_worker.target_version = tag
+
+    monkeypatch.setattr(
+        source_worker, "_install_standalone_source_update", fake_source_install)
+    ok, message = source_worker._check_and_install()
+    assert ok and "Standalone-Python wurde auf v2.7.5 aktualisiert" in message
+    assert source_worker.target_version == "v2.7.5"
+
+    exe_worker.deleteLater()
+    source_worker.deleteLater()
+
+
+def test_prepare_standalone_exe_requires_release_digest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    current_exe = tmp_path / "SystemTricorder.exe"
+    current_exe.write_bytes(b"MZ-current")
+    monkeypatch.setattr(tricorder.sys, "executable", str(current_exe))
+    monkeypatch.setattr(tricorder.platform, "machine", lambda: "AMD64")
+    worker = tricorder.UpdateWorker()
+    release = {
+        "assets": [{
+            "name": tricorder.GITHUB_WINDOWS_ASSET,
+            "size": 6_000_000,
+            "digest": "",
+            "browser_download_url": (
+                "https://github.com/DaWasteh/System-Tricorder/releases/"
+                "download/v2.7.5/SystemTricorder-windows-x86_64.exe"
+            ),
+        }],
+    }
+    with pytest.raises(RuntimeError, match="SHA-256"):
+        worker._prepare_standalone_exe_update(
+            release, "v2.7.5", (2, 7, 5))
+
+    update_dir = tmp_path / "system-tricorder-update-test"
+
+    def fake_mkdtemp(*, prefix: str) -> str:
+        assert prefix == "system-tricorder-update-"
+        update_dir.mkdir()
+        return str(update_dir)
+
+    download_call: dict[str, object] = {}
+
+    def fake_download(
+        url: str, destination: Path, *, expected_size: int,
+        max_size: int, expected_sha256: str = "", timeout: int = 120,
+    ) -> str:
+        download_call.update({
+            "url": url, "size": expected_size, "max": max_size,
+            "sha": expected_sha256, "timeout": timeout,
+        })
+        destination.write_bytes(b"MZ-verified-candidate")
+        return expected_sha256
+
+    validated: list[tuple[Path, tuple[int, int, int]]] = []
+    release["assets"][0]["digest"] = "sha256:" + "a" * 64
+    monkeypatch.setattr(tricorder.tempfile, "mkdtemp", fake_mkdtemp)
+    monkeypatch.setattr(worker, "_download_to_path", fake_download)
+    monkeypatch.setattr(
+        worker, "_validate_windows_candidate",
+        lambda path, version: validated.append((path, version)),
+    )
+    worker._prepare_standalone_exe_update(
+        release, "v2.7.5", (2, 7, 5))
+    assert Path(worker.prepared_exe_update).read_bytes() == b"MZ-verified-candidate"
+    assert worker.target_version == "v2.7.5"
+    assert download_call["sha"] == "a" * 64
+    assert validated == [(Path(worker.prepared_exe_update), (2, 7, 5))]
+    shutil.rmtree(update_dir, ignore_errors=True)
+    worker.deleteLater()
 
 
 def test_frozen_windows_update_defers_pull_until_exe_exits(

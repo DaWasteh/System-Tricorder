@@ -11,6 +11,13 @@ import contextlib
 import ctypes
 import subprocess
 import shlex
+import hashlib
+import shutil
+import tempfile
+import stat
+import urllib.error
+import urllib.parse
+import urllib.request
 try:
     import pynvml                                               # type: ignore
     pynvml.nvmlInit()
@@ -132,8 +139,23 @@ except ImportError:
 # ── Layout / window config ────────────────────────────────────────────────────
 CONFIG_FILE = Path.home() / ".tricorder_layout.json"
 CONFIG_VERSION = "1.0"
-APP_VERSION = "2.7.4"
-GITHUB_REPO_URL = "https://github.com/DaWasteh/System-Tricorder.git"
+APP_VERSION = "2.7.5"
+GITHUB_REPO = "DaWasteh/System-Tricorder"
+GITHUB_REPO_URL = f"https://github.com/{GITHUB_REPO}.git"
+GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}"
+GITHUB_WINDOWS_ASSET = "SystemTricorder-windows-x86_64.exe"
+_UPDATE_SOURCE_FILES = (
+    "system_tricorder.py",
+    "requirements.txt",
+    "assets/SystemTricorder.png",
+)
+_UPDATE_ALLOWED_HOSTS = frozenset({
+    "api.github.com",
+    "github.com",
+    "raw.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+})
 
 
 def _resource_path(relative_path: str) -> Path:
@@ -4563,16 +4585,190 @@ def _app_start_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def _cleanup_previous_exe_backup() -> None:
+    """Remove the rollback EXE only after the replacement app stayed alive."""
+    if platform.system() != "Windows" or not getattr(sys, "frozen", False):
+        return
+    backup = Path(str(Path(sys.executable).resolve()) + ".previous")
+    try:
+        backup.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("Could not remove successful update backup %s: %s", backup, exc)
+
+
+def _is_system_tricorder_source(path: Path) -> bool:
+    """Recognize the tracked project source without trusting only its filename."""
+    try:
+        if not path.is_file() or path.stat().st_size > 2 * 1024 * 1024:
+            return False
+        source = path.read_text(encoding="utf-8")
+        return (
+            "DaWasteh/System-Tricorder" in source
+            and "class TricorderDashboard(QMainWindow):" in source
+            and "class UpdateWorker(QThread):" in source
+        )
+    except (OSError, UnicodeError):
+        return False
+
+
 def _find_git_checkout(start: Path) -> Optional[Path]:
-    """Find the nearest parent directory that is a git checkout."""
+    """Find the nearest verified System Tricorder checkout."""
     for candidate in (start, *start.parents):
-        if (candidate / ".git").exists():
+        if ((candidate / ".git").exists()
+                and _is_system_tricorder_source(
+                    candidate / "system_tricorder.py")):
             return candidate
     return None
 
 
 def _short_sha(sha: str) -> str:
     return sha[:7] if sha else "unknown"
+
+
+def _version_tuple(value: str) -> Optional[Tuple[int, int, int]]:
+    """Parse a stable ``vMAJOR.MINOR[.PATCH]`` version without guessing."""
+    match = re.fullmatch(r"v?(\d+)\.(\d+)(?:\.(\d+))?", value.strip())
+    if match is None:
+        return None
+    return tuple(int(part or 0) for part in match.groups())  # type: ignore[return-value]
+
+
+def _validate_update_url(url: str) -> str:
+    """Allow only HTTPS downloads hosted by GitHub's fixed update surface."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError(f"Ungueltige Update-URL: {exc}") from exc
+    if (parsed.scheme.lower() != "https" or not host
+            or host not in _UPDATE_ALLOWED_HOSTS
+            or parsed.username is not None or parsed.password is not None
+            or port not in (None, 443)):
+        raise RuntimeError("Update-URL liegt nicht auf einem erlaubten GitHub-Host")
+    return url
+
+
+def _git_blob_sha(data: bytes) -> str:
+    """Return the Git object id used by GitHub's Contents API."""
+    prefix = f"blob {len(data)}\0".encode("ascii")
+    return hashlib.sha1(prefix + data, usedforsecurity=False).hexdigest()
+
+
+class _VsFixedFileInfo(ctypes.Structure):
+    _fields_ = [(name, wintypes.DWORD) for name in (
+        "dwSignature", "dwStrucVersion", "dwFileVersionMS",
+        "dwFileVersionLS", "dwProductVersionMS", "dwProductVersionLS",
+        "dwFileFlagsMask", "dwFileFlags", "dwFileOS", "dwFileType",
+        "dwFileSubtype", "dwFileDateMS", "dwFileDateLS",
+    )]
+
+
+def _windows_file_version(path: Path) -> Optional[Tuple[int, int, int, int]]:
+    """Read a PE file version through the native Windows version API."""
+    if os.name != "nt":
+        return None
+    version = ctypes.WinDLL("version", use_last_error=True)
+    get_size = version.GetFileVersionInfoSizeW
+    get_size.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(wintypes.DWORD)]
+    get_size.restype = wintypes.DWORD
+    get_info = version.GetFileVersionInfoW
+    get_info.argtypes = [ctypes.c_wchar_p, wintypes.DWORD, wintypes.DWORD,
+                         ctypes.c_void_p]
+    get_info.restype = ctypes.c_int
+    query = version.VerQueryValueW
+    query.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                      ctypes.POINTER(ctypes.c_void_p),
+                      ctypes.POINTER(ctypes.c_uint)]
+    query.restype = ctypes.c_int
+
+    ignored = wintypes.DWORD(0)
+    size = int(get_size(str(path), ctypes.byref(ignored)))
+    if size <= 0:
+        return None
+    buffer = (ctypes.c_ubyte * size)()
+    if not get_info(str(path), 0, size, buffer):
+        return None
+    value = ctypes.c_void_p()
+    value_size = ctypes.c_uint(0)
+    if not query(buffer, "\\", ctypes.byref(value), ctypes.byref(value_size)):
+        return None
+    if value_size.value < ctypes.sizeof(_VsFixedFileInfo):
+        return None
+    fixed = ctypes.cast(value, ctypes.POINTER(_VsFixedFileInfo)).contents
+    if fixed.dwSignature != 0xFEEF04BD:
+        return None
+    return (
+        int(fixed.dwFileVersionMS >> 16),
+        int(fixed.dwFileVersionMS & 0xFFFF),
+        int(fixed.dwFileVersionLS >> 16),
+        int(fixed.dwFileVersionLS & 0xFFFF),
+    )
+
+
+def _install_staged_source_files(staging: Path, install_root: Path) -> bool:
+    """Atomically install the allowlisted source files with rollback.
+
+    Returns whether ``requirements.txt`` changed.  All paths are resolved under
+    ``install_root`` so a symlink cannot redirect an update outside the app.
+    """
+    root = install_root.resolve()
+    planned: List[Tuple[Path, Path, bool, Optional[int]]] = []
+    requirements_changed = False
+    for relative in _UPDATE_SOURCE_FILES:
+        source = staging / relative
+        if not source.is_file():
+            raise RuntimeError(f"Update-Datei fehlt: {relative}")
+        target = root / relative
+        if not target.resolve(strict=False).is_relative_to(root):
+            raise RuntimeError(f"Unsicherer Update-Pfad: {relative}")
+        existed = target.is_file()
+        if target.exists() and not existed:
+            raise RuntimeError(f"Update-Ziel ist keine Datei: {relative}")
+        if relative == "requirements.txt":
+            old_data = target.read_bytes() if existed else b""
+            requirements_changed = old_data != source.read_bytes()
+        old_mode = stat.S_IMODE(target.stat().st_mode) if existed else None
+        planned.append((source, target, existed, old_mode))
+
+    token = f"{os.getpid()}-{threading.get_ident()}"
+    installed: List[Tuple[Path, Path, Path, bool]] = []
+    try:
+        for source, target, existed, old_mode in planned:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            candidate = target.with_name(f".{target.name}.update-{token}")
+            backup = target.with_name(f".{target.name}.backup-{token}")
+            candidate.unlink(missing_ok=True)
+            backup.unlink(missing_ok=True)
+            with source.open("rb") as src, candidate.open("xb") as dst:
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
+                dst.flush()
+                os.fsync(dst.fileno())
+            if old_mode is not None:
+                os.chmod(candidate, old_mode)
+            installed.append((target, candidate, backup, existed))
+            if existed:
+                target.replace(backup)
+            candidate.replace(target)
+    except Exception:
+        for target, candidate, backup, existed in reversed(installed):
+            candidate.unlink(missing_ok=True)
+            if backup.exists():
+                target.unlink(missing_ok=True)
+                backup.replace(target)
+            elif not existed:
+                target.unlink(missing_ok=True)
+        raise
+
+    # Every target now contains the same release, so the transaction is
+    # committed.  Backup cleanup must never roll some files back after others'
+    # backups have already been removed.
+    for _, _, backup, _ in installed:
+        try:
+            backup.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Could not remove source update backup %s: %s", backup, exc)
+    return requirements_changed
 
 
 def _build_rebuild_bat(repo_root: Path, exe_path: Path, pid: int,
@@ -4691,29 +4887,238 @@ def _build_rebuild_bat(repo_root: Path, exe_path: Path, pid: int,
     return "\r\n".join(lines) + "\r\n"
 
 
-class UpdateWorker(QThread):
-    """Checks GitHub and fast-forward-updates the local git checkout.
+def _build_standalone_exe_update_bat(
+    exe_path: Path, update_path: Path, pid: int, log_path: Path,
+) -> str:
+    """Build a rollback-capable helper for a downloaded Windows release EXE."""
+    for path in (exe_path, update_path, log_path):
+        if any(character in str(path) for character in ("%", "\r", "\n")):
+            raise ValueError("Windows update helper path contains unsafe characters")
+    if pid <= 0:
+        raise ValueError("Windows update helper PID must be positive")
+    lines = [
+        "@echo off",
+        "chcp 65001 >NUL",
+        "set PYTHONUTF8=1",
+        "setlocal enableextensions",
+        f'set "PID={pid}"',
+        f'set "EXE={exe_path}"',
+        f'set "UPDATE={update_path}"',
+        f'set "LOG={log_path}"',
+        'for %%D in ("%UPDATE%") do set "UPDATEDIR=%%~dpD"',
+        'set "NEW=%EXE%.update-new"',
+        'set "BACKUP=%EXE%.previous"',
+        'echo [%date% %time%] standalone update helper started >> "%LOG%"',
+        "",
+        "REM --- Wait until Windows releases the running EXE (max ~90s) ---",
+        "set /a WAIT_N=0",
+        ":waitloop",
+        'tasklist /FI "PID eq %PID%" 2>NUL | find "%PID%" >NUL',
+        "if errorlevel 1 goto procgone",
+        "set /a WAIT_N+=1",
+        "if %WAIT_N% GEQ 90 goto forcekill",
+        "ping 127.0.0.1 -n 2 >NUL",
+        "goto waitloop",
+        ":forcekill",
+        'echo [%date% %time%] force-killing PID %PID% >> "%LOG%"',
+        "taskkill /PID %PID% /F >NUL 2>&1",
+        ":procgone",
+        'echo [%date% %time%] process gone, replacing EXE >> "%LOG%"',
+        "",
+        'if not exist "%UPDATE%" (',
+        '    echo [%date% %time%] ERROR: verified download is missing >> "%LOG%"',
+        "    goto cleanup",
+        ")",
+        'del /F /Q "%NEW%" >NUL 2>&1',
+        'copy /Y /B "%UPDATE%" "%NEW%" >> "%LOG%" 2>&1',
+        "if errorlevel 1 (",
+        '    echo [%date% %time%] ERROR: staging next to EXE failed >> "%LOG%"',
+        "    goto cleanup",
+        ")",
+        'del /F /Q "%BACKUP%" >NUL 2>&1',
+        'move /Y "%EXE%" "%BACKUP%" >> "%LOG%" 2>&1',
+        "if errorlevel 1 (",
+        '    echo [%date% %time%] ERROR: current EXE could not be backed up >> "%LOG%"',
+        "    goto cleanup",
+        ")",
+        'move /Y "%NEW%" "%EXE%" >> "%LOG%" 2>&1',
+        "if errorlevel 1 (",
+        '    echo [%date% %time%] ERROR: replacement failed, restoring backup >> "%LOG%"',
+        '    move /Y "%BACKUP%" "%EXE%" >> "%LOG%" 2>&1',
+        "    goto cleanup",
+        ")",
+        "",
+        'echo [%date% %time%] relaunching verified release >> "%LOG%"',
+        'start "" "%EXE%"',
+        "if errorlevel 1 (",
+        '    echo [%date% %time%] ERROR: relaunch failed, restoring previous EXE >> "%LOG%"',
+        '    del /F /Q "%EXE%" >NUL 2>&1',
+        '    move /Y "%BACKUP%" "%EXE%" >> "%LOG%" 2>&1',
+        ")",
+        "",
+        ":cleanup",
+        'del /F /Q "%NEW%" >NUL 2>&1',
+        'del /F /Q "%UPDATE%" >NUL 2>&1',
+        'rd "%UPDATEDIR%" >NUL 2>&1',
+        'echo [%date% %time%] helper done, self-deleting >> "%LOG%"',
+        '(goto) 2>NUL & del "%~f0"',
+    ]
+    return "\r\n".join(lines) + "\r\n"
 
-    User settings live in CONFIG_FILE under the home directory and are never
-    touched by this updater.  We intentionally use a fast-forward git pull
-    instead of reset/checkout so local source changes are not overwritten.
+
+class UpdateWorker(QThread):
+    """Update Git checkouts, standalone Python copies, and Windows release EXEs.
+
+    Git installations keep their fast-forward/autostash workflow.  A standalone
+    source copy is updated from immutable release-tag blobs, while a downloaded
+    Windows EXE is replaced only after GitHub's SHA-256, PE version, and frozen
+    self-test all pass.  ``CONFIG_FILE`` lives outside every install target.
     """
 
     update_finished = pyqtSignal(bool, str)
-    # Set when a git pull changes source or packaging inputs that affect the EXE.
-    # The dashboard reads this to decide whether to trigger a rebuild.
-    rebuild_needed: bool = False
-    deferred_pull_branch: str = ""
+    _MAX_JSON_BYTES = 2 * 1024 * 1024
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.rebuild_needed = False
+        self.deferred_pull_branch = ""
+        self.prepared_exe_update = ""
+        self.target_version = ""
+        self.requirements_changed = False
 
     def run(self) -> None:                                                # type: ignore[override]
         self.rebuild_needed = False
         self.deferred_pull_branch = ""
+        self.prepared_exe_update = ""
+        self.target_version = ""
+        self.requirements_changed = False
         try:
             ok, message = self._check_and_install()
         except Exception as exc:
             ok = False
             message = f"Update fehlgeschlagen: {exc}"
         self.update_finished.emit(ok, message)
+
+    @staticmethod
+    def _request_headers(accept: str) -> Dict[str, str]:
+        return {
+            "Accept": accept,
+            "User-Agent": f"SystemTricorder/{APP_VERSION}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+
+    def _request_json(self, url: str, timeout: int = 30) -> dict:
+        _validate_update_url(url)
+        request = urllib.request.Request(
+            url, headers=self._request_headers("application/vnd.github+json"))
+        payload = b""
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    _validate_update_url(response.geturl())
+                    raw_length = response.headers.get("Content-Length")
+                    if raw_length:
+                        try:
+                            if int(raw_length) > self._MAX_JSON_BYTES:
+                                raise RuntimeError(
+                                    "GitHub-Antwort ist unerwartet gross")
+                        except ValueError as exc:
+                            raise RuntimeError(
+                                "Ungueltige Content-Length von GitHub") from exc
+                    payload = response.read(self._MAX_JSON_BYTES + 1)
+                break
+            except (urllib.error.URLError, ConnectionError,
+                    TimeoutError, OSError):
+                if attempt >= 2:
+                    raise
+                time.sleep(0.5 * (attempt + 1))
+        if len(payload) > self._MAX_JSON_BYTES:
+            raise RuntimeError("GitHub-Antwort ist unerwartet gross")
+        try:
+            data = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("GitHub lieferte keine gueltige JSON-Antwort") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError("GitHub-Antwort hat ein unerwartetes Format")
+        return data
+
+    def _download_to_path(
+        self, url: str, destination: Path, *, expected_size: int,
+        max_size: int, expected_sha256: str = "", timeout: int = 120,
+    ) -> str:
+        """Stream one bounded GitHub file and atomically publish it locally."""
+        _validate_update_url(url)
+        if expected_size <= 0 or expected_size > max_size:
+            raise RuntimeError("Update-Dateigroesse liegt ausserhalb des erlaubten Bereichs")
+        expected_hash = expected_sha256.lower()
+        if expected_hash and re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None:
+            raise RuntimeError("GitHub-Release enthaelt keinen gueltigen SHA-256")
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        partial = destination.with_name(destination.name + ".part")
+        request = urllib.request.Request(
+            url, headers=self._request_headers("application/octet-stream"))
+        for attempt in range(3):
+            partial.unlink(missing_ok=True)
+            digest = hashlib.sha256()
+            total = 0
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    _validate_update_url(response.geturl())
+                    raw_length = response.headers.get("Content-Length")
+                    if raw_length:
+                        try:
+                            response_size = int(raw_length)
+                        except ValueError as exc:
+                            raise RuntimeError(
+                                "Ungueltige Content-Length im Download") from exc
+                        if response_size != expected_size or response_size > max_size:
+                            raise RuntimeError("GitHub-Downloadgroesse stimmt nicht")
+                    with partial.open("xb") as output:
+                        while True:
+                            chunk = response.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            total += len(chunk)
+                            if total > max_size or total > expected_size:
+                                raise RuntimeError(
+                                    "GitHub-Download ueberschreitet die erwartete Groesse")
+                            output.write(chunk)
+                            digest.update(chunk)
+                        output.flush()
+                        os.fsync(output.fileno())
+                if total != expected_size:
+                    partial.unlink(missing_ok=True)
+                    if attempt < 2:
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    raise RuntimeError(
+                        f"GitHub-Download ist unvollstaendig ({total}/{expected_size} Bytes)")
+                actual_hash = digest.hexdigest()
+                if expected_hash and actual_hash != expected_hash:
+                    raise RuntimeError(
+                        "SHA-256-Pruefung des GitHub-Downloads fehlgeschlagen")
+                partial.replace(destination)
+                return actual_hash
+            except (urllib.error.URLError, ConnectionError,
+                    TimeoutError, OSError):
+                partial.unlink(missing_ok=True)
+                if attempt >= 2:
+                    raise
+                time.sleep(0.5 * (attempt + 1))
+            except Exception:
+                partial.unlink(missing_ok=True)
+                raise
+        raise RuntimeError("GitHub-Download konnte nicht abgeschlossen werden")
+
+    def _latest_release(self) -> Tuple[dict, str, Tuple[int, int, int]]:
+        release = self._request_json(f"{GITHUB_API_URL}/releases/latest")
+        tag = str(release.get("tag_name") or "").strip()
+        version = _version_tuple(tag)
+        if (version is None or release.get("draft") is True
+                or release.get("prerelease") is True):
+            raise RuntimeError("GitHub lieferte kein gueltiges stabiles Release")
+        return release, tag, version
 
     def _run_git(self, repo_root: Path, args: List[str], timeout: int = 60) -> str:
         cmd = ["git", "-C", str(repo_root), *args]
@@ -4756,16 +5161,7 @@ class UpdateWorker(QThread):
             return sha, resolved_branch
         raise RuntimeError(last_error or "GitHub-Remote konnte nicht gelesen werden")
 
-    def _check_and_install(self) -> Tuple[bool, str]:
-        repo_root = _find_git_checkout(_app_start_dir())
-        if repo_root is None:
-            return (
-                False,
-                "Kein lokaler Git-Checkout gefunden. Der Update-Button kann "
-                "nur Installationen aktualisieren, die aus dem GitHub-Repo "
-                "geklont wurden. Deine lokalen Settings bleiben unverändert.",
-            )
-
+    def _check_git_checkout(self, repo_root: Path) -> Tuple[bool, str]:
         branch = self._run_git(repo_root, ["branch", "--show-current"]) or "main"
         current_sha = self._run_git(repo_root, ["rev-parse", "HEAD"])
         remote_sha, remote_branch = self._remote_sha_for_branch(branch)
@@ -4778,9 +5174,8 @@ class UpdateWorker(QThread):
             )
 
         if platform.system() == "Windows" and getattr(sys, "frozen", False):
-            # The checked-in EXE may itself change in the pull.  A running
-            # Windows executable cannot be replaced reliably, so let the
-            # detached helper pull only after this process has exited.
+            # The tracked EXE can be part of the pull and is locked while this
+            # process runs.  Pull/rebuild only after the app has closed.
             self.deferred_pull_branch = remote_branch
             self.rebuild_needed = True
             return (
@@ -4791,16 +5186,20 @@ class UpdateWorker(QThread):
                 f"Lokale Settings bleiben unveraendert ({CONFIG_FILE}).",
             )
 
-        self._run_git(repo_root, ["pull", "--ff-only", "--autostash", GITHUB_REPO_URL, remote_branch], timeout=180)
+        self._run_git(
+            repo_root,
+            ["pull", "--ff-only", "--autostash", GITHUB_REPO_URL, remote_branch],
+            timeout=180,
+        )
         new_sha = self._run_git(repo_root, ["rev-parse", "HEAD"])
         rebuild_changed = self._rebuild_inputs_changed(
             repo_root, current_sha, new_sha)
         self.rebuild_needed = rebuild_changed
-        if (rebuild_changed and platform.system() == "Windows"
-                and getattr(sys, "frozen", False)):
-            extra = " App- oder Paketdateien haben sich geaendert - die EXE wird nach dem Neustart automatisch neu gebaut."
-        elif rebuild_changed:
-            extra = " App- oder Paketdateien haben sich geaendert - bitte die App neu starten bzw. das native Paket neu bauen."
+        if rebuild_changed:
+            extra = (
+                " App- oder Paketdateien haben sich geaendert - bitte die App "
+                "neu starten bzw. das native Paket neu bauen."
+            )
         else:
             extra = " Keine rebuild-relevanten Aenderungen - kein Paket-Rebuild noetig."
         return (
@@ -4809,6 +5208,213 @@ class UpdateWorker(QThread):
             f"{_short_sha(current_sha)} -> {_short_sha(new_sha)}. "
             f"Lokale Settings wurden nicht veraendert ({CONFIG_FILE})."
             + extra,
+        )
+
+    def _validate_windows_candidate(
+        self, candidate: Path, release_version: Tuple[int, int, int],
+    ) -> None:
+        with candidate.open("rb") as executable:
+            if executable.read(2) != b"MZ":
+                raise RuntimeError("GitHub-Release ist keine gueltige Windows-EXE")
+        file_version = _windows_file_version(candidate)
+        if file_version is None or file_version[:3] != release_version:
+            raise RuntimeError("EXE-Dateiversion stimmt nicht mit dem GitHub-Release ueberein")
+
+        isolated_home = candidate.parent / "self-test-home"
+        shutil.rmtree(isolated_home, ignore_errors=True)
+        isolated_home.mkdir(parents=True)
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(isolated_home),
+            "USERPROFILE": str(isolated_home),
+            "TEMP": str(isolated_home),
+            "TMP": str(isolated_home),
+            "QT_QPA_PLATFORM": "offscreen",
+        })
+        try:
+            proc = subprocess.run(
+                [str(candidate), "--self-test"],
+                cwd=str(candidate.parent),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=90,
+                check=False,
+                creationflags=0x08000000 if os.name == "nt" else 0,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"Self-Test der neuen EXE schlug fehl (Code {proc.returncode})")
+        finally:
+            shutil.rmtree(isolated_home, ignore_errors=True)
+
+    def _prepare_standalone_exe_update(
+        self, release: dict, tag: str, release_version: Tuple[int, int, int],
+    ) -> None:
+        machine = platform.machine().lower()
+        if machine not in ("amd64", "x86_64"):
+            raise RuntimeError(f"Kein Windows-Release fuer Architektur {machine or 'unknown'}")
+        assets = release.get("assets")
+        if not isinstance(assets, list):
+            raise RuntimeError("GitHub-Release enthaelt keine Assets")
+        matches = [asset for asset in assets if isinstance(asset, dict)
+                   and asset.get("name") == GITHUB_WINDOWS_ASSET]
+        if len(matches) != 1:
+            raise RuntimeError(f"Release-Asset fehlt: {GITHUB_WINDOWS_ASSET}")
+        asset = matches[0]
+        size = asset.get("size")
+        digest = str(asset.get("digest") or "").lower()
+        url = str(asset.get("browser_download_url") or "")
+        if not isinstance(size, int) or not 5_000_000 <= size <= 200_000_000:
+            raise RuntimeError("Windows-Release hat eine unplausible Groesse")
+        match = re.fullmatch(r"sha256:([0-9a-f]{64})", digest)
+        if match is None:
+            raise RuntimeError("Windows-Release besitzt keinen SHA-256-Digest")
+        _validate_update_url(url)
+        expected_path = f"/{GITHUB_REPO}/releases/download/{tag}/{GITHUB_WINDOWS_ASSET}"
+        if urllib.parse.unquote(urllib.parse.urlparse(url).path).lower() != expected_path.lower():
+            raise RuntimeError("Windows-Release verweist auf einen unerwarteten Downloadpfad")
+
+        exe_path = Path(sys.executable).resolve()
+        probe = exe_path.parent / f".tricorder-update-probe-{os.getpid()}.tmp"
+        try:
+            probe.write_bytes(b"update-write-test")
+        except OSError as exc:
+            raise RuntimeError(
+                "Der EXE-Ordner ist nicht beschreibbar; Update bitte als Benutzer "
+                "mit Schreibrechten starten") from exc
+        finally:
+            probe.unlink(missing_ok=True)
+
+        update_dir = Path(tempfile.mkdtemp(prefix="system-tricorder-update-"))
+        candidate = update_dir / GITHUB_WINDOWS_ASSET
+        try:
+            self._download_to_path(
+                url, candidate, expected_size=size, max_size=200_000_000,
+                expected_sha256=match.group(1), timeout=300,
+            )
+            self._validate_windows_candidate(candidate, release_version)
+            self.prepared_exe_update = str(candidate)
+            self.target_version = tag
+        except Exception:
+            shutil.rmtree(update_dir, ignore_errors=True)
+            raise
+
+    def _stage_source_release(
+        self, tag: str, release_version: Tuple[int, int, int],
+    ) -> Path:
+        limits = {
+            "system_tricorder.py": 2 * 1024 * 1024,
+            "requirements.txt": 128 * 1024,
+            "assets/SystemTricorder.png": 8 * 1024 * 1024,
+        }
+        staging = Path(tempfile.mkdtemp(prefix="system-tricorder-source-update-"))
+        try:
+            for relative in _UPDATE_SOURCE_FILES:
+                encoded_path = urllib.parse.quote(relative, safe="/")
+                query = urllib.parse.urlencode({"ref": tag})
+                metadata = self._request_json(
+                    f"{GITHUB_API_URL}/contents/{encoded_path}?{query}")
+                size = metadata.get("size")
+                blob_sha = str(metadata.get("sha") or "").lower()
+                download_url = str(metadata.get("download_url") or "")
+                if (metadata.get("type") != "file" or metadata.get("path") != relative
+                        or not isinstance(size, int) or not 0 < size <= limits[relative]
+                        or re.fullmatch(r"[0-9a-f]{40}", blob_sha) is None):
+                    raise RuntimeError(f"Ungueltige GitHub-Metadaten fuer {relative}")
+                _validate_update_url(download_url)
+                expected_raw_path = f"/{GITHUB_REPO}/{tag}/{relative}"
+                raw_path = urllib.parse.unquote(
+                    urllib.parse.urlparse(download_url).path)
+                if raw_path.lower() != expected_raw_path.lower():
+                    raise RuntimeError(f"Unerwarteter GitHub-Quellpfad fuer {relative}")
+                destination = staging / relative
+                self._download_to_path(
+                    download_url, destination, expected_size=size,
+                    max_size=limits[relative], timeout=120,
+                )
+                if _git_blob_sha(destination.read_bytes()) != blob_sha:
+                    raise RuntimeError(f"Git-Blob-Pruefung fehlgeschlagen: {relative}")
+
+            source_text = (staging / "system_tricorder.py").read_text(
+                encoding="utf-8")
+            release_text = tag[1:] if tag.lower().startswith("v") else tag
+            if _version_tuple(release_text) != release_version:
+                raise RuntimeError("Release-Version wurde waehrend des Updates veraendert")
+            version_pattern = re.compile(
+                rf'^APP_VERSION\s*=\s*["\']{re.escape(release_text)}["\']\s*$',
+                re.MULTILINE,
+            )
+            if (version_pattern.search(source_text) is None
+                    or "class UpdateWorker(QThread):" not in source_text):
+                raise RuntimeError("Heruntergeladene Python-Quelle ist unvollstaendig")
+            requirements = (staging / "requirements.txt").read_text(
+                encoding="utf-8")
+            if "PyQt6" not in requirements or "psutil" not in requirements:
+                raise RuntimeError("Heruntergeladene requirements.txt ist unplausibel")
+            png = (staging / "assets" / "SystemTricorder.png").read_bytes()
+            if not png.startswith(b"\x89PNG\r\n\x1a\n"):
+                raise RuntimeError("Heruntergeladenes App-Icon ist keine PNG-Datei")
+            return staging
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+
+    def _install_standalone_source_update(
+        self, tag: str, release_version: Tuple[int, int, int],
+    ) -> None:
+        staging = self._stage_source_release(tag, release_version)
+        try:
+            self.requirements_changed = _install_staged_source_files(
+                staging, _app_start_dir())
+            self.target_version = tag
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    def _check_and_install(self) -> Tuple[bool, str]:
+        repo_root = _find_git_checkout(_app_start_dir())
+        if repo_root is not None:
+            return self._check_git_checkout(repo_root)
+
+        release, tag, release_version = self._latest_release()
+        current_version = _version_tuple(APP_VERSION)
+        if current_version is None:
+            raise RuntimeError(f"Lokale App-Version ist ungueltig: {APP_VERSION}")
+        if release_version <= current_version:
+            return (
+                True,
+                f"System Tricorder ist aktuell (v{APP_VERSION}). "
+                f"Lokale Settings bleiben in {CONFIG_FILE}.",
+            )
+
+        if getattr(sys, "frozen", False):
+            if platform.system() != "Windows":
+                return (
+                    False,
+                    "Automatische Standalone-Paketupdates werden derzeit nur "
+                    "fuer die Windows-EXE angeboten. Python-/Git-Installationen "
+                    "koennen direkt aktualisiert werden.",
+                )
+            self._prepare_standalone_exe_update(release, tag, release_version)
+            return (
+                True,
+                f"Verifiziertes GitHub-Release {tag} wurde heruntergeladen. "
+                "Die EXE wird nach dem Schliessen atomar ersetzt und neu gestartet. "
+                f"Lokale Settings bleiben unveraendert ({CONFIG_FILE}).",
+            )
+
+        self._install_standalone_source_update(tag, release_version)
+        dependency_note = (
+            " requirements.txt wurde aktualisiert; bei fehlenden Modulen bitte "
+            "'python -m pip install -r requirements.txt' ausfuehren."
+            if self.requirements_changed else ""
+        )
+        return (
+            True,
+            f"Standalone-Python wurde auf {tag} aktualisiert. Bitte die App neu "
+            f"starten. Lokale Settings blieben unveraendert ({CONFIG_FILE})."
+            + dependency_note,
         )
 
     def _rebuild_inputs_changed(self, repo_root: Path,
@@ -4853,7 +5459,7 @@ def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD  v2.7.4
+# MAIN DASHBOARD  v2.7.5
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TricorderDashboard(QMainWindow):
@@ -5276,11 +5882,41 @@ class TricorderDashboard(QMainWindow):
             worker is not None and getattr(worker, "rebuild_needed", False))
         deferred_pull_branch = str(
             getattr(worker, "deferred_pull_branch", "") if worker is not None else "")
+        prepared_exe_update = str(
+            getattr(worker, "prepared_exe_update", "") if worker is not None else "")
+        target_version = str(
+            getattr(worker, "target_version", "") if worker is not None else "")
         self._update_worker = None
         if worker is not None:
             worker.deleteLater()
         if not ok:
             QMessageBox.warning(self, "System Tricorder Update", message)
+            return
+        if prepared_exe_update:
+            QMessageBox.information(
+                self, "System Tricorder Update",
+                message + "\n\nDie App schliesst sich jetzt und startet "
+                f"anschliessend als {target_version or 'neue Version'} neu. "
+                "Details stehen in tricorder_release_update_<pid>.log im "
+                "TEMP-Ordner.",
+            )
+            update_path = Path(prepared_exe_update)
+            if self._spawn_standalone_exe_update(update_path):
+                self.close()
+            else:
+                try:
+                    update_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning("Could not remove prepared EXE update %s: %s",
+                                   update_path, exc)
+                with contextlib.suppress(OSError):
+                    update_path.parent.rmdir()
+                QMessageBox.warning(
+                    self, "System Tricorder Update",
+                    "Der verifizierte Download konnte nicht zur Installation "
+                    "uebergeben werden. Die laufende EXE blieb unveraendert. "
+                    "Bitte das Release notfalls manuell von GitHub laden.",
+                )
             return
         # Successful update.  If we're running from a frozen EXE and the pull
         # changed Python source, trigger a hands-off rebuild: spawn a detached
@@ -5307,6 +5943,45 @@ class TricorderDashboard(QMainWindow):
                 )
         else:
             QMessageBox.information(self, "System Tricorder Update", message)
+
+    def _spawn_standalone_exe_update(self, update_path: Path) -> bool:
+        """Hand a verified release EXE to the detached replacement helper."""
+        try:
+            update_path = update_path.resolve()
+            temp_root = Path(tempfile.gettempdir()).resolve()
+            if (not update_path.is_file()
+                    or not update_path.is_relative_to(temp_root)
+                    or not update_path.parent.name.startswith(
+                        "system-tricorder-update-")):
+                return False
+            exe_path = Path(sys.executable).resolve()
+            pid = os.getpid()
+            tmp_dir = Path(os.environ.get("TEMP", tempfile.gettempdir()))
+            bat_path = tmp_dir / f"tricorder_release_update_{pid}.bat"
+            log_path = tmp_dir / f"tricorder_release_update_{pid}.log"
+            bat_path.write_text(
+                _build_standalone_exe_update_bat(
+                    exe_path, update_path.resolve(), pid, log_path),
+                encoding="utf-8",
+            )
+            detached_process = 0x00000008
+            new_process_group = 0x00000200
+            create_no_window = 0x08000000
+            subprocess.Popen(
+                ["cmd.exe", "/c", str(bat_path)],
+                cwd=str(exe_path.parent),
+                creationflags=(detached_process | new_process_group
+                               | create_no_window),
+                close_fds=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            logger.info("Standalone EXE update helper spawned (log: %s)", log_path)
+            return True
+        except Exception as exc:
+            logger.warning("Standalone EXE update helper failed: %s", exc)
+            return False
 
     def _spawn_rebuild_and_restart(self, pull_branch: str = "") -> bool:
         """Spawn the detached Windows update/rebuild/relaunch helper."""
@@ -5820,4 +6495,9 @@ if __name__ == "__main__":
         # schedules _fit_window_to_content) — guarantees no scrollbar on first
         # launch.  The user can still maximise manually if preferred.
         win.show()
+    if (not _self_test and platform.system() == "Windows"
+            and getattr(sys, "frozen", False)):
+        # The detached updater leaves the previous EXE as a rollback until the
+        # new dashboard has survived startup for a few seconds.
+        QTimer.singleShot(5000, _cleanup_previous_exe_backup)
     sys.exit(app.exec())

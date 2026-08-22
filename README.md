@@ -2,7 +2,7 @@
 
 > A real-time hardware monitoring dashboard for Windows, macOS, and Linux — dark mode, 30 FPS, fully customisable free-form layout.
 
-![Version](https://img.shields.io/badge/version-2.7.4-00ff88?style=flat-square)
+![Version](https://img.shields.io/badge/version-2.7.5-00ff88?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
@@ -60,9 +60,9 @@ The package is written to `release/`. The bundled application uses `assets/Syste
 
 Press **✏ Edit Layout** in the toolbar to enter edit mode. All tiles highlight with a yellow accent border and gain two overlay buttons.
 
-Press **⬇ Update** to check GitHub for a newer version and install it via a fast-forward `git pull`. Your local layout/settings file (`~/.tricorder_layout.json`) is stored outside the repo and is not overwritten.
+Press **⬇ Update** to install the newest GitHub version. Git checkouts continue to use a safe fast-forward pull; a standalone Windows EXE downloads and verifies the matching release asset before replacing itself; a standalone Python copy updates its script, requirements, and runtime PNG from the immutable release tag. Your local layout/settings file (`~/.tricorder_layout.json`) is stored outside every installation and is never overwritten.
 
-> **One-time v2.7 upgrade note:** close a running v2.7 EXE before updating to v2.7.1, then download the v2.7.1 release EXE or run `git pull` and rebuild. The old v2.7 process predates the versioned-spec updater and can also keep the checked-in EXE locked. Automatic spec-based rebuilds apply from v2.7.1 onward.
+> **One-time v2.7.5 bootstrap note:** standalone EXEs up to v2.7.4 still contain the old Git-checkout-only updater. Download v2.7.5 once from GitHub Releases and replace the old EXE manually. Starting with v2.7.5, future standalone EXE updates work directly through **⬇ Update**.
 
 ### Controls on each tile
 
@@ -82,9 +82,13 @@ Press **⬇ Update** to check GitHub for a newer version and install it via a fa
 
 ### Update control
 
-| Button | Action |
-|--------|--------|
-| **⬇ Update** | Checks `DaWasteh/System-Tricorder` on GitHub and installs available updates without touching `~/.tricorder_layout.json` |
+| Installation | **⬇ Update** behaviour |
+|--------------|-------------------------|
+| Git checkout | Compares the active branch with GitHub and uses `git pull --ff-only --autostash` |
+| Standalone Windows EXE | Downloads the exact `windows-x86_64` release, verifies size, SHA-256, PE version and an isolated frozen self-test, then replaces/restarts with rollback protection |
+| Standalone Python | Downloads only `system_tricorder.py`, `requirements.txt`, and the runtime PNG from the latest stable tag; verifies Git blob IDs and installs all files atomically |
+
+All modes leave `~/.tricorder_layout.json` untouched. If standalone Python receives changed requirements, the app reports the exact `python -m pip install -r requirements.txt` command instead of silently modifying the environment.
 
 ### Arranging tiles freely
 
@@ -191,6 +195,16 @@ Use **Edit Layout → Reset** for the factory tile layout. Deleting the file add
 ---
 
 ## 🗂️ Changelog
+
+### v2.7.5
+
+- **Update-Button funktioniert für heruntergeladene Windows-EXEs** — ein lokaler Git-Checkout ist nicht mehr erforderlich; das neueste stabile GitHub-Release wird im Hintergrund geladen und die laufende EXE nach dem Schließen automatisch ersetzt und neu gestartet
+- **Mehrstufig verifizierter EXE-Download** — nur das exakte `SystemTricorder-windows-x86_64.exe`-Asset des festen Repositories wird akzeptiert; Größe, GitHub-SHA-256, PE-Dateiversion und ein isolierter Frozen-Self-Test müssen vor der Installation erfolgreich sein
+- **Rollbackfähiger Windows-Austausch** — ein separater Helper wartet auf die Freigabe der laufenden Datei, staged die neue EXE im Zielordner, behält die vorherige Version bis zum erfolgreichen Start als `.previous` und stellt sie bei Übergabefehlern wieder her
+- **Standalone-Python ohne Git aktualisierbar** — Script, `requirements.txt` und Runtime-PNG kommen vom unveränderlichen Release-Tag, werden gegen ihre Git-Blob-IDs geprüft und als gemeinsame Transaktion mit Rollback sowie Erhalt bestehender Dateirechte installiert
+- **Bestehende Git-Installationen unverändert unterstützt** — Branch-Vergleich, `--ff-only --autostash` und der automatische Windows-Rebuild für Checkout-EXEs bleiben erhalten; fremde Parent-Repositories werden nicht mehr versehentlich als Tricorder-Checkout akzeptiert
+- **Netzwerk- und Regression-Härtung** — feste HTTPS-Host-/Pfadregeln, Größenlimits, Retry bei transienten Verbindungsabbrüchen und neue Tests für Hashfehler, unsichere URLs/Pfade, atomaren Rollback, Backup-Cleanup und POSIX-Dateimodi
+- **Windows-Build 2.7.5.0** — lokale Onefile-EXE und Release-Metadaten wurden aktualisiert; Source-/Frozen-Self-Test sowie die vollständige plattformübergreifende CI sichern das Release ab
 
 ### v2.7.4
 

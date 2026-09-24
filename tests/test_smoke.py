@@ -1497,3 +1497,109 @@ def test_dashboard_constructs_headlessly(
     dashboard.hw_thread.stop()
     dashboard.close()
     qapp.processEvents()
+
+
+def test_sensor_poller_keeps_last_value_while_driver_call_blocks() -> None:
+    import threading
+    import time
+
+    release = threading.Event()
+    calls = []
+    teardown_threads = []
+
+    def poll():
+        calls.append(1)
+        if len(calls) == 2:
+            release.wait(5.0)      # simulated ~5 s ADLX stall
+        return len(calls)
+
+    poller = tricorder._SensorPoller(
+        "test", 0.01, poll,
+        teardown=lambda: teardown_threads.append(threading.current_thread().name))
+    poller.start()
+    deadline = time.monotonic() + 2.0
+    while poller.latest() is None and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert poller.latest() == 1
+
+    # The blocked call must not block readers; the value simply ages.
+    started = time.monotonic()
+    assert poller.latest() == 1
+    assert time.monotonic() - started < 0.1
+    time.sleep(0.05)
+    assert poller.latest(max_age=0.01) is None
+    assert poller.latest(max_age=10.0) == 1
+
+    release.set()
+    poller.request_stop()
+    poller.join(2.0)
+    assert not poller.is_alive()
+    assert teardown_threads == ["tricorder-test"]
+
+
+def test_windows_disk_poller_computes_rates(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(tricorder.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(tricorder, "NVML_AVAILABLE", False)
+    monkeypatch.setattr(tricorder, "get_dxgi_adapter_map", lambda: {})
+    monitor = tricorder.HardwareMonitorThread(
+        drive_info=[("PhysicalDrive0", "C:")],
+        dgpu_info=[("AMD Radeon Test", 16.0, "0x1234")],
+    )
+    mib = 1024 * 1024
+    samples = iter([
+        (SimpleNamespace(read_bytes=0, write_bytes=0),
+         {"PhysicalDrive0": SimpleNamespace(read_bytes=0, write_bytes=0)}),
+        (SimpleNamespace(read_bytes=20 * mib, write_bytes=10 * mib),
+         {"PhysicalDrive0": SimpleNamespace(read_bytes=20 * mib, write_bytes=10 * mib)}),
+    ])
+    current = {}
+
+    def disk_io_counters(perdisk: bool = False):
+        if not perdisk:
+            current["pair"] = next(samples)
+            return current["pair"][0]
+        return current["pair"][1]
+
+    times = iter((100.0, 102.0))
+    monkeypatch.setattr(tricorder.psutil, "disk_io_counters", disk_io_counters)
+    monkeypatch.setattr(tricorder.time, "monotonic", lambda: next(times))
+    monitor._setup_disk()
+    rmb, wmb, drives = monitor._poll_disk()
+    monkeypatch.undo()
+    assert rmb == pytest.approx(10.0)
+    assert wmb == pytest.approx(5.0)
+    assert drives[0].label == "C:"
+    assert drives[0].read_mbps == pytest.approx(10.0)
+    assert drives[0].write_mbps == pytest.approx(5.0)
+
+
+def test_adlx_close_unloads_dll_for_safe_reinit(monkeypatch: pytest.MonkeyPatch) -> None:
+    freed = []
+
+    class FakeFreeLibrary:
+        argtypes = None
+
+        def __call__(self, handle):
+            freed.append(handle.value)
+            return 1
+
+    class FakeKernel32:
+        FreeLibrary = FakeFreeLibrary()
+
+    monkeypatch.setattr(tricorder.ctypes, "WinDLL", lambda _name: FakeKernel32(),
+                        raising=False)
+    sampler = tricorder._AdlxGpuSampler.__new__(tricorder._AdlxGpuSampler)
+    sampler._ok = True
+    sampler._started = False
+    sampler._initialized = True
+    sampler._terminate = lambda: 0
+    sampler._gpus = []
+    sampler._perf = tricorder.ctypes.c_void_p()
+    sampler._system = tricorder.ctypes.c_void_p()
+    sampler._dll = type("FakeDll", (), {"_handle": 0x1234})()
+    sampler.close()
+    assert freed == [0x1234]
+    assert sampler._dll is None
+    assert not sampler.ok

@@ -2,7 +2,7 @@
 
 > A real-time hardware monitoring dashboard for Windows, macOS, and Linux — Light-/Darkmode, 30 FPS, fully customisable free-form layout.
 
-![Version](https://img.shields.io/badge/version-2.7.6-00ff88?style=flat-square)
+![Version](https://img.shields.io/badge/version-2.7.7-00ff88?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
@@ -204,6 +204,16 @@ Use **Edit Layout → Reset** for the factory tile layout. Deleting the file add
 ---
 
 ## 🗂️ Changelog
+
+### v2.7.7
+
+- **Kein Einfrieren mehr bei Last** — die AMD-Treiber-API ADLX blockiert bei Treiber-Ereignissen (z. B. wenn ein weiterer ADLX-Client startet) oder unter hoher GPU-Last systemweit für bis zu ~5 s; weil alle Sensoren seriell in einer Schleife liefen, stand dabei das gesamte Dashboard still. ADLX, NVML, Energy Meter (CPU-Watt), GPU-Speicher und Laufwerks-I/O laufen jetzt jeweils in eigenen Sensor-Threads; ein hängender Treiber lässt nur seinen eigenen Wert altern (nach 2 s Fallback auf die WDDM-Zähler), alle anderen Kacheln laufen flüssig weiter
+- **Höhere Scheduler-Priorität** — der Tricorder läuft unter Windows mit `ABOVE_NORMAL`, die Mess-Threads mit `THREAD_PRIORITY_HIGHEST`; bei voller CPU-Last durch Builds, Games oder lokale LLMs wird das Dashboard nicht mehr vom Scheduler ausgehungert (vorher Einbruch auf 2–12 FPS, jetzt konstant)
+- **Echte 30 FPS** — der UI-Timer nutzt jetzt einen präzisen Timer; der grobe Windows-Timer hatte 33 ms auf ~47 ms gerundet und die Anzeige auf ~21 FPS begrenzt
+- **ADLX-Neuinitialisierung repariert** — ein erneutes `ADLXInitialize` nach `ADLXTerminate` löste eine Access Violation aus; die DLL wird jetzt wie im AMD-ADLXHelper nach dem Beenden entladen, sodass die automatische Wiederverbindung nach Treiber-Resets funktioniert
+- **Bessere Diagnose** — langsame Sensoraufrufe werden im Log mit Sensorname protokolliert (`Slow adlx sensor call: … (dashboard unaffected)`)
+- **Regressionstests erweitert** — blockierender Sensor ohne Auswirkung auf Leser, Teardown im Sensor-Thread, Laufwerksraten und DLL-Entladung beim ADLX-Close
+- **Windows-Build 2.7.7.0** — Onefile-EXE und Dateimetadaten wurden für v2.7.7 aktualisiert
 
 ### v2.7.6
 

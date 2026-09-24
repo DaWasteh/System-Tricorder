@@ -38,7 +38,7 @@ import psutil
 from pathlib import Path
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from datetime import datetime
 
 # ── High-DPI scaling helpers ──────────────────────────────────────────────────
@@ -141,7 +141,7 @@ except ImportError:
 # ── Layout / window config ────────────────────────────────────────────────────
 CONFIG_FILE = Path.home() / ".tricorder_layout.json"
 CONFIG_VERSION = "1.0"
-APP_VERSION = "2.7.6"
+APP_VERSION = "2.7.7"
 GITHUB_REPO = "DaWasteh/System-Tricorder"
 GITHUB_REPO_URL = f"https://github.com/{GITHUB_REPO}.git"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}"
@@ -1448,7 +1448,16 @@ class _AdlxGpuSampler:
         self._initialized = False
         self._system = ctypes.c_void_p()
         self._terminate = None
+        # ADLXInitialize crashes (access violation) when called again after
+        # ADLXTerminate while the DLL is still mapped.  Unload it like AMD's
+        # own ADLXHelper does so a later re-init starts from a fresh module.
+        handle = getattr(self._dll, "_handle", None)
         self._dll = None
+        if handle:
+            with contextlib.suppress(Exception):
+                kernel32 = ctypes.WinDLL("kernel32")    # type: ignore[attr-defined]
+                kernel32.FreeLibrary.argtypes = [ctypes.c_void_p]
+                kernel32.FreeLibrary(ctypes.c_void_p(handle))
 
 
 def get_wmi_gpu_list() -> List[Tuple[str, bool, float, str]]:
@@ -1874,6 +1883,127 @@ class SystemMetrics:
 # HARDWARE MONITOR THREAD  (30 FPS)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _raise_current_thread_priority() -> None:
+    """Keep telemetry threads responsive while games/builds saturate the CPU.
+
+    The sampling threads need well under 5 % of one core, so running them
+    above the default level costs nothing, but it prevents the Windows
+    scheduler from starving them behind above-normal game or LLM threads.
+    """
+    if platform.system() != "Windows":
+        return
+    with contextlib.suppress(Exception):
+        kernel32 = ctypes.WinDLL("kernel32")                    # type: ignore[attr-defined]
+        kernel32.GetCurrentThread.restype = ctypes.c_void_p
+        kernel32.SetThreadPriority.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        kernel32.SetThreadPriority(kernel32.GetCurrentThread(), 2)   # THREAD_PRIORITY_HIGHEST
+
+
+def _raise_process_priority() -> None:
+    """Run the dashboard ABOVE_NORMAL, like Task Manager runs above normal.
+
+    With NORMAL priority a monitor is scheduled behind every above-normal
+    game, shader-compiler or inference thread and visibly stalls exactly when
+    the user wants to watch the load.
+    """
+    if platform.system() != "Windows":
+        return
+    with contextlib.suppress(Exception):
+        psutil.Process().nice(psutil.ABOVE_NORMAL_PRIORITY_CLASS)   # type: ignore[attr-defined]
+
+
+class _SensorPoller:
+    """Poll one slow driver sensor in its own thread and cache its result.
+
+    Driver APIs such as ADLX, NVML, the Energy Meter and disk IOCTLs can block
+    for seconds (ADLX stalls ~5 s system-wide whenever the AMD driver
+    re-enumerates, e.g. when another ADLX client starts).  Called inline, one
+    stalled sensor froze every tile.  Here it only ages its own cached value
+    while the 30 FPS frame keeps flowing.
+
+    ``poll`` returns the new value or ``None`` for "no data this time".
+    ``setup``/``teardown`` run inside the poller thread so thread-affine
+    driver sessions are created, used and closed on the same thread.
+    """
+
+    def __init__(self, name: str, interval: float, poll: Callable[[], Any],
+                 setup: Optional[Callable[[], None]] = None,
+                 teardown: Optional[Callable[[], None]] = None) -> None:
+        self.name = name
+        self._interval = interval
+        self._poll = poll
+        self._setup = setup
+        self._teardown = teardown
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._value: Any = None
+        self._stamp = 0.0
+        self._last_slow_warning = 0.0
+        self._thread = threading.Thread(
+            target=self._run, name=f"tricorder-{name}", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def latest(self, max_age: Optional[float] = None) -> Any:
+        """Newest value, or ``None`` when there is none younger than max_age."""
+        with self._lock:
+            if self._value is None:
+                return None
+            if max_age is not None and time.monotonic() - self._stamp > max_age:
+                return None
+            return self._value
+
+    def _run(self) -> None:
+        _raise_current_thread_priority()
+        try:
+            if self._setup is not None:
+                self._setup()
+            next_tick = time.monotonic()
+            while not self._stop_event.is_set():
+                started = time.monotonic()
+                try:
+                    value = self._poll()
+                except Exception as exc:
+                    logger.debug("%s poll failed: %s", self.name, exc)
+                    value = None
+                finished = time.monotonic()
+                if value is not None:
+                    with self._lock:
+                        self._value = value
+                        self._stamp = finished
+                if (finished - started >= 0.5
+                        and finished - self._last_slow_warning >= 60.0):
+                    self._last_slow_warning = finished
+                    logger.warning("Slow %s sensor call: %.3f s (dashboard unaffected)",
+                                   self.name, finished - started)
+                next_tick += self._interval
+                delay = next_tick - time.monotonic()
+                if delay <= 0:
+                    # No catch-up burst after a stalled driver call.
+                    next_tick = time.monotonic()
+                    delay = 0.0
+                self._stop_event.wait(delay)
+        except Exception as exc:
+            logger.warning("%s sensor thread stopped: %s", self.name, exc)
+        finally:
+            if self._teardown is not None:
+                with contextlib.suppress(Exception):
+                    self._teardown()
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def request_stop(self) -> None:
+        self._stop_event.set()
+
+    def join(self, timeout: float) -> None:
+        """Wait for teardown.  A thread stuck in a driver call stays a daemon;
+        its driver session is then never closed from a foreign thread."""
+        if self._thread.is_alive() and self._thread is not threading.current_thread():
+            self._thread.join(max(timeout, 0.0))
+
+
 class HardwareMonitorThread(QThread):
     # Metrics are handed to the UI via a lock-protected latest-value slot
     # instead of a queued pyqtSignal: with a queued signal, every frame the UI
@@ -1912,14 +2042,13 @@ class HardwareMonitorThread(QThread):
         self._pdh_energy:     Optional[_PdhEnergySampler] = None
         self._adlx:           Optional[_AdlxGpuSampler] = None
         self._adlx_cache:     List[dict] = []
-        self._last_adlx_query = 0.0
         self._last_adlx_success = 0.0
         self._next_adlx_retry = 0.0
-        self._last_memory_query = 0.0
-        self._last_memory_success = 0.0
         self._last_power_query = 0.0
         self._last_power_success = 0.0
         self._cpu_power_watts: Optional[float] = None
+        self._pollers:        Dict[str, _SensorPoller] = {}
+        self._driver_calls_in_flight = False
 
         # Linux-specific fields
         self._linux_gpus:     List[dict] = []
@@ -2027,7 +2156,7 @@ class HardwareMonitorThread(QThread):
 
         # Standard WDDM NVIDIA cards are visible to PDH but still need NVML for
         # total-board power.  Bind handles once by PCI device id (name fallback)
-        # and sample them at the same 4 Hz cadence as ADLX.
+        # and sample them at the same 4 Hz cadence as ADLX (own sensor thread).
         self._nvml_wddm_handles: Dict[int, Any] = {}
         if NVML_AVAILABLE:
             try:
@@ -2071,8 +2200,6 @@ class HardwareMonitorThread(QThread):
                 logger.debug("Windows NVML handle mapping: %s", exc)
 
         self._nvml_win_cache: Dict[int, dict] = {}
-        self._last_nvml_query = 0.0
-        self._last_nvml_success = 0.0
 
         self._luid_device_map = get_dxgi_adapter_map()
         self._last_dxgi_refresh = time.monotonic()
@@ -2323,38 +2450,20 @@ class HardwareMonitorThread(QThread):
     # WINDOWS MONITORING LOOP
     # ══════════════════════════════════════════════════════════════════════
     def _run_windows(self) -> None:
-        # Driver/performance-counter APIs are initialized inside this worker
-        # thread so startup and the Qt event loop never wait on sensor setup.
+        _raise_current_thread_priority()
+        # The PDH GPU-engine query is a cheap kernel counter (<2 ms even under
+        # full load) and stays in this 30 FPS loop.  Every driver-backed
+        # sensor that was observed to block (ADLX for ~5 s, NVML, Energy
+        # Meter, disk IOCTLs) runs in its own _SensorPoller, so a stalled
+        # driver ages one value instead of freezing the whole dashboard.
+        # WMI is not polled at all: COM/perflib calls can block for seconds.
         self._pdh = _PdhGpuSampler()
-        self._pdh_memory = _PdhGpuMemorySampler()
-        self._pdh_energy = _PdhEnergySampler()
-        self._adlx = _AdlxGpuSampler() if self._has_amd_gpu else None
         self._adlx_cache = []
-        self._last_adlx_query = 0.0
-        self._last_adlx_success = time.monotonic()
-        self._next_adlx_retry = self._last_adlx_success + 30.0
         self._nvml_win_cache = {}
-        self._last_nvml_query = 0.0
-        self._last_nvml_success = 0.0
-        self._last_memory_query = 0.0
-        self._last_memory_success = 0.0
-        self._last_power_query = 0.0
-        self._last_power_success = 0.0
+        self._vram_cache = {}
         self._cpu_power_watts = None
+        self._start_windows_pollers()
 
-        # WMI remains a one-shot inventory source only.  It is deliberately
-        # absent from this hot loop: COM/perflib calls can block for seconds and
-        # were the main source of visible telemetry pauses under heavy AI load.
-
-        try:
-            self._last_io = psutil.disk_io_counters()
-            self._last_io_per = psutil.disk_io_counters(perdisk=True) or {}
-        except Exception as exc:
-            self._log_sensor_error("Disk", exc)
-            self._last_io = None
-            self._last_io_per = {}
-        self._last_disk_t = time.monotonic()
-        self._last_disk_query = self._last_disk_t
         rmb = wmb = 0.0
         drives = [DriveMetrics(key=key, label=label, read_mbps=0.0, write_mbps=0.0)
                   for key, label in self._drive_info]
@@ -2368,42 +2477,9 @@ class HardwareMonitorThread(QThread):
             try:
                 now = loop_started
 
-                # Disk enumeration is comparatively expensive on a nine-drive
-                # workstation and does not benefit from 30 Hz polling.  Read it
-                # at 10 Hz, isolate failures (including WinError 1450), and keep
-                # publishing the last good frame instead of freezing all tiles.
-                if now - self._last_disk_query >= 0.1:
-                    self._last_disk_query = now
-                    disk_dt = max(now - self._last_disk_t, 0.001)
-                    try:
-                        io_agg = psutil.disk_io_counters()
-                        io_per = psutil.disk_io_counters(perdisk=True) or {}
-                        next_rmb = next_wmb = 0.0
-                        if io_agg and self._last_io:
-                            next_rmb = max(0.0, (io_agg.read_bytes - self._last_io.read_bytes)
-                                           / (1024 * 1024) / disk_dt)
-                            next_wmb = max(0.0, (io_agg.write_bytes - self._last_io.write_bytes)
-                                           / (1024 * 1024) / disk_dt)
-                        next_drives: List[DriveMetrics] = []
-                        for key, label in self._drive_info:
-                            if key in io_per and key in self._last_io_per:
-                                read_mbps = max(
-                                    0.0, (io_per[key].read_bytes - self._last_io_per[key].read_bytes)
-                                    / (1024 * 1024) / disk_dt)
-                                write_mbps = max(
-                                    0.0, (io_per[key].write_bytes - self._last_io_per[key].write_bytes)
-                                    / (1024 * 1024) / disk_dt)
-                            else:
-                                read_mbps = write_mbps = 0.0
-                            next_drives.append(DriveMetrics(
-                                key=key, label=label,
-                                read_mbps=read_mbps, write_mbps=write_mbps))
-                        self._last_io = io_agg
-                        self._last_io_per = io_per
-                        self._last_disk_t = now
-                        rmb, wmb, drives = next_rmb, next_wmb, next_drives
-                    except Exception as exc:
-                        self._log_sensor_error("Disk", exc)
+                disk = self._latest_poll("disk")
+                if disk is not None:
+                    rmb, wmb, drives = disk
 
                 # CPU and RAM failures are independent from GPU/disk telemetry;
                 # keep the last values and still publish a complete frame.
@@ -2423,76 +2499,14 @@ class HardwareMonitorThread(QThread):
                 except Exception as exc:
                     self._log_sensor_error("RAM", exc)
 
-                # ADLX updates at a driver-defined cadence (minimum 250 ms).
-                # Cache its latest frame rather than making redundant calls at
-                # the 30 FPS UI/PDH rate.
-                if (self._adlx is not None and self._adlx.ok
-                        and now - self._last_adlx_query >= 0.25):
-                    self._last_adlx_query = now
-                    adlx_sample = self._adlx.sample()
-                    if adlx_sample:
-                        self._adlx_cache = adlx_sample
-                        self._last_adlx_success = now
-                        self._next_adlx_retry = now + 5.0
-                    elif now - self._last_adlx_success >= 1.0:
-                        # Never leave a stale 100 % / high-power value visible
-                        # after a driver reset or failed ADLX session.
-                        self._adlx_cache = []
-                adlx_stale = now - self._last_adlx_success >= 5.0
-                if (self._has_amd_gpu
-                        and (self._adlx is None or not self._adlx.ok or adlx_stale)
-                        and now >= self._next_adlx_retry):
-                    if self._adlx is not None:
-                        self._adlx.close()
-                    self._adlx = _AdlxGpuSampler()
-                    self._next_adlx_retry = now + (5.0 if self._adlx.ok else 30.0)
-                    if not self._adlx.ok:
-                        self._adlx_cache = []
-
-                if (self._nvml_wddm_handles
-                        and now - self._last_nvml_query >= 0.25):
-                    self._last_nvml_query = now
-                    nvml_cache: Dict[int, dict] = {}
-                    for gpu_index, handle in self._nvml_wddm_handles.items():
-                        util, used_gb, total_gb = _read_nvml_gpu(handle)
-                        if total_gb > 0:
-                            nvml_cache[gpu_index] = {
-                                "usage_percent": util,
-                                "vram_used_gb": used_gb,
-                                "power_watts": _read_nvml_power_watts(handle),
-                            }
-                    if nvml_cache:
-                        self._nvml_win_cache = nvml_cache
-                        self._last_nvml_success = now
-                    elif now - self._last_nvml_success >= 2.0:
-                        self._nvml_win_cache = {}
-
-                # Dedicated VRAM and CPU package power change much more slowly
-                # than engine utilization.  Native PDH reads at 2/4 Hz replace
-                # the old synchronous WMI query that could stall for seconds.
-                if (self._pdh_memory is not None and self._pdh_memory.ok
-                        and now - self._last_memory_query >= 0.5):
-                    self._last_memory_query = now
-                    memory_rows = self._pdh_memory.sample()
-                    if memory_rows:
-                        self._last_memory_success = now
-                        vram_cache: Dict[str, float] = {}
-                        for instance, dedicated_bytes in memory_rows:
-                            luid = instance.split('_phys')[0]
-                            used_gb = max(dedicated_bytes, 0.0) / (1024 ** 3)
-                            vram_cache[luid] = max(vram_cache.get(luid, 0.0), used_gb)
-                        self._vram_cache = vram_cache
-                    elif now - self._last_memory_success >= 5.0:
-                        self._vram_cache = {}
-                if (self._pdh_energy is not None and self._pdh_energy.ok
-                        and now - self._last_power_query >= 0.25):
-                    self._last_power_query = now
-                    cpu_power = _cpu_package_power_from_pdh(self._pdh_energy.sample())
-                    if cpu_power is not None:
-                        self._cpu_power_watts = cpu_power
-                        self._last_power_success = now
-                    elif now - self._last_power_success >= 2.0:
-                        self._cpu_power_watts = None
+                # Driver values expire instead of freezing: never leave a
+                # stale 100 % / high-power reading visible after a driver
+                # reset, hung ADLX session or removed card.
+                self._adlx_cache = self._latest_poll("adlx", 2.0) or []
+                self._nvml_win_cache = self._latest_poll("nvml", 2.0) or {}
+                self._vram_cache = self._latest_poll("vram", 5.0) or {}
+                self._cpu_power_watts = self._latest_poll("cpu_power", 2.0)
+                nvml_tcc: Dict[str, GPUMetrics] = self._latest_poll("nvml_tcc", 2.0) or {}
 
                 # ── GPU (PDH engine split + ADLX overall AMD load) ─────────
                 igpu_p = 0.0
@@ -2662,7 +2676,8 @@ class HardwareMonitorThread(QThread):
                     # TCC-mode NVIDIA GPUs: invisible to DXGI/perf counters —
                     # read utilization and VRAM directly via NVML.
                     if dev_id.startswith("nvml:"):
-                        gpus.append(self._read_nvml_win_gpu(name, vram_total, dev_id))
+                        gpus.append(nvml_tcc.get(dev_id) or GPUMetrics(
+                            name=name, luid=dev_id, gpu_vram_total_gb=vram_total))
                         continue
 
                     candidates = device_to_luids.get(dev_id)
@@ -2750,14 +2765,158 @@ class HardwareMonitorThread(QThread):
 
         self._close_windows_samplers()
 
+    # ── Windows background sensors ─────────────────────────────────────────
+    def _start_windows_pollers(self) -> None:
+        pollers = [_SensorPoller("disk", 0.1, self._poll_disk, setup=self._setup_disk)]
+        if self._has_amd_gpu:
+            pollers.append(_SensorPoller(
+                "adlx", 0.25, self._poll_adlx,
+                setup=self._setup_adlx, teardown=lambda: self._close_sampler("_adlx")))
+        if self._nvml_wddm_handles:
+            pollers.append(_SensorPoller("nvml", 0.25, self._poll_nvml_wddm))
+        if self._nvml_win_handles:
+            pollers.append(_SensorPoller("nvml_tcc", 1.0 / 15.0, self._poll_nvml_tcc))
+        pollers.append(_SensorPoller(
+            "vram", 0.5, self._poll_vram,
+            setup=lambda: setattr(self, "_pdh_memory", _PdhGpuMemorySampler()),
+            teardown=lambda: self._close_sampler("_pdh_memory")))
+        pollers.append(_SensorPoller(
+            "cpu_power", 0.25, self._poll_cpu_power,
+            setup=lambda: setattr(self, "_pdh_energy", _PdhEnergySampler()),
+            teardown=lambda: self._close_sampler("_pdh_energy")))
+        self._pollers = {poller.name: poller for poller in pollers}
+        for poller in pollers:
+            poller.start()
+
+    def _latest_poll(self, name: str, max_age: Optional[float] = None) -> Any:
+        poller = self._pollers.get(name)
+        return poller.latest(max_age) if poller is not None else None
+
+    def _setup_disk(self) -> None:
+        try:
+            self._last_io = psutil.disk_io_counters()
+            self._last_io_per = psutil.disk_io_counters(perdisk=True) or {}
+        except Exception as exc:
+            self._log_sensor_error("Disk", exc)
+            self._last_io = None
+            self._last_io_per = {}
+        self._last_disk_t = time.monotonic()
+
+    def _poll_disk(self) -> Optional[Tuple[float, float, List[DriveMetrics]]]:
+        # Disk enumeration is comparatively expensive on a many-drive
+        # workstation and can wait for a sleeping HDD to spin up; 10 Hz in
+        # this thread is plenty.  Failures (including WinError 1450) keep the
+        # last good rates on screen.
+        try:
+            io_agg = psutil.disk_io_counters()
+            io_per = psutil.disk_io_counters(perdisk=True) or {}
+        except Exception as exc:
+            self._log_sensor_error("Disk", exc)
+            return None
+        now = time.monotonic()
+        disk_dt = max(now - self._last_disk_t, 0.001)
+        mib = 1024 * 1024
+        rmb = wmb = 0.0
+        if io_agg and self._last_io:
+            rmb = max(0.0, (io_agg.read_bytes - self._last_io.read_bytes) / mib / disk_dt)
+            wmb = max(0.0, (io_agg.write_bytes - self._last_io.write_bytes) / mib / disk_dt)
+        drives: List[DriveMetrics] = []
+        for key, label in self._drive_info:
+            read_mbps = write_mbps = 0.0
+            if key in io_per and key in self._last_io_per:
+                read_mbps = max(0.0, (io_per[key].read_bytes
+                                      - self._last_io_per[key].read_bytes) / mib / disk_dt)
+                write_mbps = max(0.0, (io_per[key].write_bytes
+                                       - self._last_io_per[key].write_bytes) / mib / disk_dt)
+            drives.append(DriveMetrics(key=key, label=label,
+                                       read_mbps=read_mbps, write_mbps=write_mbps))
+        self._last_io = io_agg
+        self._last_io_per = io_per
+        self._last_disk_t = now
+        return rmb, wmb, drives
+
+    def _setup_adlx(self) -> None:
+        self._adlx = _AdlxGpuSampler()
+        self._last_adlx_success = time.monotonic()
+        self._next_adlx_retry = self._last_adlx_success + 30.0
+
+    def _poll_adlx(self) -> Optional[List[dict]]:
+        # ADLX updates at a driver-defined cadence (minimum 250 ms).
+        sample = self._adlx.sample() if self._adlx is not None and self._adlx.ok else []
+        now = time.monotonic()
+        if sample:
+            self._last_adlx_success = now
+            self._next_adlx_retry = now + 5.0
+            return sample
+        # Persistently empty samples mean a dead session (e.g. after a driver
+        # reset).  Re-open it with back-off; close() unloads the DLL so the
+        # re-initialization is safe.
+        if ((self._adlx is None or not self._adlx.ok
+             or now - self._last_adlx_success >= 5.0)
+                and now >= self._next_adlx_retry):
+            self._close_sampler("_adlx")
+            self._adlx = _AdlxGpuSampler()
+            self._next_adlx_retry = now + (5.0 if self._adlx.ok else 30.0)
+        return None
+
+    def _poll_nvml_wddm(self) -> Optional[Dict[int, dict]]:
+        # Standard WDDM NVIDIA cards: board power (and driver load/VRAM).
+        cache: Dict[int, dict] = {}
+        for gpu_index, handle in self._nvml_wddm_handles.items():
+            util, used_gb, total_gb = _read_nvml_gpu(handle)
+            if total_gb > 0:
+                cache[gpu_index] = {
+                    "usage_percent": util,
+                    "vram_used_gb": used_gb,
+                    "power_watts": _read_nvml_power_watts(handle),
+                }
+        return cache or None
+
+    def _poll_nvml_tcc(self) -> Optional[Dict[str, GPUMetrics]]:
+        # TCC-mode NVIDIA GPUs are invisible to DXGI/perf counters.
+        return {
+            dev_key: self._read_nvml_win_gpu(name, vram_total, dev_key)
+            for name, vram_total, dev_key in self._dgpu_info
+            if dev_key.startswith("nvml:")
+        } or None
+
+    def _poll_vram(self) -> Optional[Dict[str, float]]:
+        # Dedicated VRAM changes slowly; native PDH replaces the old WMI query.
+        if self._pdh_memory is None or not self._pdh_memory.ok:
+            return None
+        vram_cache: Dict[str, float] = {}
+        for instance, dedicated_bytes in self._pdh_memory.sample():
+            luid = instance.split('_phys')[0]
+            used_gb = max(dedicated_bytes, 0.0) / (1024 ** 3)
+            vram_cache[luid] = max(vram_cache.get(luid, 0.0), used_gb)
+        return vram_cache or None
+
+    def _poll_cpu_power(self) -> Optional[float]:
+        if self._pdh_energy is None or not self._pdh_energy.ok:
+            return None
+        return _cpu_package_power_from_pdh(self._pdh_energy.sample())
+
+    def _close_sampler(self, attr: str) -> None:
+        sampler = getattr(self, attr, None)
+        if sampler is not None:
+            with contextlib.suppress(Exception):
+                sampler.close()
+            setattr(self, attr, None)
+
     def _close_windows_samplers(self) -> None:
-        """Close native sensors idempotently, preferably in the worker thread."""
-        for attr in ("_adlx", "_pdh", "_pdh_memory", "_pdh_energy"):
-            sampler = getattr(self, attr, None)
-            if sampler is not None:
-                with contextlib.suppress(Exception):
-                    sampler.close()
-                setattr(self, attr, None)
+        """Stop sensor threads and close native sensors idempotently."""
+        pollers = list(self._pollers.values())
+        self._pollers = {}
+        for poller in pollers:
+            poller.request_stop()
+        deadline = time.monotonic() + 2.0
+        for poller in pollers:
+            poller.join(deadline - time.monotonic())
+        # Pollers close their own driver sessions in-thread.  One that is
+        # still stuck in a driver call must not have NVML torn down under it.
+        if any(poller.is_alive() for poller in pollers):
+            self._driver_calls_in_flight = True
+        self._close_sampler("_pdh")
 
     def stop(self) -> None:
         self._running = False
@@ -2766,7 +2925,7 @@ class HardwareMonitorThread(QThread):
             # Normally already closed at the end of _run_windows.  This also
             # covers a monitor object that was constructed but never started.
             self._close_windows_samplers()
-        if NVML_AVAILABLE:
+        if NVML_AVAILABLE and not self._driver_calls_in_flight:
             with contextlib.suppress(Exception):
                 pynvml.nvmlShutdown()                                  # type: ignore
 
@@ -5949,6 +6108,7 @@ class TricorderDashboard(QMainWindow):
         # update overruns the interval, the next tick simply picks up the
         # newest frame — no event-queue backlog, no replayed stale frames.
         self._metrics_timer = QTimer(self)
+        self._metrics_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._metrics_timer.timeout.connect(self._poll_metrics)
         self._metrics_timer.start(33)
 
@@ -7005,6 +7165,7 @@ if __name__ == "__main__":
         )
 
     sys.excepthook = _excepthook
+    _raise_process_priority()
 
     app = QApplication([sys.argv[0]] if _self_test else sys.argv)
     app.setApplicationName("System Tricorder")

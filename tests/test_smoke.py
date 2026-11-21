@@ -68,23 +68,23 @@ def test_metric_defaults() -> None:
 
 
 def test_release_versions_are_synchronized() -> None:
-    assert tricorder.APP_VERSION == "2.7.7"
+    assert tricorder.APP_VERSION == "2.7.8"
     assert tricorder.CONFIG_VERSION == "1.0"
     root = Path(tricorder.__file__).parent
     version_info = (root / "assets" / "version_info.txt").read_text(encoding="utf-8")
     for expected in (
-        "filevers=(2, 7, 7, 0)",
-        "prodvers=(2, 7, 7, 0)",
-        "FileVersion', '2.7.7.0'",
-        "ProductVersion', '2.7.7.0'",
+        "filevers=(2, 7, 8, 0)",
+        "prodvers=(2, 7, 8, 0)",
+        "FileVersion', '2.7.8.0'",
+        "ProductVersion', '2.7.8.0'",
     ):
         assert expected in version_info
     readme = (root / "README.md").read_text(encoding="utf-8")
-    assert "version-2.7.7-00ff88" in readme
-    assert "### v2.7.7" in readme
+    assert "version-2.7.8-00ff88" in readme
+    assert "### v2.7.8" in readme
     if os.name == "nt":
         assert tricorder._windows_file_version(
-            root / "dist" / "system_tricorder.exe") == (2, 7, 7, 0)
+            root / "dist" / "system_tricorder.exe") == (2, 7, 8, 0)
     release_builder = (root / ".github" / "scripts" / "build_release.py").read_text(
         encoding="utf-8")
     assert 'generated_spec_dir = build_dir / "generated-spec"' in release_builder
@@ -1603,3 +1603,289 @@ def test_adlx_close_unloads_dll_for_safe_reinit(monkeypatch: pytest.MonkeyPatch)
     assert freed == [0x1234]
     assert sampler._dll is None
     assert not sampler.ok
+
+
+def test_autostart_mode_and_cli_parsing() -> None:
+    assert tricorder._normalise_autostart_mode("MAXIMIZED") == "maximized"
+    assert tricorder._normalise_autostart_mode("minimized") == "minimized"
+    assert tricorder._normalise_autostart_mode("invalid") == "normal"
+
+    assert tricorder._parse_startup_mode_arg([]) is None
+    assert tricorder._parse_startup_mode_arg(["--start-minimized"]) == "minimized"
+    assert tricorder._parse_startup_mode_arg(["--minimized"]) == "minimized"
+    assert tricorder._parse_startup_mode_arg(["--start-maximized"]) == "maximized"
+    assert tricorder._parse_startup_mode_arg(["--maximized"]) == "maximized"
+    assert tricorder._parse_startup_mode_arg(["--start-tray"]) == "tray"
+    assert tricorder._parse_startup_mode_arg(
+        ["--start-minimized", "--start-maximized"]) == "maximized"
+
+    assert tricorder._autostart_platform_label("Windows") == "Windows"
+    assert tricorder._autostart_platform_label("Darwin") == "macOS"
+    assert tricorder._autostart_platform_label("Linux") == "Linux"
+
+
+def test_autostart_command_and_desktop_escaping(tmp_path: Path) -> None:
+    exe_dir = tmp_path / "Program Files"
+    exe_dir.mkdir()
+    py_exe = exe_dir / "python.exe"
+    pyw_exe = exe_dir / "pythonw.exe"
+    script = exe_dir / "system_tricorder.py"
+    py_exe.write_bytes(b"")
+    pyw_exe.write_bytes(b"")
+    script.write_text("", encoding="utf-8")
+
+    cmd_win_src = tricorder._autostart_command(
+        "minimized",
+        system_name="Windows",
+        frozen=False,
+        executable=str(py_exe),
+        script_path=script,
+    )
+    assert cmd_win_src == [
+        str(pyw_exe.resolve()), str(script.resolve()), "--start-minimized"
+    ]
+
+    frozen_bin = exe_dir / "SystemTricorder"
+    frozen_bin.write_bytes(b"")
+    cmd_frozen_max = tricorder._autostart_command(
+        "maximized",
+        system_name="Linux",
+        frozen=True,
+        executable=str(frozen_bin),
+    )
+    assert cmd_frozen_max == [str(frozen_bin.resolve()), "--start-maximized"]
+
+    cmd_normal = tricorder._autostart_command(
+        "normal",
+        system_name="Darwin",
+        frozen=True,
+        executable=str(frozen_bin),
+    )
+    assert cmd_normal == [str(frozen_bin.resolve())]
+
+    escaped = tricorder._format_desktop_exec(
+        ["/opt/System Tricorder/app", "--flag=$HOME", "100%"])
+    assert escaped == '"/opt/System Tricorder/app" "--flag=\\$HOME" 100%%'
+
+
+def test_cross_platform_os_autostart_enable_and_disable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    fake_exe = tmp_path / "SystemTricorder"
+    fake_exe.write_bytes(b"")
+    monkeypatch.setattr(tricorder.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(tricorder.sys, "executable", str(fake_exe))
+
+    # Linux XDG autostart (.desktop)
+    xdg_dir = tmp_path / "xdg-config"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_dir))
+    tricorder._set_os_autostart(True, "minimized", system_name="Linux")
+    desktop_file = xdg_dir / "autostart" / "system-tricorder.desktop"
+    assert desktop_file.is_file()
+    assert tricorder._is_os_autostart_enabled(system_name="Linux")
+    desktop_text = desktop_file.read_text(encoding="utf-8")
+    assert "--start-minimized" in desktop_text
+    assert "X-GNOME-Autostart-enabled=true" in desktop_text
+    tricorder._set_os_autostart(False, system_name="Linux")
+    assert not desktop_file.exists()
+    assert not tricorder._is_os_autostart_enabled(system_name="Linux")
+
+    # macOS LaunchAgent (.plist)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    tricorder._set_os_autostart(True, "maximized", system_name="Darwin")
+    plist_file = (
+        tmp_path / "Library" / "LaunchAgents" / "com.dawasteh.system-tricorder.plist"
+    )
+    assert plist_file.is_file()
+    assert tricorder._is_os_autostart_enabled(system_name="Darwin")
+    plist_data = tricorder.plistlib.loads(plist_file.read_bytes())
+    assert plist_data["Label"] == "com.dawasteh.system-tricorder"
+    assert plist_data["RunAtLoad"] is True
+    assert plist_data["ProgramArguments"][-1] == "--start-maximized"
+    tricorder._set_os_autostart(False, system_name="Darwin")
+    assert not plist_file.exists()
+    assert not tricorder._is_os_autostart_enabled(system_name="Darwin")
+
+    # Windows Registry (HKCU\...\Run)
+    reg_store: dict[str, str] = {}
+
+    class FakeRegKey:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    class FakeWinReg:
+        HKEY_CURRENT_USER = object()
+        KEY_SET_VALUE = 2
+        KEY_QUERY_VALUE = 1
+        REG_SZ = 1
+
+        @staticmethod
+        def CreateKeyEx(_root, _subkey, _reserved, _access):
+            return FakeRegKey()
+
+        @staticmethod
+        def OpenKey(_root, _subkey, _reserved, _access):
+            return FakeRegKey()
+
+        @staticmethod
+        def SetValueEx(_key, name, _reserved, _typ, value):
+            reg_store[name] = value
+
+        @staticmethod
+        def QueryValueEx(_key, name):
+            if name not in reg_store:
+                raise FileNotFoundError(name)
+            return reg_store[name], 1
+
+        @staticmethod
+        def DeleteValue(_key, name):
+            if name not in reg_store:
+                raise FileNotFoundError(name)
+            del reg_store[name]
+
+    monkeypatch.setattr(tricorder, "WINREG_AVAILABLE", True)
+    monkeypatch.setattr(tricorder, "winreg", FakeWinReg)
+    tricorder._set_os_autostart(True, "minimized", system_name="Windows")
+    assert tricorder._is_os_autostart_enabled(system_name="Windows")
+    assert "--start-minimized" in reg_store["SystemTricorder"]
+    tricorder._set_os_autostart(False, system_name="Windows")
+    assert not tricorder._is_os_autostart_enabled(system_name="Windows")
+
+
+def test_options_dialog_controls_and_values(qapp: QApplication) -> None:
+    dlg = tricorder.OptionsDialog(
+        minimize_to_tray=False,
+        autostart_enabled=False,
+        autostart_mode="normal",
+        tray_available=True,
+    )
+    try:
+        assert not dlg._combo_mode.isEnabled()
+        assert dlg.values() == (False, False, "normal")
+
+        dlg._cb_autostart.setChecked(True)
+        assert dlg._combo_mode.isEnabled()
+        min_idx = dlg._combo_mode.findData("minimized")
+        dlg._combo_mode.setCurrentIndex(min_idx)
+        assert "Taskleiste" in dlg._mode_hint.text()
+
+        dlg._cb_tray.setChecked(True)
+        assert "System-Tray" in dlg._mode_hint.text()
+        assert dlg.values() == (True, True, "minimized")
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_dashboard_tray_minimize_restore_and_startup_modes(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "layout.json"
+    monkeypatch.setattr(tricorder.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(tricorder, "CONFIG_FILE", config_path)
+    monkeypatch.setattr(tricorder, "_get_cpu_topology", lambda: None)
+    monkeypatch.setattr(tricorder, "build_drive_info", lambda: [])
+    monkeypatch.setattr(tricorder.HardwareMonitorThread, "start", lambda self: None)
+    monkeypatch.setattr(tricorder.HardwareMonitorThread, "stop", lambda self: None)
+    monkeypatch.setattr(tricorder, "_system_tray_available", lambda: True)
+
+    recorded_autostart: list[tuple[bool, str]] = []
+    monkeypatch.setattr(
+        tricorder, "_set_os_autostart",
+        lambda enabled, mode="normal", **_kw: recorded_autostart.append((enabled, mode)),
+    )
+
+    class FakeTray:
+        def __init__(self, icon, parent=None) -> None:
+            self.icon = icon
+            self.parent = parent
+            self.visible = False
+            self.tooltip = ""
+            self.menu = None
+            self.activated = type(
+                "Sig", (), {"connect": lambda _self, _fn: None})()
+
+        def setToolTip(self, text: str) -> None:
+            self.tooltip = text
+
+        def setContextMenu(self, menu) -> None:
+            self.menu = menu
+
+        def show(self) -> None:
+            self.visible = True
+
+        def hide(self) -> None:
+            self.visible = False
+
+    monkeypatch.setattr(tricorder, "QSystemTrayIcon", FakeTray)
+
+    dashboard = tricorder.TricorderDashboard()
+    try:
+        assert dashboard._tray_icon is None
+        assert dashboard._apply_app_options(
+            minimize_to_tray=True,
+            autostart_enabled=True,
+            autostart_mode="minimized",
+            sync_os_autostart=True,
+        )
+        assert recorded_autostart == [(True, "minimized")]
+        assert dashboard._tray_icon is not None
+        assert dashboard._tray_icon.visible is True
+
+        saved = json.loads(config_path.read_text(encoding="utf-8"))
+        assert saved["minimize_to_tray"] is True
+        assert saved["autostart"] is True
+        assert saved["autostart_mode"] == "minimized"
+
+        # Show normally, save geometry, hide to tray and restore.
+        dashboard.show()
+        qapp.processEvents()
+        assert dashboard._hide_to_tray()
+        assert dashboard._in_tray is True
+        assert dashboard.isHidden()
+        assert dashboard._tray_toggle_action is not None
+        assert dashboard._tray_toggle_action.text() == "Fenster anzeigen"
+
+        dashboard._restore_from_tray()
+        qapp.processEvents()
+        assert dashboard._in_tray is False
+        assert not dashboard.isHidden()
+        assert dashboard._tray_toggle_action.text() == "In den Tray minimieren"
+    finally:
+        dashboard.close()
+        dashboard.deleteLater()
+        qapp.processEvents()
+
+    # Starting with --start-minimized while minimize_to_tray=True starts directly
+    # in the tray and preserves previously saved window placement on close.
+    saved_before = json.loads(config_path.read_text(encoding="utf-8"))
+    saved_window_before = saved_before["window"]
+
+    tray_start = tricorder.TricorderDashboard()
+    try:
+        assert tray_start.apply_startup_mode("minimized") == "tray"
+        assert tray_start._in_tray is True
+        assert tray_start.isHidden()
+        assert tray_start._tray_icon is not None and tray_start._tray_icon.visible
+    finally:
+        tray_start.close()
+        assert tray_start._tray_icon is not None and not tray_start._tray_icon.visible
+        tray_start.deleteLater()
+        qapp.processEvents()
+
+    saved_after = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved_after["window"] == saved_window_before
+
+    # Starting with --start-maximized launches maximized.
+    max_start = tricorder.TricorderDashboard()
+    try:
+        assert max_start.apply_startup_mode("maximized") == "maximized"
+        qapp.processEvents()
+        assert max_start.isMaximized()
+    finally:
+        max_start.close()
+        max_start.deleteLater()
+        qapp.processEvents()

@@ -15,6 +15,7 @@ import hashlib
 import shutil
 import tempfile
 import stat
+import plistlib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -100,7 +101,7 @@ from PyQt6.QtWidgets import (                                       # type: igno
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLayout,
     QLabel, QFrame, QGridLayout, QSizePolicy, QPushButton, QComboBox,
     QScrollArea, QDialog, QCheckBox, QDialogButtonBox, QMessageBox,
-    QColorDialog, QMenu,
+    QColorDialog, QMenu, QSystemTrayIcon,
 )
 from PyQt6.QtCore  import (  # type: ignore
     Qt, QEvent, QTimer, pyqtSignal, QThread, QMimeData, QPoint, QSize, QByteArray,
@@ -141,7 +142,7 @@ except ImportError:
 # ── Layout / window config ────────────────────────────────────────────────────
 CONFIG_FILE = Path.home() / ".tricorder_layout.json"
 CONFIG_VERSION = "1.0"
-APP_VERSION = "2.7.7"
+APP_VERSION = "2.7.8"
 GITHUB_REPO = "DaWasteh/System-Tricorder"
 GITHUB_REPO_URL = f"https://github.com/{GITHUB_REPO}.git"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}"
@@ -365,6 +366,232 @@ def _save_config_file(data: dict) -> None:
     tmp = CONFIG_FILE.with_suffix('.tmp')
     tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8')
     tmp.replace(CONFIG_FILE)          # atomic on same filesystem
+
+
+# ── System-tray & cross-platform autostart helpers ────────────────────────────
+_AUTOSTART_MODES = ("normal", "maximized", "minimized")
+_WINDOWS_RUN_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_WINDOWS_RUN_VALUE_NAME = "SystemTricorder"
+_LINUX_AUTOSTART_FILENAME = "system-tricorder.desktop"
+_MACOS_LAUNCH_AGENT_LABEL = "com.dawasteh.system-tricorder"
+_DESKTOP_EXEC_SPECIAL = set(' \t\n"\'\\><~|&;$*?#()`')
+
+
+def _normalise_autostart_mode(value: Any) -> str:
+    mode = str(value).strip().lower()
+    return mode if mode in _AUTOSTART_MODES else "normal"
+
+
+def _parse_startup_mode_arg(argv: List[str]) -> Optional[str]:
+    """Parse startup window-state CLI flags (last matching flag wins)."""
+    mode: Optional[str] = None
+    for arg in argv:
+        if arg in ("--start-minimized", "--minimized"):
+            mode = "minimized"
+        elif arg in ("--start-maximized", "--maximized"):
+            mode = "maximized"
+        elif arg == "--start-tray":
+            mode = "tray"
+        elif arg == "--start-normal":
+            mode = "normal"
+    return mode
+
+
+def _autostart_platform_label(system_name: Optional[str] = None) -> str:
+    current = system_name or platform.system()
+    if current == "Windows":
+        return "Windows"
+    if current == "Darwin":
+        return "macOS"
+    if current == "Linux":
+        return "Linux"
+    return "System"
+
+
+def _system_tray_available() -> bool:
+    try:
+        return bool(QSystemTrayIcon.isSystemTrayAvailable())
+    except Exception:
+        return False
+
+
+def _autostart_command(
+    mode: str = "normal",
+    *,
+    system_name: Optional[str] = None,
+    frozen: Optional[bool] = None,
+    executable: Optional[str] = None,
+    script_path: Optional[Path] = None,
+) -> List[str]:
+    """Build the argv command used by OS autostart entries."""
+    normalised = _normalise_autostart_mode(mode)
+    current = system_name or platform.system()
+    is_frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
+    exe = Path(executable or sys.executable).resolve()
+
+    if is_frozen:
+        cmd = [str(exe)]
+    else:
+        if current == "Windows" and exe.name.lower() == "python.exe":
+            pythonw = exe.with_name("pythonw.exe")
+            if pythonw.is_file():
+                exe = pythonw
+        target_script = (script_path or Path(__file__)).resolve()
+        cmd = [str(exe), str(target_script)]
+
+    if normalised == "minimized":
+        cmd.append("--start-minimized")
+    elif normalised == "maximized":
+        cmd.append("--start-maximized")
+    return cmd
+
+
+def _format_desktop_exec(args: List[str]) -> str:
+    """Format an argv list for a Freedesktop .desktop Exec= line."""
+    formatted: List[str] = []
+    for raw in args:
+        arg = raw.replace("%", "%%")
+        if not arg or any(ch in _DESKTOP_EXEC_SPECIAL for ch in arg):
+            escaped = (
+                arg.replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("`", "\\`")
+                .replace("$", "\\$")
+            )
+            formatted.append(f'"{escaped}"')
+        else:
+            formatted.append(arg)
+    return " ".join(formatted)
+
+
+def _linux_autostart_path() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "autostart" / _LINUX_AUTOSTART_FILENAME
+
+
+def _macos_launch_agent_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{_MACOS_LAUNCH_AGENT_LABEL}.plist"
+
+
+def _build_linux_autostart_desktop(
+    cmd: List[str], icon_path: Optional[Path] = None,
+) -> str:
+    icon = str(icon_path) if icon_path is not None else "utilities-system-monitor"
+    return "\n".join([
+        "[Desktop Entry]",
+        "Type=Application",
+        "Version=1.0",
+        "Name=System Tricorder",
+        "Comment=Real-time hardware monitoring dashboard",
+        f"Exec={_format_desktop_exec(cmd)}",
+        f"Icon={icon}",
+        "Terminal=false",
+        "Categories=Utility;System;",
+        "X-GNOME-Autostart-enabled=true",
+        "",
+    ])
+
+
+def _build_macos_launch_agent_plist(cmd: List[str]) -> bytes:
+    payload = {
+        "Label": _MACOS_LAUNCH_AGENT_LABEL,
+        "ProgramArguments": list(cmd),
+        "RunAtLoad": True,
+        "KeepAlive": False,
+        "ProcessType": "Interactive",
+    }
+    return plistlib.dumps(payload, fmt=plistlib.FMT_XML)
+
+
+def _set_os_autostart(
+    enabled: bool,
+    mode: str = "normal",
+    *,
+    system_name: Optional[str] = None,
+) -> None:
+    """Register or remove the per-user login autostart entry on Windows/Linux/macOS."""
+    current = system_name or platform.system()
+    normalised = _normalise_autostart_mode(mode)
+
+    if current == "Windows":
+        if not WINREG_AVAILABLE or winreg is None:
+            raise RuntimeError("Windows Registry (winreg) ist nicht verfügbar.")
+        if enabled:
+            cmd_line = subprocess.list2cmdline(
+                _autostart_command(normalised, system_name="Windows"))
+            with winreg.CreateKeyEx(
+                winreg.HKEY_CURRENT_USER,
+                _WINDOWS_RUN_REG_PATH,
+                0,
+                winreg.KEY_SET_VALUE,
+            ) as key:
+                winreg.SetValueEx(
+                    key, _WINDOWS_RUN_VALUE_NAME, 0, winreg.REG_SZ, cmd_line)
+        else:
+            with contextlib.suppress(FileNotFoundError), winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                _WINDOWS_RUN_REG_PATH,
+                0,
+                winreg.KEY_SET_VALUE,
+            ) as key:
+                winreg.DeleteValue(key, _WINDOWS_RUN_VALUE_NAME)
+        return
+
+    if current == "Linux":
+        target = _linux_autostart_path()
+        if enabled:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            icon = _resource_path("assets/SystemTricorder.png")
+            content = _build_linux_autostart_desktop(
+                _autostart_command(normalised, system_name="Linux"),
+                icon if icon.is_file() else None,
+            )
+            tmp = target.with_suffix(".tmp")
+            tmp.write_text(content, encoding="utf-8")
+            tmp.replace(target)
+        else:
+            target.unlink(missing_ok=True)
+        return
+
+    if current == "Darwin":
+        target = _macos_launch_agent_path()
+        if enabled:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            payload = _build_macos_launch_agent_plist(
+                _autostart_command(normalised, system_name="Darwin"))
+            tmp = target.with_suffix(".tmp")
+            tmp.write_bytes(payload)
+            tmp.replace(target)
+        else:
+            target.unlink(missing_ok=True)
+        return
+
+    raise RuntimeError(f"Autostart wird auf {current} nicht unterstützt.")
+
+
+def _is_os_autostart_enabled(*, system_name: Optional[str] = None) -> bool:
+    """Return True if a per-user autostart entry is currently registered."""
+    current = system_name or platform.system()
+    if current == "Windows":
+        if not WINREG_AVAILABLE or winreg is None:
+            return False
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                _WINDOWS_RUN_REG_PATH,
+                0,
+                winreg.KEY_QUERY_VALUE,
+            ) as key:
+                value, _ = winreg.QueryValueEx(key, _WINDOWS_RUN_VALUE_NAME)
+            return bool(isinstance(value, str) and value.strip())
+        except OSError:
+            return False
+    if current == "Linux":
+        return _linux_autostart_path().is_file()
+    if current == "Darwin":
+        return _macos_launch_agent_path().is_file()
+    return False
 
 # ── GPU colour palettes (up to 4 discrete GPUs) ───────────────────────────────
 GPU_PALETTES = [
@@ -5084,6 +5311,143 @@ class AddTilesDialog(QDialog):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# OPTIONS DIALOG  (System Tray & Autostart)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class OptionsDialog(QDialog):
+    """Modal dialog for system-tray behaviour and cross-platform autostart."""
+
+    def __init__(
+        self,
+        minimize_to_tray: bool,
+        autostart_enabled: bool,
+        autostart_mode: str,
+        *,
+        tray_available: bool = True,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Optionen")
+        self.setMinimumWidth(dp(380))
+        _set_themed_style(self, """
+            QDialog   { background: #0e0e18; color: white; }
+            QLabel    { color: #ccc; background: transparent; }
+            QCheckBox { color: #ccc; padding: 4px 0; font-size: 12px; }
+            QCheckBox::indicator          { width: 14px; height: 14px; }
+            QCheckBox::indicator:checked  { background: #00ff88; border-radius: 2px; }
+            QCheckBox::indicator:unchecked{ background: #222; border: 1px solid #444;
+                                            border-radius: 2px; }
+            QComboBox {
+                background: #1e1e2e; color: #ccc;
+                border: 1px solid #333; border-radius: 4px;
+                padding: 4px 8px;
+            }
+            QComboBox:disabled { color: #555; border-color: #222; }
+            QComboBox QAbstractItemView {
+                background: #1e1e2e; color: #ccc;
+                selection-background-color: #2e2e3e;
+            }
+            QDialogButtonBox QPushButton  { background: #1e1e2e; color: #ccc;
+                                            border: 1px solid #333; border-radius: 4px;
+                                            padding: 4px 16px; }
+            QDialogButtonBox QPushButton:hover { background: #2e2e3e; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
+
+        tray_hdr = QLabel("System-Tray")
+        _set_themed_style(tray_hdr, "color: #00ff88; font-size: 12px; font-weight: bold;")
+        layout.addWidget(tray_hdr)
+
+        self._cb_tray = QCheckBox("Beim Minimieren in den System-Tray ausblenden")
+        self._cb_tray.setChecked(bool(minimize_to_tray))
+        layout.addWidget(self._cb_tray)
+
+        if not tray_available:
+            warn_lbl = QLabel(
+                "Hinweis: Auf diesem System wurde aktuell kein System-Tray erkannt.")
+            warn_lbl.setWordWrap(True)
+            _set_themed_style(warn_lbl, "color: #ffcc00; font-size: 11px;")
+            layout.addWidget(warn_lbl)
+
+        layout.addSpacing(6)
+
+        autostart_hdr = QLabel("Autostart")
+        _set_themed_style(autostart_hdr, "color: #00d4ff; font-size: 12px; font-weight: bold;")
+        layout.addWidget(autostart_hdr)
+
+        self._cb_autostart = QCheckBox(
+            f"Mit {_autostart_platform_label()} starten")
+        self._cb_autostart.setChecked(bool(autostart_enabled))
+        layout.addWidget(self._cb_autostart)
+
+        mode_row = QHBoxLayout()
+        mode_row.setContentsMargins(20, 0, 0, 0)
+        mode_row.setSpacing(8)
+        mode_lbl = QLabel("Startmodus:")
+        _set_themed_style(mode_lbl, "color: #aaa; font-size: 12px;")
+        self._combo_mode = QComboBox()
+        self._combo_mode.addItem("Normal (letzte Position)", "normal")
+        self._combo_mode.addItem("Maximiert", "maximized")
+        self._combo_mode.addItem("Minimiert", "minimized")
+        mode_index = self._combo_mode.findData(
+            _normalise_autostart_mode(autostart_mode))
+        self._combo_mode.setCurrentIndex(max(0, mode_index))
+        mode_row.addWidget(mode_lbl)
+        mode_row.addWidget(self._combo_mode, 1)
+        layout.addLayout(mode_row)
+
+        self._mode_hint = QLabel()
+        self._mode_hint.setWordWrap(True)
+        _set_themed_style(
+            self._mode_hint,
+            "color: #888; font-size: 11px; padding-left: 20px;",
+        )
+        layout.addWidget(self._mode_hint)
+
+        self._cb_autostart.toggled.connect(self._update_controls)
+        self._cb_tray.toggled.connect(self._update_controls)
+        self._combo_mode.currentIndexChanged.connect(self._update_controls)
+        self._update_controls()
+
+        layout.addSpacing(8)
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)  # type: ignore
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _update_controls(self) -> None:
+        autostart_on = self._cb_autostart.isChecked()
+        self._combo_mode.setEnabled(autostart_on)
+        mode = str(self._combo_mode.currentData() or "normal")
+        if not autostart_on:
+            self._mode_hint.setText(
+                "System Tricorder startet nicht automatisch beim Anmelden.")
+        elif mode == "maximized":
+            self._mode_hint.setText("Startet automatisch als maximiertes Fenster.")
+        elif mode == "minimized" and self._cb_tray.isChecked():
+            self._mode_hint.setText(
+                "Startet direkt im System-Tray, ohne das Fenster anzuzeigen.")
+        elif mode == "minimized":
+            self._mode_hint.setText(
+                "Startet minimiert in der Taskleiste. Aktiviere die Tray-Option "
+                "oben, um direkt im System-Tray zu starten.")
+        else:
+            self._mode_hint.setText(
+                "Startet automatisch mit der zuletzt gespeicherten Fensterposition.")
+
+    def values(self) -> Tuple[bool, bool, str]:
+        return (
+            self._cb_tray.isChecked(),
+            self._cb_autostart.isChecked(),
+            _normalise_autostart_mode(self._combo_mode.currentData()),
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # COLLAPSIBLE SECTION
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -6036,15 +6400,30 @@ def _toolbar_btn(text: str, checkable: bool = False) -> QPushButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD  v2.7.6
+# MAIN DASHBOARD  v2.7.8
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TricorderDashboard(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
 
-        self._theme = _set_active_theme(
-            _load_config_file().get('theme', 'dark'))
+        initial_cfg = _load_config_file()
+        self._theme = _set_active_theme(initial_cfg.get('theme', 'dark'))
+        self._minimize_to_tray = bool(initial_cfg.get('minimize_to_tray', False))
+        self._autostart_enabled = bool(initial_cfg.get('autostart', False))
+        self._autostart_mode = _normalise_autostart_mode(
+            initial_cfg.get('autostart_mode', 'normal'))
+
+        self._tray_icon: Optional[QSystemTrayIcon] = None
+        self._tray_menu: Optional[QMenu] = None
+        self._tray_toggle_action: Optional[QAction] = None
+        self._in_tray = False
+        self._has_ever_been_shown = False
+        self._pre_tray_maximized = False
+        self._pre_tray_fullscreen = False
+        self._quit_on_close = False
+        self._previous_quit_on_last_window: Optional[bool] = None
+
         _set_windows_titlebar_theme(self, self._theme)
 
         self.setWindowTitle(f"System Tricorder v{APP_VERSION}")
@@ -6093,6 +6472,7 @@ class TricorderDashboard(QMainWindow):
         self._setup_ui()
         _apply_theme_tree(self)
         self._update_clock_layout(self.width())
+        self._sync_tray_icon()
 
         self.clock_timer = QTimer(self)
         self.clock_timer.timeout.connect(self._update_clock)
@@ -6249,6 +6629,8 @@ class TricorderDashboard(QMainWindow):
         self._title_lbl.setVisible(not compact)
         self._info_lbl.setVisible(width >= 1200)
         self._btn_update.setVisible(not (compact and editing))
+        self._btn_options.setVisible(not (compact and editing))
+        self._btn_options.setText("⚙" if compact else "⚙  Optionen")
         self._btn_edit.setText(
             ("✔" if editing else "✏")
             if compact else ("✔  Fertig" if editing else "✏  Edit Layout"))
@@ -6360,6 +6742,8 @@ class TricorderDashboard(QMainWindow):
 
         # ── Edit-mode toolbar ─────────────────────────────────────────────────
         self._btn_update = _toolbar_btn("⬇  Update")
+        self._btn_options = _toolbar_btn("⚙  Optionen")
+        self._btn_options.setToolTip("System-Tray- und Autostart-Optionen")
         self._btn_edit  = _toolbar_btn("✏  Edit Layout", checkable=True)
         self._btn_edit.setToolTip(
             "Kacheln verschieben; per Rechtsklick Farbe über RGB/HEX wählen")
@@ -6378,15 +6762,16 @@ class TricorderDashboard(QMainWindow):
 
         self._update_worker: Optional[UpdateWorker] = None
         self._btn_update.clicked.connect(self._on_update_clicked)
+        self._btn_options.clicked.connect(self._on_options_clicked)
         self._btn_edit.toggled.connect(self._on_edit_toggled)
         self._btn_add.clicked.connect(self._on_add_tiles)
         self._btn_minus.clicked.connect(lambda: self._change_cols(-1))
         self._btn_plus.clicked.connect(lambda: self._change_cols(+1))
         self._btn_reset.clicked.connect(self._on_reset_layout)
 
-        for w in (self._btn_update, self._btn_edit, self._btn_add,
-                  self._btn_minus, self._cols_lbl, self._btn_plus,
-                  self._btn_reset):
+        for w in (self._btn_update, self._btn_options, self._btn_edit,
+                  self._btn_add, self._btn_minus, self._cols_lbl,
+                  self._btn_plus, self._btn_reset):
             hdr.addWidget(w)
 
         self._theme_combo = QComboBox()
@@ -6751,6 +7136,166 @@ class TricorderDashboard(QMainWindow):
         self._tile_grid.reset_layout(self._default_tile_order)
         self._update_cols_label()
 
+    # ── System tray & autostart options ────────────────────────────────────────
+
+    def _on_options_clicked(self) -> None:
+        parent = self if self.isVisible() else None
+        dlg = OptionsDialog(
+            self._minimize_to_tray,
+            self._autostart_enabled,
+            self._autostart_mode,
+            tray_available=_system_tray_available(),
+            parent=parent,
+        )
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            minimize_to_tray, autostart_enabled, autostart_mode = dlg.values()
+            self._apply_app_options(
+                minimize_to_tray=minimize_to_tray,
+                autostart_enabled=autostart_enabled,
+                autostart_mode=autostart_mode,
+                sync_os_autostart=True,
+                show_errors=True,
+            )
+
+    def _apply_app_options(
+        self,
+        *,
+        minimize_to_tray: bool,
+        autostart_enabled: bool,
+        autostart_mode: str,
+        sync_os_autostart: bool = True,
+        show_errors: bool = False,
+    ) -> bool:
+        mode = _normalise_autostart_mode(autostart_mode)
+        if sync_os_autostart:
+            try:
+                _set_os_autostart(autostart_enabled, mode)
+            except Exception as exc:
+                logger.warning("Autostart configuration failed: %s", exc)
+                if show_errors:
+                    QMessageBox.warning(
+                        self if self.isVisible() else None,
+                        "System Tricorder Optionen",
+                        f"Autostart konnte nicht konfiguriert werden:\n{exc}",
+                    )
+                return False
+
+        self._minimize_to_tray = bool(minimize_to_tray)
+        self._autostart_enabled = bool(autostart_enabled)
+        self._autostart_mode = mode
+        try:
+            data = _load_config_file()
+            data['minimize_to_tray'] = self._minimize_to_tray
+            data['autostart'] = self._autostart_enabled
+            data['autostart_mode'] = self._autostart_mode
+            _save_config_file(data)
+        except Exception as exc:
+            logger.warning("Options save failed: %s", exc)
+        self._sync_tray_icon()
+        return True
+
+    def _ensure_tray_icon(self) -> bool:
+        if not _system_tray_available():
+            return False
+        if self._tray_icon is None:
+            tray = QSystemTrayIcon(_app_icon(), self)
+            tray.setToolTip(f"System Tricorder v{APP_VERSION}")
+            menu = QMenu(self)
+            toggle_action = QAction("Fenster anzeigen", menu)
+            toggle_action.triggered.connect(self._toggle_tray_visibility)
+            options_action = QAction("Optionen…", menu)
+            options_action.triggered.connect(self._on_options_clicked)
+            quit_action = QAction("Beenden", menu)
+            quit_action.triggered.connect(self._quit_from_tray)
+            menu.addAction(toggle_action)
+            menu.addAction(options_action)
+            menu.addSeparator()
+            menu.addAction(quit_action)
+            menu.aboutToShow.connect(self._update_tray_menu_state)
+            tray.setContextMenu(menu)
+            tray.activated.connect(self._on_tray_activated)
+            self._tray_menu = menu
+            self._tray_toggle_action = toggle_action
+            self._tray_icon = tray
+        self._tray_icon.show()
+        self._update_tray_menu_state()
+        return True
+
+    def _sync_tray_icon(self) -> None:
+        if self._minimize_to_tray or self._in_tray:
+            self._ensure_tray_icon()
+        elif self._tray_icon is not None:
+            self._tray_icon.hide()
+
+    def _update_tray_menu_state(self) -> None:
+        if self._tray_toggle_action is None:
+            return
+        hidden_or_min = self._in_tray or not self.isVisible() or self.isMinimized()
+        self._tray_toggle_action.setText(
+            "Fenster anzeigen" if hidden_or_min else "In den Tray minimieren")
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self._restore_from_tray()
+
+    def _toggle_tray_visibility(self) -> None:
+        if self._in_tray or not self.isVisible() or self.isMinimized():
+            self._restore_from_tray()
+        else:
+            self._hide_to_tray()
+
+    def _hide_to_tray(self, *, save_placement: bool = True) -> bool:
+        if not self._ensure_tray_icon():
+            return False
+        if (save_placement and self.isVisible()
+                and not self.isMinimized() and not self._in_tray):
+            state = self.windowState()
+            self._pre_tray_fullscreen = bool(
+                state & Qt.WindowState.WindowFullScreen)           # type: ignore[operator]
+            self._pre_tray_maximized = bool(
+                state & Qt.WindowState.WindowMaximized)            # type: ignore[operator]
+            self._save_window_placement()
+        self._in_tray = True
+        app = QApplication.instance()
+        if app is not None and self._previous_quit_on_last_window is None:
+            self._previous_quit_on_last_window = app.quitOnLastWindowClosed()
+            app.setQuitOnLastWindowClosed(False)
+        self.hide()
+        self._update_tray_menu_state()
+        return True
+
+    def _restore_from_tray(self) -> None:
+        self._in_tray = False
+        self.setWindowState(
+            self.windowState() & ~Qt.WindowState.WindowMinimized)  # type: ignore[operator]
+        if self._pre_tray_fullscreen:
+            self.showFullScreen()
+        elif self._pre_tray_maximized:
+            self.showMaximized()
+        else:
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        _set_windows_titlebar_theme(self, self._theme)
+        if self._previous_quit_on_last_window is not None:
+            app = QApplication.instance()
+            if app is not None:
+                app.setQuitOnLastWindowClosed(self._previous_quit_on_last_window)
+            self._previous_quit_on_last_window = None
+        self._sync_tray_icon()
+        self._update_tray_menu_state()
+
+    def _hide_to_tray_if_minimized(self) -> None:
+        if self.isMinimized() and self._minimize_to_tray and not self._in_tray:
+            self._hide_to_tray(save_placement=False)
+
+    def _quit_from_tray(self) -> None:
+        self._quit_on_close = True
+        self.close()
+
     # ── CPU core topology builders ─────────────────────────────────────────────
 
     def _build_hybrid_cores(self, parent: QVBoxLayout) -> None:
@@ -6906,6 +7451,9 @@ class TricorderDashboard(QMainWindow):
         # Batch update all sparklines once per frame instead of per-widget.
         # Global tiles AND per-thread CPU widgets both need this — the latter
         # live in self.thread_widgets and are not part of self._tiles.
+        # Skip repaint scheduling while hidden in the system tray.
+        if getattr(self, "_in_tray", False):
+            return
         for tile in self._tiles.values():
             tile.batch_update()
         for tw in self.thread_widgets.values():
@@ -7065,8 +7613,26 @@ class TricorderDashboard(QMainWindow):
 
     def changeEvent(self, event) -> None:                                    # type: ignore
         super().changeEvent(event)
-        if (event.type() == QEvent.Type.WindowStateChange
-                and hasattr(self, '_resize_settle_timer')):
+        if event.type() != QEvent.Type.WindowStateChange:
+            return
+        if self.isMinimized():
+            if (getattr(self, '_minimize_to_tray', False)
+                    and not getattr(self, '_in_tray', False)
+                    and _system_tray_available()):
+                old_state = event.oldState()
+                self._pre_tray_fullscreen = bool(
+                    old_state & Qt.WindowState.WindowFullScreen)   # type: ignore[operator]
+                self._pre_tray_maximized = bool(
+                    old_state & Qt.WindowState.WindowMaximized)    # type: ignore[operator]
+                placement_override = (
+                    'fullscreen' if self._pre_tray_fullscreen
+                    else 'maximized' if self._pre_tray_maximized
+                    else 'normal'
+                )
+                self._save_window_placement(placement_override=placement_override)
+                QTimer.singleShot(0, self._hide_to_tray_if_minimized)
+            return
+        if hasattr(self, '_resize_settle_timer'):
             # Window-state transitions can arrive before or after resizeEvent
             # depending on the platform.  Handle both paths idempotently.
             self._fit_mode = 'fill'
@@ -7075,6 +7641,7 @@ class TricorderDashboard(QMainWindow):
 
     def showEvent(self, event) -> None:                                      # type: ignore
         super().showEvent(event)
+        self._has_ever_been_shown = True
         state = self.windowState()
         maximised = bool(
             state
@@ -7089,42 +7656,106 @@ class TricorderDashboard(QMainWindow):
         self._fit_mode = 'fill' if maximised or preserve_geometry else 'auto'
         self._schedule_layout_settle(self._fit_mode)
 
-    def _restore_window_placement(self) -> bool:
-        """Restore the last Windows window position/size/mode from config."""
+    def _restore_window_geometry_only(self) -> Tuple[bool, str]:
+        """Restore saved geometry without showing the window yet."""
         try:
             cfg = _load_config_file()
             win_cfg = cfg.get('window', {})
             geometry_b64 = win_cfg.get('geometry')
             if not isinstance(geometry_b64, str) or not geometry_b64:
-                return False
+                return False, 'normal'
 
             geometry = QByteArray.fromBase64(geometry_b64.encode('ascii'))
             if geometry.isEmpty() or not self.restoreGeometry(geometry):
-                return False
+                return False, 'normal'
 
             self._restored_window_geometry = True
-            placement = win_cfg.get('placement', 'normal')
+            placement = str(win_cfg.get('placement', 'normal'))
+            if placement not in ('normal', 'maximized', 'fullscreen'):
+                placement = 'normal'
+            return True, placement
+        except Exception as exc:
+            logger.warning("Window placement restore failed: %s", exc)
+            return False, 'normal'
+
+    def _restore_window_placement(self) -> bool:
+        """Restore the last window position/size/mode from config."""
+        restored, placement = self._restore_window_geometry_only()
+        if not restored:
+            return False
+        if placement == 'fullscreen':
+            self.showFullScreen()
+        elif placement == 'maximized':
+            self.showMaximized()
+        else:
+            self.show()
+        return True
+
+    def apply_startup_mode(self, start_mode: Optional[str]) -> str:
+        """Show or tray-hide the window according to startup flags and saved state."""
+        if start_mode is None:
+            restored, placement = self._restore_window_geometry_only()
+            if not restored:
+                self.show()
+                return 'normal'
             if placement == 'fullscreen':
                 self.showFullScreen()
             elif placement == 'maximized':
                 self.showMaximized()
             else:
                 self.show()
-            return True
-        except Exception as exc:
-            logger.warning("Window placement restore failed: %s", exc)
-            return False
+            return placement
 
-    def _save_window_placement(self) -> None:
-        """Persist the current Windows window position/size/mode into config."""
+        restored, saved_placement = self._restore_window_geometry_only()
+        self._pre_tray_fullscreen = (saved_placement == 'fullscreen')
+        self._pre_tray_maximized = (saved_placement == 'maximized')
+
+        if start_mode == 'maximized':
+            self.showMaximized()
+            return 'maximized'
+        if start_mode == 'tray':
+            if self._hide_to_tray(save_placement=False):
+                return 'tray'
+            self.showMinimized()
+            return 'minimized'
+        if start_mode == 'minimized':
+            if self._minimize_to_tray and self._hide_to_tray(save_placement=False):
+                return 'tray'
+            self.showMinimized()
+            return 'minimized'
+
+        if restored:
+            if saved_placement == 'fullscreen':
+                self.showFullScreen()
+                return 'fullscreen'
+            if saved_placement == 'maximized':
+                self.showMaximized()
+                return 'maximized'
+        self.show()
+        return 'normal'
+
+    def _save_window_placement(
+        self, *, placement_override: Optional[str] = None,
+    ) -> None:
+        """Persist the current window position/size/mode into config."""
         try:
-            state = self.windowState()
-            if state & Qt.WindowState.WindowFullScreen:              # type: ignore[operator]
-                placement = 'fullscreen'
-            elif state & Qt.WindowState.WindowMaximized:             # type: ignore[operator]
-                placement = 'maximized'
+            if placement_override is None and (
+                getattr(self, '_in_tray', False)
+                or self.isMinimized()
+                or not getattr(self, '_has_ever_been_shown', True)
+            ):
+                return
+
+            if placement_override is not None:
+                placement = placement_override
             else:
-                placement = 'normal'
+                state = self.windowState()
+                if state & Qt.WindowState.WindowFullScreen:          # type: ignore[operator]
+                    placement = 'fullscreen'
+                elif state & Qt.WindowState.WindowMaximized:         # type: ignore[operator]
+                    placement = 'maximized'
+                else:
+                    placement = 'normal'
 
             data = _load_config_file()
             data['window'] = {
@@ -7137,13 +7768,29 @@ class TricorderDashboard(QMainWindow):
 
     def closeEvent(self, event) -> None:                                    # type: ignore
         self._save_window_placement()
+        for timer_name in ('_metrics_timer', 'clock_timer', '_resize_settle_timer'):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                timer.stop()
         self.hw_thread.stop()
+        if self._tray_icon is not None:
+            self._tray_icon.hide()
+        if self._previous_quit_on_last_window is not None:
+            app = QApplication.instance()
+            if app is not None:
+                app.setQuitOnLastWindowClosed(self._previous_quit_on_last_window)
+            self._previous_quit_on_last_window = None
         event.accept()                                              # type: ignore
+        if self._quit_on_close:
+            app = QApplication.instance()
+            if app is not None:
+                app.quit()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     _self_test = "--self-test" in sys.argv
+    _startup_mode = None if _self_test else _parse_startup_mode_arg(sys.argv[1:])
     if _self_test:
         # Frozen-artifact CI smoke test: no display server or user interaction,
         # and never overwrite the developer's real layout/geometry file.
@@ -7177,6 +7824,8 @@ if __name__ == "__main__":
     logging.getLogger("tricorder").debug("DPI scale factor: %.2f", _DP_SCALE)
 
     win = TricorderDashboard()
+    app.aboutToQuit.connect(
+        lambda: win._tray_icon.hide() if win._tray_icon is not None else None)
     if _self_test:
         app.setQuitOnLastWindowClosed(False)
         win.show()
@@ -7197,11 +7846,8 @@ if __name__ == "__main__":
             app.exit(0 if ok else 1)
 
         QTimer.singleShot(3000, _finish_self_test)
-    elif not win._restore_window_placement():
-        # No saved geometry: open windowed and auto-fit to content (showEvent
-        # schedules _fit_window_to_content) — guarantees no scrollbar on first
-        # launch.  The user can still maximise manually if preferred.
-        win.show()
+    else:
+        win.apply_startup_mode(_startup_mode)
     if (not _self_test and platform.system() == "Windows"
             and getattr(sys, "frozen", False)):
         # The detached updater leaves the previous EXE as a rollback until the

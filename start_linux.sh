@@ -69,4 +69,4 @@ python -m pip install -r requirements.txt
 
 # 5. Run the application
 echo "🌟 Launching $APP_NAME..."
-exec python system_tricorder.py
+exec python system_tricorder.py "$@"

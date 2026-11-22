@@ -5320,6 +5320,7 @@ class OptionsDialog(QDialog):
     def __init__(
         self,
         minimize_to_tray: bool,
+        close_to_tray: bool,
         autostart_enabled: bool,
         autostart_mode: str,
         *,
@@ -5365,6 +5366,11 @@ class OptionsDialog(QDialog):
         self._cb_tray.setChecked(bool(minimize_to_tray))
         layout.addWidget(self._cb_tray)
 
+        self._cb_close_tray = QCheckBox(
+            "Beim Schließen (×) in den System-Tray minimieren")
+        self._cb_close_tray.setChecked(bool(close_to_tray))
+        layout.addWidget(self._cb_close_tray)
+
         if not tray_available:
             warn_lbl = QLabel(
                 "Hinweis: Auf diesem System wurde aktuell kein System-Tray erkannt.")
@@ -5409,6 +5415,7 @@ class OptionsDialog(QDialog):
 
         self._cb_autostart.toggled.connect(self._update_controls)
         self._cb_tray.toggled.connect(self._update_controls)
+        self._cb_close_tray.toggled.connect(self._update_controls)
         self._combo_mode.currentIndexChanged.connect(self._update_controls)
         self._update_controls()
 
@@ -5421,6 +5428,7 @@ class OptionsDialog(QDialog):
 
     def _update_controls(self) -> None:
         autostart_on = self._cb_autostart.isChecked()
+        tray_on = self._cb_tray.isChecked() or self._cb_close_tray.isChecked()
         self._combo_mode.setEnabled(autostart_on)
         mode = str(self._combo_mode.currentData() or "normal")
         if not autostart_on:
@@ -5428,20 +5436,21 @@ class OptionsDialog(QDialog):
                 "System Tricorder startet nicht automatisch beim Anmelden.")
         elif mode == "maximized":
             self._mode_hint.setText("Startet automatisch als maximiertes Fenster.")
-        elif mode == "minimized" and self._cb_tray.isChecked():
+        elif mode == "minimized" and tray_on:
             self._mode_hint.setText(
                 "Startet direkt im System-Tray, ohne das Fenster anzuzeigen.")
         elif mode == "minimized":
             self._mode_hint.setText(
-                "Startet minimiert in der Taskleiste. Aktiviere die Tray-Option "
+                "Startet minimiert in der Taskleiste. Aktiviere eine Tray-Option "
                 "oben, um direkt im System-Tray zu starten.")
         else:
             self._mode_hint.setText(
                 "Startet automatisch mit der zuletzt gespeicherten Fensterposition.")
 
-    def values(self) -> Tuple[bool, bool, str]:
+    def values(self) -> Tuple[bool, bool, bool, str]:
         return (
             self._cb_tray.isChecked(),
+            self._cb_close_tray.isChecked(),
             self._cb_autostart.isChecked(),
             _normalise_autostart_mode(self._combo_mode.currentData()),
         )
@@ -6410,6 +6419,7 @@ class TricorderDashboard(QMainWindow):
         initial_cfg = _load_config_file()
         self._theme = _set_active_theme(initial_cfg.get('theme', 'dark'))
         self._minimize_to_tray = bool(initial_cfg.get('minimize_to_tray', False))
+        self._close_to_tray = bool(initial_cfg.get('close_to_tray', False))
         self._autostart_enabled = bool(initial_cfg.get('autostart', False))
         self._autostart_mode = _normalise_autostart_mode(
             initial_cfg.get('autostart_mode', 'normal'))
@@ -6421,6 +6431,7 @@ class TricorderDashboard(QMainWindow):
         self._has_ever_been_shown = False
         self._pre_tray_maximized = False
         self._pre_tray_fullscreen = False
+        self._force_quit = False
         self._quit_on_close = False
         self._previous_quit_on_last_window: Optional[bool] = None
 
@@ -6989,7 +7000,7 @@ class TricorderDashboard(QMainWindow):
             )
             update_path = Path(prepared_exe_update)
             if self._spawn_standalone_exe_update(update_path):
-                self.close()
+                self._force_close()
             else:
                 try:
                     update_path.unlink(missing_ok=True)
@@ -7019,7 +7030,7 @@ class TricorderDashboard(QMainWindow):
                 "Datei tricorder_rebuild_<pid>.log im TEMP-Ordner.",
             )
             if self._spawn_rebuild_and_restart(deferred_pull_branch):
-                self.close()  # releases the .exe lock so PyInstaller can overwrite it
+                self._force_close()  # releases the .exe lock so PyInstaller can overwrite it
             else:
                 QMessageBox.warning(
                     self, "System Tricorder Update",
@@ -7142,15 +7153,22 @@ class TricorderDashboard(QMainWindow):
         parent = self if self.isVisible() else None
         dlg = OptionsDialog(
             self._minimize_to_tray,
+            self._close_to_tray,
             self._autostart_enabled,
             self._autostart_mode,
             tray_available=_system_tray_available(),
             parent=parent,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            minimize_to_tray, autostart_enabled, autostart_mode = dlg.values()
+            (
+                minimize_to_tray,
+                close_to_tray,
+                autostart_enabled,
+                autostart_mode,
+            ) = dlg.values()
             self._apply_app_options(
                 minimize_to_tray=minimize_to_tray,
+                close_to_tray=close_to_tray,
                 autostart_enabled=autostart_enabled,
                 autostart_mode=autostart_mode,
                 sync_os_autostart=True,
@@ -7161,6 +7179,7 @@ class TricorderDashboard(QMainWindow):
         self,
         *,
         minimize_to_tray: bool,
+        close_to_tray: bool = False,
         autostart_enabled: bool,
         autostart_mode: str,
         sync_os_autostart: bool = True,
@@ -7181,11 +7200,13 @@ class TricorderDashboard(QMainWindow):
                 return False
 
         self._minimize_to_tray = bool(minimize_to_tray)
+        self._close_to_tray = bool(close_to_tray)
         self._autostart_enabled = bool(autostart_enabled)
         self._autostart_mode = mode
         try:
             data = _load_config_file()
             data['minimize_to_tray'] = self._minimize_to_tray
+            data['close_to_tray'] = self._close_to_tray
             data['autostart'] = self._autostart_enabled
             data['autostart_mode'] = self._autostart_mode
             _save_config_file(data)
@@ -7222,7 +7243,7 @@ class TricorderDashboard(QMainWindow):
         return True
 
     def _sync_tray_icon(self) -> None:
-        if self._minimize_to_tray or self._in_tray:
+        if self._minimize_to_tray or self._close_to_tray or self._in_tray:
             self._ensure_tray_icon()
         elif self._tray_icon is not None:
             self._tray_icon.hide()
@@ -7292,7 +7313,12 @@ class TricorderDashboard(QMainWindow):
         if self.isMinimized() and self._minimize_to_tray and not self._in_tray:
             self._hide_to_tray(save_placement=False)
 
+    def _force_close(self) -> None:
+        self._force_quit = True
+        self.close()
+
     def _quit_from_tray(self) -> None:
+        self._force_quit = True
         self._quit_on_close = True
         self.close()
 
@@ -7719,7 +7745,8 @@ class TricorderDashboard(QMainWindow):
             self.showMinimized()
             return 'minimized'
         if start_mode == 'minimized':
-            if self._minimize_to_tray and self._hide_to_tray(save_placement=False):
+            if ((self._minimize_to_tray or self._close_to_tray)
+                    and self._hide_to_tray(save_placement=False)):
                 return 'tray'
             self.showMinimized()
             return 'minimized'
@@ -7767,6 +7794,13 @@ class TricorderDashboard(QMainWindow):
             logger.warning("Window placement save failed: %s", exc)
 
     def closeEvent(self, event) -> None:                                    # type: ignore
+        if (getattr(self, '_close_to_tray', False)
+                and not getattr(self, '_force_quit', False)
+                and not getattr(self, '_in_tray', False)
+                and _system_tray_available()):
+            event.ignore()                                          # type: ignore
+            self._hide_to_tray(save_placement=True)
+            return
         self._save_window_placement()
         for timer_name in ('_metrics_timer', 'clock_timer', '_resize_settle_timer'):
             timer = getattr(self, timer_name, None)
@@ -7824,6 +7858,8 @@ if __name__ == "__main__":
     logging.getLogger("tricorder").debug("DPI scale factor: %.2f", _DP_SCALE)
 
     win = TricorderDashboard()
+    app.commitDataRequest.connect(
+        lambda _mgr: setattr(win, "_force_quit", True))
     app.aboutToQuit.connect(
         lambda: win._tray_icon.hide() if win._tray_icon is not None else None)
     if _self_test:
@@ -7840,7 +7876,7 @@ if __name__ == "__main__":
                 logger.info("Frozen self-test passed (%d metric frames)", win._metric_frames)
             else:
                 logger.error("Frozen self-test failed (%d metric frames)", win._metric_frames)
-            win.close()
+            win._force_close()
             with contextlib.suppress(FileNotFoundError):
                 CONFIG_FILE.unlink()
             app.exit(0 if ok else 1)

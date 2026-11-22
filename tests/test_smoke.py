@@ -1758,13 +1758,14 @@ def test_cross_platform_os_autostart_enable_and_disable(
 def test_options_dialog_controls_and_values(qapp: QApplication) -> None:
     dlg = tricorder.OptionsDialog(
         minimize_to_tray=False,
+        close_to_tray=False,
         autostart_enabled=False,
         autostart_mode="normal",
         tray_available=True,
     )
     try:
         assert not dlg._combo_mode.isEnabled()
-        assert dlg.values() == (False, False, "normal")
+        assert dlg.values() == (False, False, False, "normal")
 
         dlg._cb_autostart.setChecked(True)
         assert dlg._combo_mode.isEnabled()
@@ -1772,9 +1773,12 @@ def test_options_dialog_controls_and_values(qapp: QApplication) -> None:
         dlg._combo_mode.setCurrentIndex(min_idx)
         assert "Taskleiste" in dlg._mode_hint.text()
 
-        dlg._cb_tray.setChecked(True)
+        dlg._cb_close_tray.setChecked(True)
         assert "System-Tray" in dlg._mode_hint.text()
-        assert dlg.values() == (True, True, "minimized")
+        assert dlg.values() == (False, True, True, "minimized")
+
+        dlg._cb_tray.setChecked(True)
+        assert dlg.values() == (True, True, True, "minimized")
     finally:
         dlg.deleteLater()
         qapp.processEvents()
@@ -1827,6 +1831,7 @@ def test_dashboard_tray_minimize_restore_and_startup_modes(
         assert dashboard._tray_icon is None
         assert dashboard._apply_app_options(
             minimize_to_tray=True,
+            close_to_tray=True,
             autostart_enabled=True,
             autostart_mode="minimized",
             sync_os_autostart=True,
@@ -1837,15 +1842,18 @@ def test_dashboard_tray_minimize_restore_and_startup_modes(
 
         saved = json.loads(config_path.read_text(encoding="utf-8"))
         assert saved["minimize_to_tray"] is True
+        assert saved["close_to_tray"] is True
         assert saved["autostart"] is True
         assert saved["autostart_mode"] == "minimized"
 
-        # Show normally, save geometry, hide to tray and restore.
+        # Show normally, save geometry, close (X) hides to tray when close_to_tray=True.
         dashboard.show()
         qapp.processEvents()
-        assert dashboard._hide_to_tray()
+        dashboard.close()
+        qapp.processEvents()
         assert dashboard._in_tray is True
         assert dashboard.isHidden()
+        assert dashboard._tray_icon.visible is True
         assert dashboard._tray_toggle_action is not None
         assert dashboard._tray_toggle_action.text() == "Fenster anzeigen"
 
@@ -1855,7 +1863,8 @@ def test_dashboard_tray_minimize_restore_and_startup_modes(
         assert not dashboard.isHidden()
         assert dashboard._tray_toggle_action.text() == "In den Tray minimieren"
     finally:
-        dashboard.close()
+        dashboard._force_close()
+        assert dashboard._tray_icon is not None and not dashboard._tray_icon.visible
         dashboard.deleteLater()
         qapp.processEvents()
 
@@ -1886,6 +1895,6 @@ def test_dashboard_tray_minimize_restore_and_startup_modes(
         qapp.processEvents()
         assert max_start.isMaximized()
     finally:
-        max_start.close()
+        max_start._force_close()
         max_start.deleteLater()
         qapp.processEvents()

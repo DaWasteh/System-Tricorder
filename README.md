@@ -48,7 +48,7 @@ The built package is written to `release/`.
 
 Click **⚙ Optionen** in the toolbar (or right-click the tray icon → **Optionen…**) to configure:
 
-- **Minimize to System Tray** — minimizing the window hides it to the system tray instead of keeping it on the taskbar. Left-clicking or double-clicking the tray icon restores the window; right-clicking opens show/hide, **Optionen…**, and **Beenden**.
+- **System Tray (`minimize_to_tray` / `close_to_tray`)** — optionally hide System Tricorder to the system tray when minimizing and/or when clicking the window close button (**×**). Left-clicking or double-clicking the tray icon restores the window; right-clicking opens show/hide, **Optionen…**, and **Beenden**.
 - **Autostart on Login** — registers a per-user login entry without administrator rights:
   - **Windows:** `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (`SystemTricorder`, uses `pythonw.exe` when running from source)
   - **Linux:** `${XDG_CONFIG_HOME:-~/.config}/autostart/system-tricorder.desktop`
@@ -116,6 +116,7 @@ Your `~/.tricorder_layout.json` is never overwritten by updates.
   "version": "1.0",
   "theme": "dark",
   "minimize_to_tray": true,
+  "close_to_tray": true,
   "autostart": true,
   "autostart_mode": "minimized",
   "min_row_h": 75,
@@ -141,7 +142,7 @@ Deleting `~/.tricorder_layout.json` resets all settings and saved window geometr
 
 ### v2.7.8
 
-- **Minimize to System Tray** — new option in **⚙ Optionen** hides System Tricorder to the system tray when minimized, with a tray icon menu to restore, open options, or quit cleanly without losing saved window placement
+- **Minimize & Close to System Tray** — new options in **⚙ Optionen** hide System Tricorder to the system tray when minimizing and/or clicking **×**, with a tray icon menu to restore, open options, or quit cleanly without losing saved window placement
 - **Cross-Platform Autostart** — native per-user autostart support for Windows (`HKCU\...\Run`), Linux (`~/.config/autostart/system-tricorder.desktop`), and macOS (`~/Library/LaunchAgents/com.dawasteh.system-tricorder.plist`)
 - **Configurable Start Mode** — autostart (and CLI flags `--start-minimized`, `--start-maximized`, `--start-normal`, `--start-tray`) can launch normal, maximized, or minimized directly into the system tray
 

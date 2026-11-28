@@ -268,6 +268,6 @@ flowchart LR
 - [x] **Phase 1:** `formal/` mit gepinnter `lean-toolchain` und `lakefile.toml` (ohne Mathlib) baut lokal sauber.
 - [x] **Phase 2:** `Layout.lean` beweist Partition, Disjunktheit, Duplikatfreiheit, `CanonicalOrder`, Idempotenz und Dormant-Round-Trip ohne `sorry`.
 - [x] **Phase 3:** `Updater.lean` beweist Crash-Safety-Recoverability für Standalone-EXE- und Multi-File-Source-Updates ohne `sorry`.
-- [ ] **Phase 4:** `Power.lean` und `Config.lean` beweisen Domain-Disjunktheit, RAPL-Wrap-Around und Config-Totalität ohne `sorry`.
+- [x] **Phase 4:** `Power.lean` und `Config.lean` beweisen Domain-Disjunktheit, RAPL-Wrap-Around und Config-Totalität ohne `sorry`.
 - [ ] **Phase 5:** `tricorder-oracle` läuft im `pytest`+`hypothesis`-Differential-Test gegen `system_tricorder.py` ohne Abweichungen.
 - [ ] **Phase 6:** CI-Job `formal-verify` läuft auf GitHub Actions grün (inkl. Axiom-/No-`sorry`-Prüfung), bestehende Release-Builds und `requirements.txt` bleiben unverändert.

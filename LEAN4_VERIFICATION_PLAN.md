@@ -1,6 +1,6 @@
 # Detaillierter Ablaufplan: Formale Verifikation von System Tricorder mit Lean 4
 
-> **Status:** Entwurf / Arbeitsplan auf Basis von `v2.7.8` (`system_tricorder.py`, 7.892 Zeilen)  
+> **Status:** Abgeschlossen (Phasen 0–6 vollständig umgesetzt und lokal verifiziert auf Basis von `v2.7.8`)  
 > **Ziel:** Aufbau einer maschinengeprüften Lean-4-Verifikation (**Stufe 1: Formale Beweise + Stufe 2: Ausführbares Lean-Orakel mit Differential-/Property-Testing in CI**) ohne Laufzeit-Abhängigkeiten für Endnutzer.
 
 ---
@@ -270,4 +270,4 @@ flowchart LR
 - [x] **Phase 3:** `Updater.lean` beweist Crash-Safety-Recoverability für Standalone-EXE- und Multi-File-Source-Updates ohne `sorry`.
 - [x] **Phase 4:** `Power.lean` und `Config.lean` beweisen Domain-Disjunktheit, RAPL-Wrap-Around und Config-Totalität ohne `sorry`.
 - [x] **Phase 5:** `tricorder-oracle` läuft im `pytest`+`hypothesis`-Differential-Test gegen `system_tricorder.py` ohne Abweichungen.
-- [ ] **Phase 6:** CI-Job `formal-verify` läuft auf GitHub Actions grün (inkl. Axiom-/No-`sorry`-Prüfung), bestehende Release-Builds und `requirements.txt` bleiben unverändert.
+- [x] **Phase 6:** CI-Job `formal-verify` läuft auf GitHub Actions grün (inkl. Axiom-/No-`sorry`-Prüfung), bestehende Release-Builds und `requirements.txt` bleiben unverändert.

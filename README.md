@@ -138,6 +138,12 @@ Your `~/.tricorder_layout.json` is never overwritten by updates.
 
 Deleting `~/.tricorder_layout.json` resets all settings and saved window geometry.
 
+## 🔬 Formal Verification (Lean 4)
+
+Core algorithmic and transactional logic — tile layout & migration, standalone EXE & multi-file updater crash-safety, CPU power domain aggregation / RAPL wrap-around, and configuration sanitization — is formally specified and machine-checked in Lean 4 under [`formal/`](formal/README.md) (26 theorems, 0 `sorry`, standard axioms only) and coupled to `system_tricorder.py` via an executable Lean JSON oracle and Hypothesis differential tests in [`tests/test_formal_differential.py`](tests/test_formal_differential.py).
+
+End-user packages and `requirements.txt` do not depend on Lean 4. See [`formal/README.md`](formal/README.md) for local build instructions and Trusted Computing Base (TCB) boundaries.
+
 ## 📋 Changelog
 
 ### v2.7.8

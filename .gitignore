@@ -14,3 +14,4 @@ release/
 *.spec
 !system_tricorder.spec
 .DS_Store
+formal/.lake/

@@ -1,0 +1,10 @@
+name = "tricorder_formal"
+version = "0.1.0"
+defaultTargets = ["Tricorder", "tricorder-oracle"]
+
+[[lean_lib]]
+name = "Tricorder"
+
+[[lean_exe]]
+name = "tricorder-oracle"
+root = "Oracle.Main"

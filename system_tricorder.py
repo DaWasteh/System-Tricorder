@@ -302,12 +302,15 @@ def _apply_theme_tree(root: QWidget) -> None:
 
 def _normalise_color_hex(value: Any) -> Optional[str]:
     """Return a validated opaque ``#rrggbb`` colour or ``None``."""
-    if not isinstance(value, str) or not value.strip():
+    if not isinstance(value, str):
         return None
-    color = QColor(value.strip())
-    if not color.isValid():
-        return None
-    return color.name(QColor.NameFormat.HexRgb).lower()
+    text = value.strip()
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", text):
+        return text.lower()
+    if re.fullmatch(r"#[0-9a-fA-F]{3}", text):
+        r, g, b = text[1], text[2], text[3]
+        return f"#{r}{r}{g}{g}{b}{b}".lower()
+    return None
 
 
 def _clock_display_mode(width: int) -> str:
@@ -366,6 +369,78 @@ def _save_config_file(data: dict) -> None:
     tmp = CONFIG_FILE.with_suffix('.tmp')
     tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8')
     tmp.replace(CONFIG_FILE)          # atomic on same filesystem
+
+
+_MIN_ROW_H_FLOOR = 50
+_MIN_ROW_H_CEIL = 400
+_DEFAULT_MIN_ROW_H = 75
+_DEFAULT_MAX_ROW_H = 180
+
+
+def _normalise_min_row_h(
+    value: Any,
+    default: int = _DEFAULT_MIN_ROW_H,
+    *,
+    floor: int = _MIN_ROW_H_FLOOR,
+    ceil: int = _MIN_ROW_H_CEIL,
+) -> int:
+    """Parse and clamp ``min_row_h`` without crashing on corrupt config values."""
+    low = max(1, int(floor))
+    high = max(low, int(ceil))
+    fallback = max(low, min(int(default), high))
+    if isinstance(value, bool) or value is None:
+        return fallback
+    parsed: Optional[int] = None
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float):
+        if math.isfinite(value):
+            parsed = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r"[+-]?\d+", text):
+            parsed = int(text)
+    if parsed is None:
+        return fallback
+    return max(low, min(parsed, high))
+
+
+def _sanitise_config(
+    raw: Any,
+    *,
+    default_min_row_h: int = _DEFAULT_MIN_ROW_H,
+    default_max_row_h: int = _DEFAULT_MAX_ROW_H,
+    min_row_h_floor: int = _MIN_ROW_H_FLOOR,
+    min_row_h_ceil: int = _MIN_ROW_H_CEIL,
+) -> Dict[str, Any]:
+    """Total sanitizer mapping arbitrary JSON data to valid core settings."""
+    cfg = raw if isinstance(raw, dict) else {}
+    min_row_h = _normalise_min_row_h(
+        cfg.get('min_row_h'),
+        default=default_min_row_h,
+        floor=min_row_h_floor,
+        ceil=min_row_h_ceil,
+    )
+    max_row_h = max(int(default_max_row_h), min_row_h)
+    raw_colors = cfg.get('tile_colors')
+    tile_colors: Dict[str, str] = {}
+    if isinstance(raw_colors, dict):
+        for raw_id, raw_color in raw_colors.items():
+            color = _normalise_color_hex(raw_color)
+            if (isinstance(raw_id, str) and raw_id
+                    and len(raw_id) <= 256 and color is not None):
+                tile_colors[raw_id] = color
+    return {
+        'theme': _normalise_theme(cfg.get('theme', 'dark')),
+        'minimize_to_tray': cfg.get('minimize_to_tray') is True,
+        'close_to_tray': cfg.get('close_to_tray') is True,
+        'autostart': cfg.get('autostart') is True,
+        'autostart_mode': _normalise_autostart_mode(
+            cfg.get('autostart_mode', 'normal')),
+        'min_row_h': min_row_h,
+        'max_row_h': max_row_h,
+        'tile_colors': tile_colors,
+    }
 
 
 # ── System-tray & cross-platform autostart helpers ────────────────────────────
@@ -917,6 +992,20 @@ def _linux_read_gpu_power_watts(card_dir: str) -> Optional[float]:
     return None
 
 
+def _linux_rapl_energy_delta(
+    previous_uj: int, current_uj: int, max_range: Optional[int],
+) -> Optional[int]:
+    """Return a non-negative RAPL microjoule delta handling counter wrap-around."""
+    if previous_uj < 0 or current_uj < 0:
+        return None
+    delta = current_uj - previous_uj
+    if delta < 0:
+        if max_range is None or max_range <= 0:
+            return None
+        delta += max_range
+    return delta if delta >= 0 else None
+
+
 class _LinuxCpuPowerSampler:
     """Best-effort CPU package power from Linux powercap energy deltas."""
 
@@ -958,11 +1047,9 @@ class _LinuxCpuPowerSampler:
                 if previous is None:
                     continue
                 previous_uj, previous_t = previous
-                delta = energy_uj - previous_uj
-                if delta < 0 and max_range:
-                    delta += max_range
+                delta = _linux_rapl_energy_delta(previous_uj, energy_uj, max_range)
                 dt = now - previous_t
-                if delta >= 0 and dt > 0:
+                if delta is not None and dt > 0:
                     total_watts += delta / 1_000_000.0 / dt
                     valid += 1
             except Exception:
@@ -1369,6 +1456,7 @@ def _cpu_package_power_from_pdh(rows: List[Tuple[str, float]]) -> Optional[float
     package family and never add PP0/DRAM or core rows to a package value.
     """
     normalized: List[Tuple[str, float]] = []
+    seen_names: set[str] = set()
     for raw_name, raw_value in rows:
         try:
             value = float(raw_value)
@@ -1378,6 +1466,12 @@ def _cpu_package_power_from_pdh(rows: List[Tuple[str, float]]) -> Optional[float
             continue
         name = re.sub(r"#\d+$", "", str(raw_name).strip().lower())
         name = re.sub(r"[^a-z0-9]+", "_", name).strip("_")
+        # Distinct sockets/cores carry distinct names (e.g. Package0/Package1,
+        # Core0/Core1).  Duplicate instances with the same normalized name
+        # (such as a PDH #1 suffix alias) must not double-count one domain.
+        if not name or name in seen_names:
+            continue
+        seen_names.add(name)
         normalized.append((name, value))
 
     # Each entry is a priority tier.  Multiple rows in one tier represent
@@ -2198,6 +2292,9 @@ class _SensorPoller:
                 if value is not None:
                     with self._lock:
                         self._value = value
+                        # Stamp on completion: blocking driver calls return the
+                        # freshly read value upon unblocking, while any stall
+                        # lets the *previous* cached value age out via max_age.
                         self._stamp = finished
                 if (finished - started >= 0.5
                         and finished - self._last_slow_warning >= 60.0):
@@ -2492,19 +2589,19 @@ class HardwareMonitorThread(QThread):
     def _run_linux(self) -> None:
         self._last_io     = psutil.disk_io_counters()
         self._last_io_per = psutil.disk_io_counters(perdisk=True) or {}
-        self._last_t      = time.time()
+        self._last_t      = time.monotonic()
 
         while self._running:
             try:
-                now = time.time()
+                now = time.monotonic()
                 dt  = max(now - self._last_t, 0.001)
 
                 # ── Disk I/O (identical to Windows path) ───────────────────
                 io_agg = psutil.disk_io_counters()
                 rmb = wmb = 0.0
                 if io_agg and self._last_io:
-                    rmb = (io_agg.read_bytes  - self._last_io.read_bytes)  / (1024 * 1024) / dt
-                    wmb = (io_agg.write_bytes - self._last_io.write_bytes) / (1024 * 1024) / dt
+                    rmb = max(0.0, (io_agg.read_bytes  - self._last_io.read_bytes)  / (1024 * 1024) / dt)
+                    wmb = max(0.0, (io_agg.write_bytes - self._last_io.write_bytes) / (1024 * 1024) / dt)
                 self._last_io = io_agg
 
                 io_per = psutil.disk_io_counters(perdisk=True) or {}
@@ -2704,9 +2801,15 @@ class HardwareMonitorThread(QThread):
             try:
                 now = loop_started
 
-                disk = self._latest_poll("disk")
+                disk = self._latest_poll("disk", 5.0)
                 if disk is not None:
                     rmb, wmb, drives = disk
+                else:
+                    rmb = wmb = 0.0
+                    drives = [
+                        DriveMetrics(key=key, label=label, read_mbps=0.0, write_mbps=0.0)
+                        for key, label in self._drive_info
+                    ]
 
                 # CPU and RAM failures are independent from GPU/disk telemetry;
                 # keep the last values and still publish a complete frame.
@@ -4883,7 +4986,16 @@ class TileGrid(QWidget):
                 saved_order, saved_hidden, list(self._tiles), default_order)
             self._tile_order = saved_order
             self._hidden = saved_hidden
-            self._min_row_h = int(cfg.get('min_row_h', self._min_row_h))
+            raw_min_row_h = cfg.get('min_row_h')
+            normalised_min_row_h = _normalise_min_row_h(
+                raw_min_row_h,
+                default=self._min_row_h,
+                floor=int(_MIN_ROW_H_FLOOR * _DP_SCALE),
+                ceil=int(_MIN_ROW_H_CEIL * _DP_SCALE),
+            )
+            if raw_min_row_h != normalised_min_row_h:
+                layout_changed = True
+            self._min_row_h = normalised_min_row_h
             self._max_row_h = max(self._max_row_h, self._min_row_h)
             layout_changed = layout_changed or merged
         else:
@@ -5074,7 +5186,9 @@ class TileGrid(QWidget):
 
     def _on_move(self, src: str, target: str, insert_before: bool) -> None:
         """Insert src immediately before or after target in _tile_order."""
-        if src not in self._tile_order or target not in self._tile_order or src == target:
+        if (src == '__row__' or target == '__row__'
+                or src not in self._tile_order or target not in self._tile_order
+                or src == target):
             return
         self._tile_order.remove(src)
         idx = self._tile_order.index(target)
@@ -5134,6 +5248,8 @@ class TileGrid(QWidget):
             self._save_config()
 
     def show_tile(self, tile_id: str) -> None:
+        if tile_id == '__row__' or tile_id not in self._tiles:
+            return
         if tile_id in self._hidden:
             self._hidden.remove(tile_id)
         if tile_id not in self._tile_order:
@@ -5702,12 +5818,17 @@ def _install_staged_source_files(staging: Path, install_root: Path) -> bool:
             candidate.replace(target)
     except Exception:
         for target, candidate, backup, existed in reversed(installed):
-            candidate.unlink(missing_ok=True)
-            if backup.exists():
-                target.unlink(missing_ok=True)
-                backup.replace(target)
-            elif not existed:
-                target.unlink(missing_ok=True)
+            try:
+                candidate.unlink(missing_ok=True)
+                if backup.exists():
+                    backup.replace(target)
+                elif not existed:
+                    target.unlink(missing_ok=True)
+            except OSError as rollback_exc:
+                logger.warning(
+                    "Could not roll back source update target %s: %s",
+                    target, rollback_exc,
+                )
         raise
 
     # Every target now contains the same release, so the transaction is
@@ -5883,6 +6004,10 @@ def _build_standalone_exe_update_bat(
         'copy /Y /B "%UPDATE%" "%NEW%" >> "%LOG%" 2>&1',
         "if errorlevel 1 (",
         '    echo [%date% %time%] ERROR: staging next to EXE failed >> "%LOG%"',
+        "    goto cleanup",
+        ")",
+        'if not exist "%EXE%" (',
+        '    echo [%date% %time%] ERROR: current EXE is missing, preserving backup >> "%LOG%"',
         "    goto cleanup",
         ")",
         'del /F /Q "%BACKUP%" >NUL 2>&1',
@@ -6417,12 +6542,12 @@ class TricorderDashboard(QMainWindow):
         super().__init__()
 
         initial_cfg = _load_config_file()
-        self._theme = _set_active_theme(initial_cfg.get('theme', 'dark'))
-        self._minimize_to_tray = bool(initial_cfg.get('minimize_to_tray', False))
-        self._close_to_tray = bool(initial_cfg.get('close_to_tray', False))
-        self._autostart_enabled = bool(initial_cfg.get('autostart', False))
-        self._autostart_mode = _normalise_autostart_mode(
-            initial_cfg.get('autostart_mode', 'normal'))
+        sanitised_cfg = _sanitise_config(initial_cfg)
+        self._theme = _set_active_theme(sanitised_cfg['theme'])
+        self._minimize_to_tray = sanitised_cfg['minimize_to_tray']
+        self._close_to_tray = sanitised_cfg['close_to_tray']
+        self._autostart_enabled = sanitised_cfg['autostart']
+        self._autostart_mode = sanitised_cfg['autostart_mode']
 
         self._tray_icon: Optional[QSystemTrayIcon] = None
         self._tray_menu: Optional[QMenu] = None

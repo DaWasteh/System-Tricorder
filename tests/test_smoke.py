@@ -1898,3 +1898,185 @@ def test_dashboard_tray_minimize_restore_and_startup_modes(
         max_start._force_close()
         max_start.deleteLater()
         qapp.processEvents()
+
+
+def test_config_sanitizer_and_corrupt_min_row_h_recovery(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    assert tricorder._normalise_min_row_h("abc") == 75
+    assert tricorder._normalise_min_row_h(None) == 75
+    assert tricorder._normalise_min_row_h(True) == 75
+    assert tricorder._normalise_min_row_h(-200) == 50
+    assert tricorder._normalise_min_row_h(9999) == 400
+    assert tricorder._normalise_min_row_h("120") == 120
+    assert tricorder._normalise_min_row_h(float("nan")) == 75
+
+    sanitised = tricorder._sanitise_config({
+        "theme": "LIGHT",
+        "minimize_to_tray": "false",
+        "close_to_tray": True,
+        "autostart": 1,
+        "autostart_mode": "MAXIMIZED",
+        "min_row_h": "corrupt",
+        "tile_colors": {
+            "cpu_total": "#AbC",
+            "bad": "red",
+            "": "#112233",
+        },
+    })
+    assert sanitised == {
+        "theme": "light",
+        "minimize_to_tray": False,
+        "close_to_tray": True,
+        "autostart": False,
+        "autostart_mode": "maximized",
+        "min_row_h": 75,
+        "max_row_h": 180,
+        "tile_colors": {"cpu_total": "#aabbcc"},
+    }
+    assert tricorder._sanitise_config(["not", "a", "dict"])["theme"] == "dark"
+
+    config_path = tmp_path / "layout.json"
+    config_path.write_text(json.dumps({
+        "version": "1.0",
+        "tile_order": ["cpu_total"],
+        "hidden_tiles": [],
+        "min_row_h": "not-an-int",
+    }), encoding="utf-8")
+    monkeypatch.setattr(tricorder, "CONFIG_FILE", config_path)
+    tile = tricorder.MetricTile("cpu_total", "CPU", "#00d4ff")
+    grid = tricorder.TileGrid(
+        {"cpu_total": tile}, {"cpu_total": "CPU"}, ["cpu_total"])
+    try:
+        assert grid._min_row_h == 75
+        saved = json.loads(config_path.read_text(encoding="utf-8"))
+        assert saved["min_row_h"] == 75
+    finally:
+        grid.deleteLater()
+        qapp.processEvents()
+
+
+def test_tile_grid_rejects_sentinel_and_unknown_tile_mutations(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(tricorder, "CONFIG_FILE", tmp_path / "layout.json")
+    t1 = tricorder.MetricTile("cpu_total", "CPU", "#00d4ff")
+    t2 = tricorder.MetricTile("ram", "RAM", "#00ff88")
+    grid = tricorder.TileGrid(
+        {"cpu_total": t1, "ram": t2},
+        {"cpu_total": "CPU", "ram": "RAM"},
+        ["cpu_total", "__row__", "ram"],
+    )
+    try:
+        before = list(grid._tile_order)
+        grid.show_tile("__row__")
+        grid.show_tile("unknown_tile")
+        grid._on_move("__row__", "ram", True)
+        grid._on_move("cpu_total", "__row__", False)
+        assert grid._tile_order == before
+    finally:
+        grid.deleteLater()
+        qapp.processEvents()
+
+
+def test_pdh_power_deduplicates_duplicate_instances_and_rapl_delta() -> None:
+    # Duplicate #1 suffix aliases of the same counter name must not double-count,
+    # while distinct multi-socket package names still sum.
+    assert tricorder._cpu_package_power_from_pdh([
+        ("CPU Power", 65_000.0),
+        ("CPU Power#1", 65_000.0),
+    ]) == pytest.approx(65.0)
+    assert tricorder._cpu_package_power_from_pdh([
+        ("RAPL_Package0_PKG", 40_000.0),
+        ("RAPL_Package0_PKG#1", 40_000.0),
+        ("RAPL_Package1_PKG", 55_000.0),
+    ]) == pytest.approx(95.0)
+
+    assert tricorder._linux_rapl_energy_delta(100, 350, 1000) == 250
+    assert tricorder._linux_rapl_energy_delta(900, 100, 1000) == 200
+    assert tricorder._linux_rapl_energy_delta(900, 100, None) is None
+    assert tricorder._linux_rapl_energy_delta(-1, 100, 1000) is None
+
+
+def test_linux_disk_io_clamps_negative_aggregate_counters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(tricorder.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(tricorder, "NVML_AVAILABLE", False)
+    monkeypatch.setattr(tricorder, "_linux_detect_gpus", lambda: [])
+    monitor = tricorder.HardwareMonitorThread(drive_info=[("sda", "sda")])
+    mib = 1024 * 1024
+    agg_samples = iter([
+        SimpleNamespace(read_bytes=50 * mib, write_bytes=40 * mib),
+        SimpleNamespace(read_bytes=10 * mib, write_bytes=5 * mib),
+    ])
+    per_samples = iter([
+        {"sda": SimpleNamespace(read_bytes=50 * mib, write_bytes=40 * mib)},
+        {"sda": SimpleNamespace(read_bytes=10 * mib, write_bytes=5 * mib)},
+    ])
+
+    def fake_disk_io(perdisk: bool = False):
+        return next(per_samples) if perdisk else next(agg_samples)
+
+    times = iter((10.0, 11.0))
+    monkeypatch.setattr(tricorder.psutil, "disk_io_counters", fake_disk_io)
+    monkeypatch.setattr(tricorder.psutil, "cpu_percent",
+                        lambda interval=None, percpu=False: [10.0] if percpu else 10.0)
+    monkeypatch.setattr(tricorder.psutil, "virtual_memory",
+                        lambda: SimpleNamespace(total=8 * 1024**3, used=4 * 1024**3, percent=50.0))
+    monkeypatch.setattr(tricorder.time, "monotonic", lambda: next(times))
+
+    def stop_after_one_publish(metrics):
+        monitor._latest = metrics
+        monitor._running = False
+
+    monkeypatch.setattr(monitor, "_publish", stop_after_one_publish)
+    monkeypatch.setattr(tricorder.time, "sleep", lambda _s: None)
+    monitor._running = True
+    monitor._run_linux()
+    assert monitor._latest is not None
+    assert monitor._latest.disk_read_mbps == 0.0
+    assert monitor._latest.disk_write_mbps == 0.0
+    assert monitor._latest.drives[0].read_mbps == 0.0
+    assert monitor._latest.drives[0].write_mbps == 0.0
+
+
+def test_updater_guards_backup_deletion_and_resilient_source_rollback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    script = tricorder._build_standalone_exe_update_bat(
+        Path("C:/Apps/SystemTricorder.exe"),
+        Path("C:/Temp/system-tricorder-update-1/release.exe"),
+        42,
+        Path("C:/Temp/release-update.log"),
+    )
+    exe_check_idx = script.index('if not exist "%EXE%"')
+    del_backup_idx = script.index('del /F /Q "%BACKUP%"')
+    assert exe_check_idx < del_backup_idx
+
+    install = tmp_path / "install"
+    staging = tmp_path / "staging"
+    _write_source_update_fixture(install, "2.7.7")
+    _write_source_update_fixture(staging, "2.7.8")
+    before = {
+        rel: (install / rel).read_bytes()
+        for rel in tricorder._UPDATE_SOURCE_FILES
+    }
+    original_replace = Path.replace
+
+    def fail_third_install_and_second_rollback(self: Path, target: Path) -> Path:
+        if self.name.startswith(".SystemTricorder.png.update-"):
+            raise OSError("install failed on 3rd file")
+        if self.name.startswith(".requirements.txt.backup-"):
+            raise OSError("rollback locked on 2nd file")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_third_install_and_second_rollback)
+    with pytest.raises(OSError, match="install failed"):
+        tricorder._install_staged_source_files(staging, install)
+    # Even though requirements.txt rollback failed, system_tricorder.py (1st file)
+    # must still be rolled back and never left unrolled.
+    assert (install / "system_tricorder.py").read_bytes() == before["system_tricorder.py"]
+    assert (install / "assets" / "SystemTricorder.png").read_bytes() == before["assets/SystemTricorder.png"]

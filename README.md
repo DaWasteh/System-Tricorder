@@ -2,7 +2,7 @@
 
 > Real-time hardware monitoring dashboard for Windows, macOS, and Linux — 30 FPS, Light/Dark mode, system tray, cross-platform autostart, and a freely customisable tile layout.
 
-![Version](https://img.shields.io/badge/version-2.7.8-00ff88?style=flat-square)
+![Version](https://img.shields.io/badge/version-2.7.9-00ff88?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
@@ -145,6 +145,11 @@ Core algorithmic and transactional logic — tile layout & migration, standalone
 End-user packages and `requirements.txt` do not depend on Lean 4. See [`formal/README.md`](formal/README.md) for local build instructions and Trusted Computing Base (TCB) boundaries.
 
 ## 📋 Changelog
+
+### v2.7.9
+
+- **Lean 4 Formal Verification & Differential Testing** — formally proved 26 theorems (0 `sorry`, standard axioms only) across layout/migration (`Layout.lean`), standalone EXE & multi-file updater crash-safety (`Updater.lean`), CPU power domain aggregation / RAPL wrap-around (`Power.lean`), and configuration sanitization (`Config.lean`), coupled to `system_tricorder.py` via an executable Lean JSON oracle and Hypothesis differential tests in CI (`formal-verify`)
+- **Core Reliability Hardening** — clamped Linux aggregate disk I/O counters and switched the Linux monitor loop to `time.monotonic()`, added stale-data expiry to the Windows disk poller, introduced a total configuration sanitizer (preventing crashes on corrupt `min_row_h` values), guarded `TileGrid` sentinel/unknown-tile operations, deduplicated duplicate PDH power instances, and hardened EXE backup preservation and multi-file source rollback
 
 ### v2.7.8
 

@@ -68,23 +68,23 @@ def test_metric_defaults() -> None:
 
 
 def test_release_versions_are_synchronized() -> None:
-    assert tricorder.APP_VERSION == "2.7.8"
+    assert tricorder.APP_VERSION == "2.7.9"
     assert tricorder.CONFIG_VERSION == "1.0"
     root = Path(tricorder.__file__).parent
     version_info = (root / "assets" / "version_info.txt").read_text(encoding="utf-8")
     for expected in (
-        "filevers=(2, 7, 8, 0)",
-        "prodvers=(2, 7, 8, 0)",
-        "FileVersion', '2.7.8.0'",
-        "ProductVersion', '2.7.8.0'",
+        "filevers=(2, 7, 9, 0)",
+        "prodvers=(2, 7, 9, 0)",
+        "FileVersion', '2.7.9.0'",
+        "ProductVersion', '2.7.9.0'",
     ):
         assert expected in version_info
     readme = (root / "README.md").read_text(encoding="utf-8")
-    assert "version-2.7.8-00ff88" in readme
-    assert "### v2.7.8" in readme
+    assert "version-2.7.9-00ff88" in readme
+    assert "### v2.7.9" in readme
     if os.name == "nt":
         assert tricorder._windows_file_version(
-            root / "dist" / "system_tricorder.exe") == (2, 7, 8, 0)
+            root / "dist" / "system_tricorder.exe") == (2, 7, 9, 0)
     release_builder = (root / ".github" / "scripts" / "build_release.py").read_text(
         encoding="utf-8")
     assert 'generated_spec_dir = build_dir / "generated-spec"' in release_builder
